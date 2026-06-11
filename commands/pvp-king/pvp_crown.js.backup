@@ -1,0 +1,323 @@
+// ----------------------
+// /pvp_crown
+// ----------------------
+const { SlashCommandBuilder, MessageFlags, ThreadChannel, EmbedBuilder } = require('discord.js');
+const { getServerLogo, createPvpFooter, createPvpLogFooter } = require('./utils/pvpAssets.js');
+
+class PvpCrownKing {
+
+    constructor(config) {
+        this.name = "pvp_crown";
+        this.db = config.db;
+        this.pvpKingRoleID = config.pvpKingRoleID;
+        this.leaderRoleID = config.leaderRoleID;
+        this.adminRoleID = config.adminRoleID;
+        this.officerRoleID = config.officerRoleID;
+        this.ownerID = config.ownerID;
+        this.logChannelID = config.logChannelID;
+        this.pvpKingChannelID = config.pvpKingChannelID;
+        this.historyThreadID = config.historyThreadID;
+        this.onCooldown = config.onCooldown;
+
+        this.data = new SlashCommandBuilder()
+            .setName('pvp_crown')
+            .setDescription('Crown a new PvP King, or record a PvP King Defense (Officers only)')
+            .addUserOption(o =>
+                o.setName('user').setDescription('Select the New PvP King, or the Defending PvP King').setRequired(true)
+            );
+    }
+
+    async execute(interaction) {
+        if (this.onCooldown(interaction.user.id, 'currentking', 2)) {
+            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.channelId !== this.pvpKingChannelID) {
+            return interaction.reply({ content: `### ❌  The \`/pvp_crown\` command can only be used in <#${this.pvpKingChannelID}>`, flags: MessageFlags.Ephemeral });
+        }
+
+        const { guild } = interaction;
+        const logChannel = guild.channels.cache.get(this.logChannelID);
+        if (!logChannel) {
+            console.log(' - WARNING: Log channel not found! Channel ID: ' + this.logChannelID);
+        }
+
+        // Check if user has Officer Role
+        const allowedRoles = [this.leaderRoleID, this.adminRoleID, this.officerRoleID];
+        if (!interaction.member.roles.cache.some(role => allowedRoles.includes(role.id))) {
+            return interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
+        }
+
+        // SAFETY CHECKS
+        const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
+        if (!kingRole) {
+            return interaction.reply({ content: '### ❌  PvP King role not found! Needs to be fixed manually!', flags: MessageFlags.Ephemeral });
+        }
+
+        const kings = kingRole.members;
+
+        // If more than 1 PvP King exist
+        if (kings.size > 1) {
+            // Log the issue to the Discord Log Channel
+            if (logChannel) {
+                const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+                await logChannel.send(
+                    `**🚨 <@${this.ownerID}> — Multiple PvP Kings Detected!**\n` +
+                    `**${kingRole.members.size} members** currently have the PvP King role.\n` +
+                    `This needs to be fixed manually before crowning a new king! (${now})`
+                );
+            }
+
+            // User feedback message
+            return interaction.reply({
+                content:
+                    `❌ **Error:** There are currently **${kingRole.members.size} members** with the PvP King role.\n` +
+                    `Please fix this manually before crowning a new king!`,
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        // If 0 OR 1 PvP Kings exist:
+        const newKing = interaction.options.getMember('user');
+        if (!newKing) {
+            return interaction.reply({ content: '### ❌  User not found.', flags: MessageFlags.Ephemeral });
+        }
+
+        await interaction.deferReply();
+
+        try {
+            // IF New King Crowned, OR Current King defends their crown
+            const oldKing = kings.first();
+            const isDefense = oldKing && oldKing.id === newKing.id;
+
+            // Get new King's last crowned date if any
+            const [newKingRow] = await this.db.query(
+                'SELECT crowned_at FROM pvp_king_stats WHERE user_id = ?',
+                [newKing.id]
+            );
+            const newKing_last_crowned = newKingRow[0]?.crowned_at || 0;
+            let usersToNotify = [];
+
+            // =============================
+            // DEFENSE CASE
+            // =============================
+            if (isDefense) {
+                await this.db.query(`
+                INSERT INTO pvp_king_stats (user_id, king_name, total_wins, current_streak, longest_streak, crowned_at)
+                VALUES (?, ?, 1, 1, 1, UTC_TIMESTAMP())
+                ON DUPLICATE KEY UPDATE
+                    total_wins = total_wins + 1,
+                    current_streak = current_streak + 1,
+                    longest_streak = GREATEST(longest_streak, current_streak),
+                    crowned_at = UTC_TIMESTAMP()
+                `, [newKing.id, newKing.displayName]);
+            }
+            // =============================
+            // NEW KING CASE
+            // =============================
+            else {
+                if (oldKing) {
+                    // ----- Cooldown Notification Logic -----
+                    const [notifyRows] = await this.db.query(`
+                        SELECT challenger_id, last_challenge FROM pvp_king_cooldowns 
+                        WHERE king_id = ? AND notify_on_expire = 1 AND last_challenge IS NOT NULL
+                    `, [oldKing.id]);
+
+                    const now = new Date();
+                    const cooldownMs = 48 * 60 * 60 * 1000;
+                    for (const row of notifyRows) {
+                        const lastChallengeDate = new Date(row.last_challenge + 'Z');
+                        // Only notify if the 48h hasn't passed yet
+                        if (now - lastChallengeDate < cooldownMs) {
+                            usersToNotify.push(`<@${row.challenger_id}>`);
+                        }
+                    }
+
+                    // Remove old king role if exists
+                    await oldKing.roles.remove(this.pvpKingRoleID).catch(() => { });
+
+                    // Reset old king streak
+                    await this.db.query(`
+                    UPDATE pvp_king_stats
+                    SET 
+                        total_crown_losses = total_crown_losses + 1,
+                        current_streak = 0
+                    WHERE user_id = ?
+                    `, [oldKing.id]);
+
+                    // Reset cooldowns any challengers have versus the old King
+                    await this.db.query(`
+                    UPDATE pvp_king_cooldowns
+                    SET last_challenge = NULL
+                    WHERE king_id = ?
+                    `, [oldKing.id]);
+
+                    // Apply a fresh cooldown to the old King against the new King to prevent instant rematches
+                    await this.db.query(`
+                    INSERT INTO pvp_king_cooldowns (challenger_id, challenger_name, king_id, king_name, last_challenge)
+                    VALUES (?, ?, ?, ?, UTC_TIMESTAMP())
+                    ON DUPLICATE KEY UPDATE
+                        challenger_name = VALUES(challenger_name),
+                        king_id = VALUES(king_id),
+                        king_name = VALUES(king_name),
+                        last_challenge = VALUES(last_challenge)
+                    `, [oldKing.id, oldKing.displayName, newKing.id, newKing.displayName]);
+
+                    // If any challengers have an active cooldown against the fallen King AND enabled notifications, then send notifications to waiting challengers!
+                    if (usersToNotify.length > 0 && this.pvpKingChannelID) {
+                        const pvpKingChannel = guild.channels.cache.get(this.pvpKingChannelID);
+                        if (pvpKingChannel) {
+                            const pvpKingCdEmbed = new EmbedBuilder()
+                                .setColor(0x02f3d7)
+                                .setTitle('🔔 PvP Cooldowns Cleared!')
+                                .setThumbnail(newKing.displayAvatarURL({ size: 256 }))
+                                .setDescription(
+                                    `### The PvP Throne has been claimed by <@${newKing.id}>!\n` +
+                                    `The reign of **${oldKing.displayName}** has ended. **All cooldowns have been reset**, and you may now challenge the new PvP King! ⚔️`
+                                )
+                                .addFields(
+                                    { name: '👑 New PvP King', value: `<@${newKing.id}>`, inline: true },
+                                    { name: 'Old PvP King', value: `<@${oldKing.id}>`, inline: true }
+                                )
+                                .setFooter(createPvpFooter())
+                                .setTimestamp();
+
+                            await pvpKingChannel.send({
+                                content: usersToNotify.length > 0 ? usersToNotify.join(' ') : null,
+                                embeds: [pvpKingCdEmbed],
+                                files: [getServerLogo()]
+                            });
+                        }
+                    }
+                }
+
+                // Add role to new king
+                await newKing.roles.add(this.pvpKingRoleID).catch(() => { });
+
+                // Update new king stats
+                await this.db.query(`
+                INSERT INTO pvp_king_stats 
+                    (user_id, king_name, total_wins, current_streak, longest_streak, first_crowned, crowned_at)
+                VALUES (?, ?, 1, 1, 1, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                ON DUPLICATE KEY UPDATE
+                    total_wins = total_wins + 1,
+                    current_streak = 1,
+                    longest_streak = GREATEST(longest_streak, 1),
+                    crowned_at = UTC_TIMESTAMP()
+                `, [newKing.id, newKing.displayName]);
+            }
+
+            //currentKingId = newKing.id;
+
+            // Get current King's Win Streak
+            const [rows] = await this.db.query(
+                'SELECT total_wins, current_streak, longest_streak, crowned_at FROM pvp_king_stats WHERE user_id = ?',
+                [newKing.id]
+            );
+            const totalWins = rows[0]?.total_wins || 0;
+            const streak = rows[0]?.current_streak || 0;
+            const longest = rows[0]?.longest_streak || 0;
+            const crowned_at = rows[0]?.crowned_at || 0;
+            let lastCrowned = (newKing_last_crowned === 0) ? crowned_at : newKing_last_crowned;
+
+            // Log to DB History
+            await this.db.query(`
+            INSERT INTO pvp_king_history
+                (king_id, king_name, type, total_wins_after, streak_after, longest_streak_after, last_crowned, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())
+            `, [
+                newKing.id,
+                newKing.displayName,
+                isDefense ? 'defense' : 'crown',
+                totalWins,
+                streak,
+                longest,
+                lastCrowned
+            ]);
+
+            // Public Feedback Message
+            const oldKingTag = oldKing ? `<@${oldKing.id}>` : '*No previous PvP King!*';
+            const crownEmbed = new EmbedBuilder()
+                .setDescription(`### 👑\u2002<@${newKing.id}> ${isDefense ? 'defended the PvP Throne!\u2002🛡️' : 'conquered the PvP Throne!\u2002⚔️'}`)
+                .addFields(
+                    { name: `🔥\u2002Current Win Streak: ${streak}`, value: '\u2002', inline: false },
+                    { name: `⚔️\u2002Longest Streak: ${longest}`, value: `\u2002`, inline: false },
+                    { name: `🏆\u2002Total Wins: ${totalWins}`, value: '\u2002', inline: false },
+                )
+                .setColor(isDefense ? 0x9b59b6 : 0xf1c40f)
+                .setThumbnail(newKing.displayAvatarURL())
+                .setFooter(createPvpFooter())
+                .setTimestamp();
+
+            if (!isDefense) {
+                crownEmbed.addFields(
+                    { name: 'Former King', value: oldKingTag, inline: true },
+                    { name: 'New King', value: `👑\u2002<@${newKing.id}>\u2002👑`, inline: true });
+            }
+
+            const crownMessage = await interaction.followUp({
+                embeds: [crownEmbed],
+                files: [getServerLogo()]
+            });
+
+            // Log Event to Log Channel
+            if (logChannel) {
+                const crownEmbedLog = new EmbedBuilder()
+                    .setDescription(
+                        `### 🏆\u2002<@${interaction.user.id}> used the \`/pvp_crown\` command!\u2002🤖\n` +
+                        `- Event Type: **${isDefense ? 'Defense 🛡️' : 'Crown 👑'}**\n` +
+                        `- Target Member: <@${newKing.id}>\n` +
+                        `### [🔗 Jump to ${isDefense ? 'Defense Message 🛡️' : 'Crown Message 👑'}](${crownMessage.url})`
+                    )
+                    .setColor(isDefense ? 0x9b59b6 : 0xf1c40f)
+                    .setThumbnail(newKing.displayAvatarURL())
+                    .setFooter(createPvpLogFooter())
+                    .setTimestamp();
+
+                if (!isDefense) {
+                    crownEmbedLog.addFields(
+                        { name: 'Former King', value: oldKingTag, inline: true },
+                        { name: 'New King', value: `👑\u2002<@${newKing.id}>\u2002👑`, inline: true }
+                    );
+                }
+
+                await logChannel.send({
+                    embeds: [crownEmbedLog],
+                    files: [getServerLogo()]
+                });
+            }
+
+            // Log to History Thread
+            try {
+                const historyThread = await interaction.guild.channels.fetch(this.historyThreadID);
+                if (!(historyThread instanceof ThreadChannel)) return;
+
+                const crownEmbedEntry = new EmbedBuilder()
+                    .setDescription(`### 👑\u2002<@${newKing.id}> ${isDefense ? 'defended the PvP Throne!\u2002🛡️' : 'conquered the PvP Throne!\u2002⚔️'}`)
+                    .addFields(
+                        { name: `🔥\u2002Current Win Streak: ${streak}`, value: '\u2002', inline: true },
+                        { name: `🏆\u2002Total Wins: ${totalWins}`, value: `\u2002`, inline: true },
+                    )
+                    .setColor(isDefense ? 0x9b59b6 : 0xf1c40f)
+                    .setThumbnail(newKing.displayAvatarURL())
+                    .setFooter(createPvpFooter())
+                    .setTimestamp();
+
+                await historyThread.send({
+                    embeds: [crownEmbedEntry],
+                    files: [getServerLogo()]
+                });
+            } catch (e) {
+                console.error(e);
+            }
+        } catch (err) {
+            console.error(err);
+            if (interaction.replied || interaction.deferred) {
+                return interaction.editReply({ content: '### ⚠️ Database error during Crowning.' });
+            }
+            return interaction.reply({ content: '### ⚠️ Database error during Crowning.', flags: MessageFlags.Ephemeral });
+        }
+    }
+}
+
+module.exports = PvpCrownKing;

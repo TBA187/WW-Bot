@@ -1,0 +1,114 @@
+// ====================
+// Create Bot Messages
+// ====================
+
+const { MessageFlags, EmbedBuilder, AttachmentBuilder } = require('discord.js');
+const path = require('path');
+
+module.exports = {
+    name: 'messageCreate',
+    async execute(message, config) {
+        if (message.author.bot) return;
+        if (!message.content.startsWith('?') && !message.content.startsWith('!')) return;
+
+        const allowedRoles = [config.leaderRoleID, config.adminRoleID, config.officerRoleID];
+        const isStaff = message.member.roles.cache.some(role => allowedRoles.includes(role.id));
+
+        // ---------------------------------------------------------
+        // COMMAND 1: !write / ?write command
+        // ---------------------------------------------------------
+        if (message.content.startsWith('!write') || message.content.startsWith('?write')) {
+            let newMessage = message.content.slice(7).trim(); // Remove prefix "! or ?" and "write "
+            let hidden = false;
+
+            // Check for hidden flag (-h)
+            if (newMessage.startsWith('-h ')) {
+                if (!isStaff) {
+                    return message.reply({ content: '### ❌  You do not have permission to use the hidden flag (-h)!' });
+                }
+
+                hidden = true;
+                newMessage = newMessage.slice(3).trim(); // Remove "-h "
+            }
+
+            const attachment = message.attachments.first();
+            let finalContent = newMessage || "";
+
+            if (!isStaff) {
+                // If NOT staff, force author footer
+                finalContent += `\n\n-# - Message created by <@${message.author.id}>`;
+            }
+
+            const payload = {
+                content: finalContent.trim() || null,
+                files: attachment ? [attachment.url] : []
+            };
+
+            try {
+                const sentMessage = await message.channel.send(payload);
+
+                let command = '?write';
+                if (hidden) {
+                    command = '?write -h';
+                    // Delete the original message command IF -h flag was used
+                    await message.delete();
+                }
+
+                // Ignore log events for specified channels (this.ignoredLogChannels)
+                if (config.logChannelID && !config.ignoredLogChannels.includes(message.channel.id)) {
+                    const logChannel = await message.client.channels.fetch(config.logChannelID);
+                    const imagePath = path.join(__dirname, '../images/ww_logo.png');
+                    const wwLogo = new AttachmentBuilder(imagePath, { name: 'wwLogo.png' });
+                    const logEmbed = new EmbedBuilder()
+                        .setTitle(`💻 \u2002\`${command}\` command used!`)
+                        .setColor(0x57F287)
+                        .setDescription(`<@${message.author.id}> (${message.author.username}) commanded the WW Bot to write a message.`)
+                        .addFields(
+                            { name: 'Executor', value: `\`${message.author.displayName}\``, inline: true },
+                            { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+                            { name: '\u200b', value: '\u200b', inline: true },
+                            { name: 'Message ID', value: `\`${sentMessage.id}\``, inline: true },
+                            { name: 'Message Link', value: `[Jump to message](${sentMessage.url})`, inline: true },
+                            { name: '\u200b', value: '\u200b', inline: true },
+                            {
+                                name: '📝 Message Content',
+                                value: `\`\`\`text\n${finalContent.trim() || '*No text content (Image only)*'}\n\`\`\``,
+                                inline: false
+                            }
+                        )
+                        .setFooter({ text: 'White Walker Logs', iconURL: 'attachment://wwLogo.png' })
+                        .setTimestamp();
+
+                    await logChannel.send({ embeds: [logEmbed], files: [wwLogo] });
+                }
+            } catch (err) {
+                console.error(err);
+                return message.reply({ content: '### ❌  Failed to send message.', flags: MessageFlags.Ephemeral });
+            }
+
+            return;
+        }
+
+        // ---------------------------------------------------------
+        // COMMAND 2: !welcome / ?welcome command
+        // ---------------------------------------------------------
+        if (/^[!?]welcome\b/.test(message.content)) { // matches !welcome or ?welcome at the start. \b → prevents accidental triggers like !welcome123
+            const member = message.mentions.members.first();
+            if (!member) {
+                return message.reply({ content: '### ❌  Please mention a user to welcome!', flags: MessageFlags.Ephemeral });
+            }
+
+            return message.channel.send(
+                `## 🎉  Welcome to White Walkers, <@${member.id}> — We're happy to have you here!  🎉\n` +
+                `### 📜 **Guild Rules:** <#1246059221280096357>\n` +
+                `### 📑 **Discord Information:** <#1454633218094530700>\n` +
+                `### 📢 **Guild Announcements:** <#1180559473501290688>\n_ _\n` +
+                `- <#1180559477519437947> — Introduce yourself to the guild\n` +
+                `- <#1184121209609269409> — Get yourself some roles (You can select multiple roles)\n` +
+                `- <#1345014095103135825> & <#1180559466555527309> — Feel free to ask any PvP related questions here\n` +
+                `- <#1469101041189523657> — Participate in our PvP King competition (Read Channel description for more info)\n` +
+                `### If you have any questions, feel free to ask in <#1301600985655017566> or send a DM to an Officer!`
+            );
+        }
+    }
+};

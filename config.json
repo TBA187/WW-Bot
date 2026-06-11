@@ -1,0 +1,26 @@
+{
+  "guildId": "1148499020038295582",
+  "welcomeChannelID": "1180559448968790098",
+  "ownerID": "291142291073269761",
+  "leaderRoleID": "1180559376499617852",
+  "adminRoleID": "1180559379171393679",
+  "officerRoleID": "1180559377636274259",
+  "pvpKingRoleID": "1469034357158051975",
+  "pvpWarriorRoleID": "1486696262043701369",
+  "wwRoleID": "1483676323301036072",
+  "streamRoleID": "1368716918420148314",
+  "botChannelID": "1181734695671693432",
+  "logChannelID": "1423716368326590575",
+  "ignoredLogChannels": [
+    "1184117095231918101"
+  ],
+  "ignoreLogPrivateChannelCreate": 1,
+  "blockedEditBotMsgChannels": [
+    "1181734695671693432",
+    "1423716368326590575",
+    "1469101041189523657",
+    "1470671708422668341"
+  ],
+  "pvpKingChannelID": "1469101041189523657",
+  "historyThreadID": "1470671708422668341"
+}
