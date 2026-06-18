@@ -11,7 +11,7 @@ const {
     MessageFlags
 } = require('discord.js');
 const {
-    guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, streamRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, historyThreadID
+    guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, streamRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, historyThreadID, dungeonChannelID, dungeonRoleID
 } = require('./config.json');
 
 const fs = require("fs");
@@ -120,6 +120,8 @@ const commandConfig = {
     blockedEditBotMsgChannels,
     pvpKingChannelID,
     historyThreadID,
+    dungeonChannelID,
+    dungeonRoleID,
     challengeTimeouts,
     onCooldown,
     commandMap,
@@ -160,10 +162,10 @@ async function bootstrap() {
                 const command = new CommandClass(commandConfig);
                 commandMap.set(command.name, command);
 
-                if (Array.isArray(command.data)) {
-                    for (const cmd of command.data) commandsForDiscord.push(cmd.toJSON());
-                } else {
-                    commandsForDiscord.push(command.data.toJSON());
+                const commandData = Array.isArray(command.data) ? command.data : [command.data];
+                for (const cmd of commandData) {
+                    commandsForDiscord.push(cmd.toJSON());
+                    if (cmd.name) commandMap.set(cmd.name, command);
                 }
             }
         }
@@ -371,7 +373,7 @@ client.on('interactionCreate', async interaction => {
 
         // Button Handling
         if (interaction.isButton()) {
-            for (const command of commandMap.values()) {
+            for (const command of new Set(commandMap.values())) {
                 if (typeof command.handleButton === 'function') {
                     const handled = await command.handleButton(interaction);
                     if (handled) return true; // explicitly mark handled
@@ -381,7 +383,7 @@ client.on('interactionCreate', async interaction => {
 
         // Select Menu Handling
         if (interaction.isStringSelectMenu()) {
-            for (const command of commandMap.values()) {
+            for (const command of new Set(commandMap.values())) {
                 if (typeof command.handleSelect === 'function') {
                     const handled = await command.handleSelect(interaction);
                     if (handled) return true;
@@ -391,7 +393,7 @@ client.on('interactionCreate', async interaction => {
 
         // Modal Handling
         if (interaction.isModalSubmit()) {
-            for (const command of commandMap.values()) {
+            for (const command of new Set(commandMap.values())) {
                 if (typeof command.handleModal === 'function') {
                     const handled = await command.handleModal(interaction);
                     if (handled) return true;

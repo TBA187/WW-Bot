@@ -56,12 +56,23 @@ function mapTrackRow(row) {
     };
 }
 
+const SPECIAL_TRACKS_CACHE_TTL_MS = Number(process.env.XP_TRACK_CACHE_TTL_MS || 60000);
+let specialTracksCache = {
+    expiresAt: 0,
+    tracks: null
+};
+
 /**
  * Fetch all special XP tracks from the database.
  * @param {object} db - MySQL database connection pool
  * @returns {Promise<Array>} Array of track objects
  */
 async function fetchSpecialTracks(db) {
+    const now = Date.now();
+    if (specialTracksCache.tracks && now < specialTracksCache.expiresAt) {
+        return specialTracksCache.tracks;
+    }
+
     try {
         const [rows] = await db.query(`
             SELECT id, name, role_ids, channel_ids, level_rewards,
@@ -70,9 +81,20 @@ async function fetchSpecialTracks(db) {
             FROM xp_channel_tracks
         `);
 
-        return rows.map(mapTrackRow);
+        const tracks = rows.map(mapTrackRow);
+        specialTracksCache = {
+            expiresAt: now + SPECIAL_TRACKS_CACHE_TTL_MS,
+            tracks
+        };
+
+        return tracks;
     } catch (err) {
         console.error('[XP DB HELPER] Error fetching special tracks:', err);
+        if (specialTracksCache.tracks) {
+            console.warn('[XP DB HELPER] Using cached special XP tracks after database error.');
+            return specialTracksCache.tracks;
+        }
+
         return [];
     }
 }

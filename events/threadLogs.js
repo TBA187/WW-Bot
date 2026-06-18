@@ -2,179 +2,229 @@
 // LOG Thread Events (Channel Threads & Forum Posts)
 // ==================================================
 
-// 🟡 EDIT START 🟡 - Use utility file and setup embed
 const { AuditLogEvent, ChannelType } = require('discord.js');
-const { formatEmoji, buildLogEmbed } = require('../utils/logHelpers.js');
-// 🟡 EDIT END 🟡
+const {
+    sleep,
+    isBlockedLogChannel,
+    fetchTargetAuditLog,
+    extractExecutor,
+    formatEmoji,
+    buildLogEmbed
+} = require('../utils/logHelpers.js');
+
+function isForumPost(thread) {
+    return thread.parent?.type === ChannelType.GuildForum;
+}
+
+function getThreadTypeName(thread) {
+    return isForumPost(thread) ? 'Forum Post' : 'Thread';
+}
+
+function getThreadTypeEmoji(thread) {
+    return isForumPost(thread) ? '💬' : '🧵';
+}
+
+function getParentLabel(thread) {
+    return thread.parentId ? `<#${thread.parentId}>` : '*Unknown Parent*';
+}
+
+function getCategoryLabel(thread) {
+    const category = thread.parent?.parent;
+    if (!category) return '*Uncategorized!*';
+    return `${category.name} (\`${category.id}\`)`;
+}
+
+function formatArchiveDuration(minutes) {
+    if (!minutes) return 'Default';
+    if (minutes === 60) return '1 Hour';
+    if (minutes === 1440) return '24 Hours';
+    if (minutes === 4320) return '3 Days';
+    if (minutes === 10080) return '1 Week';
+    return minutes >= 60 ? `${minutes / 60} Hours` : `${minutes} Minutes`;
+}
+
+function formatForumTag(thread, tagId) {
+    const tag = thread.parent?.availableTags?.find(t => t.id === tagId);
+    if (!tag) return '`Unknown Tag`';
+
+    const emoji = formatEmoji(tag);
+    return emoji ? `\`${tag.name}\` ${emoji}` : `\`${tag.name}\``;
+}
+
+function getAppliedTags(thread) {
+    return Array.isArray(thread.appliedTags) ? thread.appliedTags : [];
+}
+
+function getPinnedState(thread) {
+    return thread.flags?.has?.('Pinned') ?? false;
+}
 
 module.exports = {
-    name: 'forumLogs', // Just an identifier
+    name: 'threadLogs',
 
     async handleThreadCreate(thread, config) {
         if (!thread.guild) return;
-        if (config.ignoredLogChannels && config.ignoredLogChannels.includes(thread.parentId)) return;
-
-        const isForum = thread.parent?.type === ChannelType.GuildForum;
-        const typeName = isForum ? 'Forum Post' : 'Thread';
-        const parentName = isForum ? 'Forum' : 'Parent';
-        const typeEmoji = isForum ? '💬' : '🧵';
-        const parentChannel = thread.parent;
-        const categoryName = parentChannel?.parent?.name || '*Uncategorized!*';
-        const categoryId = parentChannel?.parent?.id || '*No ID!*';
-        const isThreadPrivate = thread.type === ChannelType.PrivateThread;
+        if (isBlockedLogChannel(thread.parentId, config.ignoredLogChannels)) return;
 
         const logChannel = thread.guild.channels.cache.get(config.logChannelID);
         if (!logChannel) return;
 
-        await new Promise(res => setTimeout(res, 1500));
-        const fetchedLogs = await thread.guild.fetchAuditLogs({ limit: 5, type: AuditLogEvent.ThreadCreate });
-        const entry = fetchedLogs.entries.find(e => e.target.id === thread.id && Date.now() - e.createdTimestamp < 10000);
+        const typeName = getThreadTypeName(thread);
+        const typeEmoji = getThreadTypeEmoji(thread);
+        const isPrivate = thread.type === ChannelType.PrivateThread;
 
-        const ownerId = thread.ownerId || entry?.executor?.id;
-        const executor = ownerId ? `<@${ownerId}>` : 'Unknown User';
-        const executorName = entry?.executor ? entry.executor.username : (thread.guild.members.cache.get(ownerId)?.user.username || 'Unknown Username');
+        await sleep(1500);
+        const entry = await fetchTargetAuditLog(thread.guild, AuditLogEvent.ThreadCreate, thread.id, 15000);
+        const executor = extractExecutor(entry, thread.ownerId, thread.guild);
 
-        let details = [];
-        details.push(`- **${typeName} Title:** <#${thread.id}>`);
-        details.push(`- **Visibility:** ${isThreadPrivate ? 'Private 🔒' : 'Public 🌐'}`);
-        details.push(`- **${parentName} Channel:** <#${thread.parentId}> (\`${thread.parentId}\`)`);
-        details.push(`- **Category:** ${categoryName} (\`${categoryId}\`)`);
+        const details = [
+            `- **Title:** <#${thread.id}>`,
+            `- **Type:** ${typeName} ${typeEmoji}`,
+            `- **Visibility:** ${isPrivate ? 'Private 🔒' : 'Public 🌐'}`,
+            `- **Parent Channel:** ${getParentLabel(thread)}`,
+            `- **Category:** ${getCategoryLabel(thread)}`
+        ];
 
-        if (isForum && thread.appliedTags.length > 0) {
-            const forumTags = parentChannel.availableTags || [];
-            const tagString = thread.appliedTags.map(id => {
-                const tag = forumTags.find(t => t.id === id);
-                if (!tag) return '`Unknown Tag`';
-                const emojiStr = formatEmoji(tag);
-                return emojiStr ? `\`${tag.name}\` ${emojiStr}` : `\`${tag.name}\``;
-            }).join(', ');
-            details.push(`- **Selected Tag(s):** ${tagString}`);
+        const appliedTags = getAppliedTags(thread);
+        if (isForumPost(thread) && appliedTags.length > 0) {
+            details.push(`- **Selected Tag(s):** ${appliedTags.map(tagId => formatForumTag(thread, tagId)).join(', ')}`);
         }
 
-        if (thread.rateLimitPerUser) details.push(`- **Slowmode:** \`${thread.rateLimitPerUser}s\``);
-
+        if (thread.rateLimitPerUser) {
+            details.push(`- **Slowmode:** \`${thread.rateLimitPerUser}s\``);
+        }
 
         const fields = [
-            { name: 'Category', value: categoryName, inline: true },
-            { name: 'Parent Channel', value: `<#${thread.parentId}>`, inline: true },
-            { name: 'Created By', value: `${executor} (${executorName})`, inline: false }
+            { name: 'Name', value: thread.name || `<#${thread.id}>`, inline: true },
+            { name: 'Thread Type', value: `${typeName} ${typeEmoji}`, inline: true },
+            { name: 'Parent Channel', value: getParentLabel(thread), inline: true },
+            { name: 'Created By', value: `${executor.mention} (${executor.username})`, inline: false }
         ];
 
         const logPayload = buildLogEmbed(
-            `${typeEmoji} New ${typeName} Created`,
+            `✅ ${typeName} Created: <#${thread.id}>`,
             details.join('\n'),
             thread.id,
             0x00FF00,
             typeName,
             fields
         );
+
         await logChannel.send(logPayload);
     },
 
     async handleThreadDelete(thread, config) {
         if (!thread.guild) return;
-        if (config.ignoredLogChannels && config.ignoredLogChannels.includes(thread.parentId)) return;
-
-        const isForum = thread.parent?.type === ChannelType.GuildForum;
-        const typeName = isForum ? 'Forum Post' : 'Thread';
+        if (isBlockedLogChannel(thread.parentId, config.ignoredLogChannels)) return;
 
         const logChannel = thread.guild.channels.cache.get(config.logChannelID);
         if (!logChannel) return;
 
-        await new Promise(res => setTimeout(res, 1500));
-        const fetchedLogs = await thread.guild.fetchAuditLogs({ limit: 5, type: AuditLogEvent.ThreadDelete });
-        const entry = fetchedLogs.entries.find(e => e.target.id === thread.id && Date.now() - e.createdTimestamp < 10000);
+        const typeName = getThreadTypeName(thread);
 
-        const executor = entry?.executor ? `<@${entry.executor.id}>` : 'Unknown User';
-        const executorName = entry?.executor ? entry.executor.username : 'Unknown Username';
+        await sleep(1500);
+        const entry = await fetchTargetAuditLog(thread.guild, AuditLogEvent.ThreadDelete, thread.id, 15000);
+        const executor = extractExecutor(entry, null, thread.guild);
 
-        const description = `- **Title:** ${thread.name}\n- **Parent Channel:** <#${thread.parentId}>`;
-        const executorString = `${executor} (${executorName})`;
+        const description = [
+            `- **Title:** ${thread.name || `\`${thread.id}\``}`,
+            `- **Parent Channel:** ${getParentLabel(thread)}`
+        ].join('\n');
 
-        const logPayload = buildLogEmbed('delete', `❌ ${typeName} Deleted`, description, thread.id, executorString, 0xFF0000);
+        const fields = [
+            { name: typeName, value: thread.name || `\`${thread.id}\``, inline: true },
+            { name: 'Parent Channel', value: getParentLabel(thread), inline: true },
+            { name: 'Deleted By', value: `${executor.mention} (${executor.username})`, inline: false }
+        ];
+
+        const logPayload = buildLogEmbed(
+            `❌ ${typeName} Deleted`,
+            description,
+            thread.id,
+            0xFF0000,
+            typeName,
+            fields
+        );
+
         await logChannel.send(logPayload);
     },
 
     async handleThreadUpdate(oldThread, newThread, config) {
         if (!newThread.guild) return;
-        if (config.ignoredLogChannels && config.ignoredLogChannels.includes(newThread.parentId)) return;
-
-        const isForum = newThread.parent?.type === ChannelType.GuildForum;
-        const typeName = isForum ? 'Forum Post' : 'Thread';
+        if (isBlockedLogChannel(newThread.parentId, config.ignoredLogChannels)) return;
 
         const logChannel = newThread.guild.channels.cache.get(config.logChannelID);
         if (!logChannel) return;
 
-        await new Promise(res => setTimeout(res, 2000));
-        const fetchedLogs = await newThread.guild.fetchAuditLogs({ limit: 10, type: AuditLogEvent.ThreadUpdate });
-        const logEntry = fetchedLogs.entries.find(e => e.target.id === newThread.id && Date.now() - e.createdTimestamp < 15000);
+        const typeName = getThreadTypeName(newThread);
+        const typeEmoji = getThreadTypeEmoji(newThread);
 
-        const executor = logEntry?.executor ? `<@${logEntry.executor.id}>` : 'Unknown User';
-        const executorName = logEntry?.executor ? logEntry.executor.username : 'Unknown Username';
+        await sleep(2000);
+        const entry = await fetchTargetAuditLog(newThread.guild, AuditLogEvent.ThreadUpdate, newThread.id, 20000);
+        const executor = extractExecutor(entry, null, newThread.guild);
 
-        let changes = [];
+        const changes = [];
 
         if (oldThread.name !== newThread.name) {
-            changes.push(`- **Title Changed:** \`${oldThread.name}\` ➔ \`${newThread.name}\``);
+            changes.push(`- **Title:** \`${oldThread.name}\` ➜ \`${newThread.name}\``);
         }
 
         if (oldThread.rateLimitPerUser !== newThread.rateLimitPerUser) {
-            const oldS = oldThread.rateLimitPerUser ? `${oldThread.rateLimitPerUser}s` : 'Off';
-            const newS = newThread.rateLimitPerUser ? `${newThread.rateLimitPerUser}s` : 'Off';
-            changes.push(`- **Slowmode:** \`${oldS}\` ➔ \`${newS}\``);
+            const oldSlowmode = oldThread.rateLimitPerUser ? `${oldThread.rateLimitPerUser}s` : 'Off';
+            const newSlowmode = newThread.rateLimitPerUser ? `${newThread.rateLimitPerUser}s` : 'Off';
+            changes.push(`- **Slowmode:** \`${oldSlowmode}\` ➜ \`${newSlowmode}\``);
         }
 
         if (oldThread.autoArchiveDuration !== newThread.autoArchiveDuration) {
-            const formatDur = (m) => m >= 60 ? `${m / 60}h` : `${m}m`;
-            changes.push(`- **Hide After Inactivity:** \`${formatDur(oldThread.autoArchiveDuration)}\` ➔ \`${formatDur(newThread.autoArchiveDuration)}\``);
+            changes.push(`- **Hide After Inactivity:** \`${formatArchiveDuration(oldThread.autoArchiveDuration)}\` ➜ \`${formatArchiveDuration(newThread.autoArchiveDuration)}\``);
         }
 
-        if (isForum && JSON.stringify(oldThread.appliedTags) !== JSON.stringify(newThread.appliedTags)) {
-            const forumTags = newThread.parent?.availableTags || [];
-            const getTagInfo = (id) => {
-                const tag = forumTags.find(t => t.id === id);
-                if (!tag) return `\`Unknown Tag\``;
-                const emoji = formatEmoji(tag);
-                return emoji ? `\`${tag.name}\`  ${emoji}` : `\`${tag.name}\``;
-            };
+        const oldAppliedTags = getAppliedTags(oldThread);
+        const newAppliedTags = getAppliedTags(newThread);
+        if (isForumPost(newThread) && JSON.stringify(oldAppliedTags) !== JSON.stringify(newAppliedTags)) {
+            const added = newAppliedTags.filter(tagId => !oldAppliedTags.includes(tagId));
+            const removed = oldAppliedTags.filter(tagId => !newAppliedTags.includes(tagId));
 
-            const added = newThread.appliedTags.filter(id => !oldThread.appliedTags.includes(id));
-            const removed = oldThread.appliedTags.filter(id => !newThread.appliedTags.includes(id));
+            if (added.length > 0) {
+                changes.push(`- **Tag Added:** ${added.map(tagId => formatForumTag(newThread, tagId)).join(', ')}`);
+            }
 
-            if (added.length > 0) changes.push(`- **✅ Tag Added:** ${added.map(id => getTagInfo(id)).join(', ')}`);
-            if (removed.length > 0) changes.push(`- **❌ Tag Removed:** ${removed.map(id => getTagInfo(id)).join(', ')}`);
+            if (removed.length > 0) {
+                changes.push(`- **Tag Removed:** ${removed.map(tagId => formatForumTag(newThread, tagId)).join(', ')}`);
+            }
         }
 
-        if (oldThread.flags.has('Pinned') !== newThread.flags.has('Pinned')) {
-            changes.push(`- **Pinned:** \`${newThread.flags.has('Pinned') ? 'Yes' : 'No'}\``);
+        if (getPinnedState(oldThread) !== getPinnedState(newThread)) {
+            changes.push(`- **Pinned:** \`${getPinnedState(newThread) ? 'Yes' : 'No'}\``);
         }
 
         if (oldThread.locked !== newThread.locked) {
-            changes.push(`- **Locked Status:** \`${oldThread.locked ? 'Locked' : 'Unlocked'}\` ➔ \`${newThread.locked ? 'Locked' : 'Unlocked'}\``);
+            changes.push(`- **Locked:** \`${oldThread.locked ? 'Locked' : 'Unlocked'}\` ➜ \`${newThread.locked ? 'Locked' : 'Unlocked'}\``);
         }
 
         if (oldThread.archived !== newThread.archived) {
-            changes.push(`- **Archive Status:** \`${oldThread.archived ? 'Archived' : 'Active'}\` ➔ \`${newThread.archived ? 'Archived' : 'Active'}\``);
+            changes.push(`- **Archive Status:** \`${oldThread.archived ? 'Archived' : 'Active'}\` ➜ \`${newThread.archived ? 'Archived' : 'Active'}\``);
         }
 
         if (changes.length === 0) return;
 
-        // Replace the bottom of handleThreadUpdate with this:
         const fields = [
-            { name: 'Parent Channel', value: `<#${newThread.parentId}>`, inline: true },
-            { name: 'Thread', value: `<#${newThread.id}>`, inline: true },
-            { name: 'Updated By', value: `${executor} (${executorName})`, inline: false }
+            { name: 'Name', value: newThread.name || `<#${newThread.id}>`, inline: true },
+            { name: 'Thread Type', value: `${typeName} ${typeEmoji}`, inline: true },
+            { name: 'Parent Channel', value: getParentLabel(newThread), inline: true },
+            { name: 'Updated By', value: `${executor.mention} (${executor.username})`, inline: false },
+            { name: 'Changes:', value: changes.join('\n'), inline: false }
         ];
 
         const logPayload = buildLogEmbed(
             `🔄 ${typeName} Updated: <#${newThread.id}>`,
-            changes.join('\n'),
-            newThread.id,
             null,
+            newThread.id,
             0xFFA500,
             typeName,
             fields
         );
+
         await logChannel.send(logPayload);
     }
 };

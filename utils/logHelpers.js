@@ -140,13 +140,26 @@ module.exports = {
     // Build embed message for Discord Logs
     buildLogEmbed: (title, description, id, color, typeName, fields = []) => {
         const attachment = new AttachmentBuilder('./images/ww_logo.png', { name: 'ww_logo.png' });
+        const safeFields = Array.isArray(fields)
+            ? fields
+                .filter(field => field && typeof field === 'object')
+                .map(field => ({
+                    name: String(field.name || '\u200B').slice(0, 256),
+                    value: String(field.value || '\u200B').slice(0, 1024),
+                    inline: Boolean(field.inline)
+                }))
+            : [];
+
         const embed = new EmbedBuilder()
             .setTitle(title)
-            .setColor(color)
+            .setColor(color || 0x808080)
             .setDescription(description || ' ')
-            .addFields(fields)
             .setFooter({ text: `${typeName} ID: ${id}`, iconURL: 'attachment://ww_logo.png' })
             .setTimestamp();
+
+        if (safeFields.length > 0) {
+            embed.addFields(safeFields);
+        }
 
         return { embeds: [embed], files: [attachment] };
     }

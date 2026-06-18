@@ -2,8 +2,35 @@
 // Create Bot Messages
 // ====================
 
-const { MessageFlags, EmbedBuilder, AttachmentBuilder } = require('discord.js');
+const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const path = require('path');
+
+const MAX_EMBED_FIELD_VALUE_LENGTH = 1024;
+
+function formatMessageContentForLog(content) {
+    const text = content.trim() || '*No text content (Image only)*';
+    const prefix = '```text\n';
+    const suffix = '\n```';
+    const fullValue = `${prefix}${text}${suffix}`;
+
+    if (fullValue.length <= MAX_EMBED_FIELD_VALUE_LENGTH) {
+        return fullValue;
+    }
+
+    const truncationNotice = '\n... [Message content truncated in logs]';
+    const maxTextLength = MAX_EMBED_FIELD_VALUE_LENGTH - prefix.length - suffix.length - truncationNotice.length;
+    return `${prefix}${text.slice(0, maxTextLength)}${truncationNotice}${suffix}`;
+}
+
+async function notifyWriteFailure(message) {
+    const content = '### ❌  Failed to send message.';
+
+    try {
+        return await message.reply({ content });
+    } catch {
+        return message.channel.send({ content }).catch(() => { });
+    }
+}
 
 module.exports = {
     name: 'messageCreate',
@@ -18,7 +45,7 @@ module.exports = {
         // COMMAND 1: !write / ?write command
         // ---------------------------------------------------------
         if (message.content.startsWith('!write') || message.content.startsWith('?write')) {
-            let newMessage = message.content.slice(7).trim(); // Remove prefix "! or ?" and "write "
+            let newMessage = message.content.slice(7).trim();
             let hidden = false;
 
             // Check for hidden flag (-h)
@@ -32,7 +59,7 @@ module.exports = {
             }
 
             const attachment = message.attachments.first();
-            let finalContent = newMessage || "";
+            let finalContent = newMessage || '';
 
             if (!isStaff) {
                 // If NOT staff, force author footer
@@ -51,39 +78,43 @@ module.exports = {
                 if (hidden) {
                     command = '?write -h';
                     // Delete the original message command IF -h flag was used
-                    await message.delete();
+                    await message.delete().catch(() => { });
                 }
 
                 // Ignore log events for specified channels (this.ignoredLogChannels)
                 if (config.logChannelID && !config.ignoredLogChannels.includes(message.channel.id)) {
-                    const logChannel = await message.client.channels.fetch(config.logChannelID);
-                    const imagePath = path.join(__dirname, '../images/ww_logo.png');
-                    const wwLogo = new AttachmentBuilder(imagePath, { name: 'wwLogo.png' });
-                    const logEmbed = new EmbedBuilder()
-                        .setTitle(`💻 \u2002\`${command}\` command used!`)
-                        .setColor(0x57F287)
-                        .setDescription(`<@${message.author.id}> (${message.author.username}) commanded the WW Bot to write a message.`)
-                        .addFields(
-                            { name: 'Executor', value: `\`${message.author.displayName}\``, inline: true },
-                            { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
-                            { name: '\u200b', value: '\u200b', inline: true },
-                            { name: 'Message ID', value: `\`${sentMessage.id}\``, inline: true },
-                            { name: 'Message Link', value: `[Jump to message](${sentMessage.url})`, inline: true },
-                            { name: '\u200b', value: '\u200b', inline: true },
-                            {
-                                name: '📝 Message Content',
-                                value: `\`\`\`text\n${finalContent.trim() || '*No text content (Image only)*'}\n\`\`\``,
-                                inline: false
-                            }
-                        )
-                        .setFooter({ text: 'White Walker Logs', iconURL: 'attachment://wwLogo.png' })
-                        .setTimestamp();
+                    try {
+                        const logChannel = await message.client.channels.fetch(config.logChannelID);
+                        const imagePath = path.join(__dirname, '../images/ww_logo.png');
+                        const wwLogo = new AttachmentBuilder(imagePath, { name: 'wwLogo.png' });
+                        const logEmbed = new EmbedBuilder()
+                            .setTitle(`💻 \u2002\`${command}\` command used!`)
+                            .setColor(0x57F287)
+                            .setDescription(`<@${message.author.id}> (${message.author.username}) commanded the WW Bot to write a message.`)
+                            .addFields(
+                                { name: 'Executor', value: `\`${message.author.displayName}\``, inline: true },
+                                { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+                                { name: '\u200b', value: '\u200b', inline: true },
+                                { name: 'Message ID', value: `\`${sentMessage.id}\``, inline: true },
+                                { name: 'Message Link', value: `[Jump to message](${sentMessage.url})`, inline: true },
+                                { name: '\u200b', value: '\u200b', inline: true },
+                                {
+                                    name: '📝 Message Content',
+                                    value: formatMessageContentForLog(finalContent),
+                                    inline: false
+                                }
+                            )
+                            .setFooter({ text: 'White Walker Logs', iconURL: 'attachment://wwLogo.png' })
+                            .setTimestamp();
 
-                    await logChannel.send({ embeds: [logEmbed], files: [wwLogo] });
+                        await logChannel.send({ embeds: [logEmbed], files: [wwLogo] });
+                    } catch (logErr) {
+                        console.error('[WW LOG] Failed to log write command:', logErr);
+                    }
                 }
             } catch (err) {
                 console.error(err);
-                return message.reply({ content: '### ❌  Failed to send message.', flags: MessageFlags.Ephemeral });
+                return notifyWriteFailure(message);
             }
 
             return;
@@ -92,10 +123,10 @@ module.exports = {
         // ---------------------------------------------------------
         // COMMAND 2: !welcome / ?welcome command
         // ---------------------------------------------------------
-        if (/^[!?]welcome\b/.test(message.content)) { // matches !welcome or ?welcome at the start. \b → prevents accidental triggers like !welcome123
+        if (/^[!?]welcome\b/.test(message.content)) {
             const member = message.mentions.members.first();
             if (!member) {
-                return message.reply({ content: '### ❌  Please mention a user to welcome!', flags: MessageFlags.Ephemeral });
+                return message.reply({ content: '### ❌  Please mention a user to welcome!' });
             }
 
             return message.channel.send(
