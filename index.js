@@ -234,6 +234,12 @@ async function bootstrap() {
                     continue;
                 }
 
+                if (file === 'userUpdatesLogger.js') {
+                    client.on('userUpdate', (oldU, newU) => event.handleUserUpdate(oldU, newU, commandConfig));
+                    client.on('guildMemberUpdate', (oldM, newM) => event.handleGuildMemberUpdate(oldM, newM, commandConfig));
+                    continue;
+                }
+
                 // Standard Event Handling
                 if (event.name && typeof event.execute === 'function') {
                     // MASTER SETTINGS LOGIC - Skip listening for events if disabled globally
@@ -317,26 +323,6 @@ client.once(Events.ClientReady, async () => {
             type: ActivityType[type] || ActivityType.Playing,
         }],
     });
-
-    // ------- PvP King Logic - Needs to be deleted! Instead fetch member manually in each pvp command! - Don't rely on this cache!
-    console.log('[WW LOG] Checking for PvP Kings across all guilds...');
-    for (const guild of client.guilds.cache.values()) {
-        try {
-            await guild.members.fetch();
-            const kingRole = guild.roles.cache.get(pvpKingRoleID);
-            if (kingRole) {
-                const kings = kingRole.members;
-                if (kings.size === 1) {
-                    currentKingId = kings.first().id;
-                    console.log(`[WW LOG] [${guild.name}] Loaded current PvP King: ${currentKingId}`);
-                } else if (kings.size > 1) {
-                    console.log(`[WW LOG] [${guild.name}] WARNING: ${kings.size} PvP Kings detected!`);
-                }
-            }
-        } catch (err) {
-            console.error(`[WW LOG] Error fetching roles for guild ${guild.id}:`, err);
-        }
-    }
 
     // Check if PvP King cooldowns naturally expired (every 60 seconds)
     const cooldownTask = require('./tasks/cooldownNotifier.js');

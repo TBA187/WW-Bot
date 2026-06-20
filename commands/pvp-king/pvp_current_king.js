@@ -24,6 +24,8 @@ class PvpCurrentKing {
             return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
         }
 
+        await interaction.deferReply();
+
         try {
             const { guild } = interaction;
             const logChannel = guild.channels.cache.get(this.logChannelID);
@@ -39,20 +41,22 @@ class PvpCurrentKing {
                     await logChannel.send(`### 🚨 <@${this.ownerID}> — PvP King role missing! (${now})`);
                 }
 
-                return interaction.reply({
+                return interaction.editReply({
                     content: '### ❌ PvP King role not found! Officers have been notified and will resolve the issue as soon as possible.',
-                    flags: MessageFlags.Ephemeral
                 });
             }
+
+            await interaction.guild.members.fetch().catch(err => {
+                console.error('[WW LOG] Failed to refresh members for /pvp_current_king:', err.code || err.message);
+            });
 
             if (kingRole.members.size === 0) {
                 if (logChannel) {
                     await logChannel.send(`### 🚨 <@${this.ownerID}> — No PvP King found! (${now})`);
                 }
 
-                return interaction.reply({
+                return interaction.editReply({
                     content: '### ⚠️ No PvP King found! Officers have been notified and will resolve the issue as soon as possible.',
-                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -61,13 +65,10 @@ class PvpCurrentKing {
                     await logChannel.send(`### 🚨 <@${this.ownerID}> — Multiple PvP Kings detected: ${kingRole.members.size} — (${now})`);
                 }
 
-                return interaction.reply({
+                return interaction.editReply({
                     content: '### ⚠️ Multiple PvP Kings detected! Officers have been notified and will resolve the issue as soon as possible.',
-                    flags: MessageFlags.Ephemeral
                 });
             }
-
-            await interaction.deferReply();
 
             const currentKing = kingRole.members.first();
 

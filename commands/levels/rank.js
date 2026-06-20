@@ -10,10 +10,10 @@ const { resolveXpTrack, fetchXpTrackAutocompleteChoices } = require('../../utils
 const path = require('path');
 
 function formatTrackingSince(value) {
-    if (!value) return '-# XP data does not have a recorded start date yet.';
+    if (!value) return 'XP tracking start date is not recorded yet.';
 
     const date = value instanceof Date ? value : new Date(value);
-    if (Number.isNaN(date.getTime())) return '-# XP data does not have a recorded start date yet.';
+    if (Number.isNaN(date.getTime())) return 'XP tracking start date is not recorded yet.';
 
     const dateParts = new Intl.DateTimeFormat('en-GB', {
         year: 'numeric',
@@ -24,7 +24,7 @@ function formatTrackingSince(value) {
     const monthNumber = String(date.getMonth() + 1).padStart(2, '0');
     const formatted = `${partByType.year}-${monthNumber}-${partByType.day}`;
 
-    return `-# XP data has been tracked since ${formatted}`;
+    return `XP tracked since ${formatted}`;
 }
 
 function formatVoiceTime(minutes) {
@@ -46,20 +46,40 @@ function capitalizeDisplayName(name) {
     return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
-function getTrackTargetFields(trackInfo) {
-    const roleList = trackInfo.roleIds.length > 0
-        ? trackInfo.roleIds.map(id => `<@&${id}>`).join('\n')
-        : 'None';
-    const channelList = trackInfo.channelIds.length > 0
-        ? trackInfo.channelIds.map(id => `<#${id}>`).join('\n')
-        : 'None';
+function getTrackRequirementDisplay(trackInfo) {
+    const roleLabel = trackInfo.roleIds.length === 1 ? 'XP-Role' : 'XP-Roles';
+    const channelLabel = trackInfo.channelIds.length === 1 ? 'XP-Channel' : 'XP-Channels';
+    const commaRoles = trackInfo.roleIds.map(id => `<@&${id}>`).join(', ');
+    const commaChannels = trackInfo.channelIds.map(id => `<#${id}>`).join(', ');
+    const hasRoles = trackInfo.roleIds.length > 0;
+    const hasChannels = trackInfo.channelIds.length > 0;
 
-    return [
-        { name: '\u2002', value: `\u2B50\u2002Viewing XP progress for the **${trackInfo.displayName}** XP-Track:`, inline: false },
-        { name: trackInfo.channelIds.length === 1 ? 'Channel' : 'Channels', value: channelList, inline: true },
-        { name: trackInfo.roleIds.length === 1 ? 'Role' : 'Roles', value: roleList, inline: true },
-        { name: '\u2002', value: '\u2002', inline: false }
-    ];
+    if (hasRoles && hasChannels) {
+        return {
+            description: '',
+            fields: [
+                { name: roleLabel, value: trackInfo.roleIds.map(id => `-# <@&${id}>`).join('\n'), inline: true },
+                { name: channelLabel, value: trackInfo.channelIds.map(id => `-# <#${id}>`).join('\n'), inline: true },
+                { name: '\u2002', value: '\u2002', inline: false }
+            ]
+        };
+    }
+
+    if (hasRoles) {
+        return {
+            description: `**${roleLabel}:** ${commaRoles}`,
+            fields: []
+        };
+    }
+
+    if (hasChannels) {
+        return {
+            description: `**${channelLabel}:** ${commaChannels}`,
+            fields: []
+        };
+    }
+
+    return { description: '', fields: [] };
 }
 
 class Rank {
@@ -71,7 +91,7 @@ class Rank {
             .setDescription('Check level and detailed XP stats for a user')
             .addUserOption(opt => opt.setName('user').setDescription('User to check (leave empty for yourself)'))
             .addStringOption(opt => opt
-                .setName('track')
+                .setName('xp_track')
                 .setDescription('Optional: Select an XP Track (leave empty for Global XP track)')
                 .setAutocomplete(true)
             );
@@ -80,7 +100,7 @@ class Rank {
     async execute(interaction) {
         const target = interaction.options.getUser('user') || interaction.user;
         const targetMember = interaction.options.getMember('user') || interaction.member;
-        const trackInput = interaction.options.getString('track');
+        const trackInput = interaction.options.getString('xp_track');
         const guildId = interaction.guild.id;
 
         const trackInfo = await resolveXpTrack(this.config.db, trackInput);
@@ -107,15 +127,45 @@ class Rank {
             `, [target.id, guildId, track]);
 
             if (!rows[0] && !trackInfo.isGlobal) {
-                const roleList = trackInfo.roleIds.length > 0
-                    ? trackInfo.roleIds.map(id => `<@&${id}>`).join('\n')
-                    : 'None';
-                const channelList = trackInfo.channelIds.length > 0
-                    ? trackInfo.channelIds.map(id => `<#${id}>`).join('\n')
-                    : 'None';
+                const trackRequirements = getTrackRequirementDisplay(trackInfo);
+                const roleLabel = trackInfo.roleIds.length === 1 ? 'XP-Role' : 'XP-Roles';
+                const channelLabel = trackInfo.channelIds.length === 1 ? 'XP-Channel' : 'XP-Channels';
+                const requirements = [];
 
-                return interaction.editReply({
-                    content: `### No Data Found\n${target} has no data for the **${trackInfo.displayName}** XP track.\n**XP-Track Roles:** ${roleList}\n**XP-Track Channels:** ${channelList}`
+                if (trackInfo.roleIds.length > 0) {
+                    requirements.push(`have the specified ${roleLabel}`);
+                }
+
+                if (trackInfo.channelIds.length > 0) {
+                    requirements.push(`send messages in the specified ${channelLabel}`);
+                }
+
+                const requirementText = requirements.length > 0
+                    ? `To earn special **${trackInfo.displayName}** XP, you need to ${requirements.join(' and ')} below:`
+                    : `No role or channel requirements are configured for this XP track.`;
+
+                const logoPath = path.join(__dirname, '../../images/ww_logo.png');
+                const logoFile = new AttachmentBuilder(logoPath, { name: 'ww_logo.png' });
+                const noDataEmbed = new EmbedBuilder()
+                    .setTitle('No XP Data Found!')
+                    .setColor(trackInfo.color || '#3f4bff')
+                    .setDescription(
+                        `${target} has no XP Data for the **${trackInfo.displayName}** XP-track.\n` +
+                        `${requirementText}` +
+                        `${trackRequirements.description ? `\n${trackRequirements.description}` : ''}`
+                    )
+                    .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+                    .setFooter({ text: 'White Walker Level System', iconURL: 'attachment://ww_logo.png' })
+                    .setTimestamp();
+
+                if (trackRequirements.fields.length > 0) {
+                    noDataEmbed.addFields(trackRequirements.fields);
+                }
+
+                await interaction.deleteReply().catch(() => { });
+                return interaction.followUp({
+                    embeds: [noDataEmbed],
+                    files: [logoFile]
                 });
             }
 
@@ -157,15 +207,15 @@ class Rank {
             const trackingSince = formatTrackingSince(data.xp_date);
             const rankTitle = trackInfo.isGlobal
                 ? `${displayName}'s Rank Overview`
-                : `${displayName}'s Rank Overview for ${trackInfo.displayName}`;
+                : `${displayName}'s Rank Overview for ${trackInfo.displayName}:`;
+            const trackRequirements = !trackInfo.isGlobal ? getTrackRequirementDisplay(trackInfo) : { description: '', fields: [] };
 
             const rankEmbed = new EmbedBuilder()
                 .setTitle(rankTitle)
-                .setDescription(trackingSince)
                 .setThumbnail(target.displayAvatarURL({ dynamic: true }))
                 .setColor(trackInfo.color || '#3f4bff')
                 .addFields(
-                    ...(!trackInfo.isGlobal ? getTrackTargetFields(trackInfo) : []),
+                    ...trackRequirements.fields,
                     { name: 'Level', value: `**${formatNumber(data.level)}**`, inline: true },
                     { name: 'XP Progress', value: xpProgress, inline: true },
                     { name: 'XP for next Level', value: xpForNextLevel, inline: true },
@@ -176,8 +226,12 @@ class Rank {
                     { name: '🎙️\u2002Voice Chat Hours       \u200b', value: `- Total: **${formatVoiceTime(data.total_voice_minutes)}**\n- XP: **${formatNumber(data.voice_xp)}**`, inline: true },
                     { name: '⌨️\u2002Commands used', value: `- Total: **${formatNumber(data.total_commands_used)}**\n- XP: **${formatNumber(data.command_xp)}**`, inline: true }
                 )
-                .setFooter({ text: 'White Walker Level System', iconURL: 'attachment://ww_logo.png' })
+                .setFooter({ text: `${trackingSince}`, iconURL: 'attachment://ww_logo.png' })
                 .setTimestamp();
+
+            if (trackRequirements.description) {
+                rankEmbed.setDescription(trackRequirements.description);
+            }
 
             return interaction.editReply({ embeds: [rankEmbed], files: [logoFile] });
         } catch (err) {

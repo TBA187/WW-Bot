@@ -52,7 +52,8 @@ function mapTrackRow(row) {
         sendLevelUpMsg: row.send_level_up_msg === 1,
         tagUserLevelUpMsg: row.tag_user_level_up_msg === 1,
         cooldownOverrides: parseJsonObject(row.cooldown_overrides),
-        color: row.color
+        color: row.color,
+        createdAt: row.created_at
     };
 }
 
@@ -77,7 +78,7 @@ async function fetchSpecialTracks(db) {
         const [rows] = await db.query(`
             SELECT id, name, role_ids, channel_ids, level_rewards,
                    send_level_up_msg, tag_user_level_up_msg,
-                   cooldown_overrides, color
+                   cooldown_overrides, color, created_at
             FROM xp_channel_tracks
         `);
 
@@ -110,7 +111,7 @@ async function fetchTrackById(db, trackId) {
         const [rows] = await db.query(`
             SELECT id, name, role_ids, channel_ids, level_rewards,
                    send_level_up_msg, tag_user_level_up_msg,
-                   cooldown_overrides, color
+                   cooldown_overrides, color, created_at
             FROM xp_channel_tracks
             WHERE id = ?
         `, [trackId]);
@@ -141,30 +142,23 @@ async function resolveXpTrack(db, trackInput) {
         };
     }
 
-    try {
-        const isNumericId = /^\d+$/.test(input);
-        const [rows] = await db.query(`
-            SELECT id, name, role_ids, channel_ids, level_rewards,
-                   send_level_up_msg, tag_user_level_up_msg,
-                   cooldown_overrides, color
-            FROM xp_channel_tracks
-            WHERE ${isNumericId ? 'id' : 'name'} = ?
-            LIMIT 1
-        `, [isNumericId ? parseInt(input, 10) : input]);
+    const isNumericId = /^\d+$/.test(input);
+    const tracks = await fetchSpecialTracks(db);
+    const track = tracks.find(candidate => {
+        if (isNumericId) return String(candidate.id) === input;
+        return String(candidate.name || '').toLowerCase() === input.toLowerCase();
+    });
 
-        if (rows.length === 0) return null;
-
-        const track = mapTrackRow(rows[0]);
-        return {
-            ...track,
-            xpType: track.id.toString(),
-            displayName: track.name,
-            isGlobal: false
-        };
-    } catch (err) {
-        console.error('[XP DB HELPER] Error resolving XP track:', err);
+    if (!track) {
         return null;
     }
+
+    return {
+        ...track,
+        xpType: track.id.toString(),
+        displayName: track.name,
+        isGlobal: false
+    };
 }
 
 function formatTrackChoiceName(row) {

@@ -19,38 +19,48 @@ const path = require('path');
 const SORT_OPTIONS = {
     level: {
         label: 'Level',
+        emoji: '🏆',
         description: 'Sort by level and total XP',
         orderBy: 'level DESC, xp_amount DESC',
         select: 'xp_amount, level',
+        visibleWhere: '(COALESCE(level, 0) > 0 OR COALESCE(xp_amount, 0) > 0)',
         stat: user => `Lvl **${formatNumber(user.level)}** (${formatNumber(user.xp_amount)} XP)`
     },
     messages: {
         label: 'Messages',
+        emoji: '💬',
         description: 'Sort by total messages sent',
         orderBy: 'total_messages_sent DESC, level DESC, xp_amount DESC',
-        select: 'xp_amount, level, total_messages_sent',
-        stat: user => `**${formatNumber(user.total_messages_sent)}** messages`
+        select: 'xp_amount, level, total_messages_sent, message_xp',
+        visibleWhere: '(COALESCE(total_messages_sent, 0) > 0 OR COALESCE(message_xp, 0) > 0)',
+        stat: user => `**${formatNumber(user.total_messages_sent)}** messages (${formatNumber(user.message_xp || 0)} XP)`
     },
     reactions: {
         label: 'Reactions',
+        emoji: '🔥',
         description: 'Sort by total reactions added',
         orderBy: 'total_reactions_added DESC, level DESC, xp_amount DESC',
-        select: 'xp_amount, level, total_reactions_added',
-        stat: user => `**${formatNumber(user.total_reactions_added)}** reactions`
+        select: 'xp_amount, level, total_reactions_added, reaction_xp',
+        visibleWhere: '(COALESCE(total_reactions_added, 0) > 0 OR COALESCE(reaction_xp, 0) > 0)',
+        stat: user => `**${formatNumber(user.total_reactions_added)}** reactions (${formatNumber(user.reaction_xp || 0)} XP)`
     },
     voice: {
         label: 'Voice Hours',
+        emoji: '🔊',
         description: 'Sort by total voice hours',
         orderBy: 'total_voice_minutes DESC, level DESC, xp_amount DESC',
-        select: 'xp_amount, level, total_voice_minutes',
-        stat: user => `**${formatVoiceTime(user.total_voice_minutes)}** voice time`
+        select: 'xp_amount, level, total_voice_minutes, voice_xp',
+        visibleWhere: '(COALESCE(total_voice_minutes, 0) > 0 OR COALESCE(voice_xp, 0) > 0)',
+        stat: user => `**${formatVoiceTime(user.total_voice_minutes)}** voice time (${formatNumber(user.voice_xp || 0)} XP)`
     },
     commands: {
         label: 'Commands',
+        emoji: '🤖',
         description: 'Sort by total commands used',
         orderBy: 'total_commands_used DESC, level DESC, xp_amount DESC',
-        select: 'xp_amount, level, total_commands_used',
-        stat: user => `**${formatNumber(user.total_commands_used)}** commands`
+        select: 'xp_amount, level, total_commands_used, command_xp',
+        visibleWhere: '(COALESCE(total_commands_used, 0) > 0 OR COALESCE(command_xp, 0) > 0)',
+        stat: user => `**${formatNumber(user.total_commands_used)}** commands (${formatNumber(user.command_xp || 0)} XP)`
     }
 };
 
@@ -83,23 +93,43 @@ function formatTrackingSince(value) {
     const monthNumber = String(date.getMonth() + 1).padStart(2, '0');
     const formatted = `${partByType.year}-${monthNumber}-${partByType.day}`;
 
-    return `-# XP data has been tracked since ${formatted}`;
+    return `XP tracked since ${formatted}`;
 }
 
-function getTrackTargetFields(trackInfo) {
-    const roleList = trackInfo.roleIds.length > 0
-        ? trackInfo.roleIds.map(id => `<@&${id}>`).join('\n')
-        : 'None';
-    const channelList = trackInfo.channelIds.length > 0
-        ? trackInfo.channelIds.map(id => `<#${id}>`).join('\n')
-        : 'None';
+function getTrackRequirementDisplay(trackInfo) {
+    const roleLabel = trackInfo.roleIds.length === 1 ? 'XP-Role' : 'XP-Roles';
+    const channelLabel = trackInfo.channelIds.length === 1 ? 'XP-Channel' : 'XP-Channels';
+    const commaRoles = trackInfo.roleIds.map(id => `<@&${id}>`).join(', ');
+    const commaChannels = trackInfo.channelIds.map(id => `<#${id}>`).join(', ');
+    const hasRoles = trackInfo.roleIds.length > 0;
+    const hasChannels = trackInfo.channelIds.length > 0;
 
-    return [
-        { name: '\u2002', value: `\u2B50\u2002Viewing XP progress for the **${trackInfo.displayName}** XP-Track:`, inline: false },
-        { name: trackInfo.channelIds.length === 1 ? 'Channel' : 'Channels', value: channelList, inline: true },
-        { name: trackInfo.roleIds.length === 1 ? 'Role' : 'Roles', value: roleList, inline: true },
-        { name: '\u2002', value: '\u2002', inline: false }
-    ];
+    if (hasRoles && hasChannels) {
+        return {
+            description: '',
+            fields: [
+                { name: roleLabel, value: trackInfo.roleIds.map(id => `-# <@&${id}>`).join('\n'), inline: true },
+                { name: channelLabel, value: trackInfo.channelIds.map(id => `-# <#${id}>`).join('\n'), inline: true },
+                { name: '\u2002', value: '\u2002', inline: false }
+            ]
+        };
+    }
+
+    if (hasRoles) {
+        return {
+            description: `**${roleLabel}:** ${commaRoles}`,
+            fields: []
+        };
+    }
+
+    if (hasChannels) {
+        return {
+            description: `**${channelLabel}:** ${commaChannels}`,
+            fields: []
+        };
+    }
+
+    return { description: '', fields: [] };
 }
 
 function buildSortMenu(track, sortKey) {
@@ -109,6 +139,7 @@ function buildSortMenu(track, sortKey) {
             .setPlaceholder('Filter leaderboard...')
             .addOptions(Object.entries(SORT_OPTIONS).map(([value, option]) => ({
                 label: option.label,
+                emoji: option.emoji,
                 description: option.description,
                 value,
                 default: value === sortKey
@@ -139,14 +170,14 @@ class Leaderboard {
             .setName('leaderboard')
             .setDescription('Display the XP Leaderboard of the server')
             .addStringOption(opt => opt
-                .setName('track')
+                .setName('xp_track')
                 .setDescription('Optional: Select an XP Track (leave empty for Global XP track)')
                 .setAutocomplete(true)
             );
     }
 
     async execute(interaction) {
-        const trackInput = interaction.options.getString('track');
+        const trackInput = interaction.options.getString('xp_track');
         const trackInfo = await resolveXpTrack(this.config.db, trackInput);
 
         if (!trackInfo) {
@@ -157,11 +188,13 @@ class Leaderboard {
         }
 
         await interaction.deferReply();
-        return this.renderLeaderboard(interaction, 1, trackInfo.xpType, 'level');
+        return this.renderLeaderboard(interaction, 1, trackInfo, 'level');
     }
 
     async renderLeaderboard(interaction, page, trackInput = null, sortKey = 'level') {
-        const trackInfo = await resolveXpTrack(this.config.db, trackInput);
+        const trackInfo = trackInput && typeof trackInput === 'object'
+            ? trackInput
+            : await resolveXpTrack(this.config.db, trackInput);
         if (!trackInfo) {
             const payload = { content: 'This XP track no longer exists.', components: [] };
             if (interaction.replied || interaction.deferred) return interaction.editReply(payload);
@@ -177,16 +210,15 @@ class Leaderboard {
         const offset = (page - 1) * limit;
 
         try {
-            const [settingsRows] = await this.config.db.query(
-                'SELECT xp_date_enabled FROM guild_settings WHERE guild_id = ?',
-                [guildId]
-            );
-            const trackingSince = formatTrackingSince(settingsRows[0]?.xp_date_enabled);
+            const cachedSettings = this.config.guildSettingsCache?.get(String(guildId));
+            const trackingSinceValue = trackInfo.isGlobal ? cachedSettings?.xpDateEnabled : trackInfo.createdAt;
+            const trackingSince = formatTrackingSince(trackingSinceValue);
 
             const [users] = await this.config.db.query(
                 `SELECT user_id, ${sort.select}
                  FROM user_levels
                  WHERE guild_id = ? AND xp_type = ?
+                   AND ${sort.visibleWhere}
                  ORDER BY ${sort.orderBy}
                  LIMIT ? OFFSET ?`,
                 [guildId, track, limit, offset]
@@ -196,30 +228,27 @@ class Leaderboard {
             const logoFile = new AttachmentBuilder(logoPath, { name: 'ww_logo.png' });
             const leaderboardTitle = trackInfo.isGlobal
                 ? `Leaderboard for ${guildName}`
-                : `Leaderboard for ${trackInfo.displayName}`;
-            const descriptionLines = [];
-            if (trackInfo.isGlobal) {
-                descriptionLines.push(trackingSince);
-            }
-            const descriptionText = descriptionLines.join('\n');
+                : `Leaderboard for ${trackInfo.displayName}:`;
+            const trackRequirements = !trackInfo.isGlobal ? getTrackRequirementDisplay(trackInfo) : { description: '', fields: [] };
 
             const lbEmbed = new EmbedBuilder()
                 .setTitle(leaderboardTitle)
                 .setThumbnail('attachment://ww_logo.png')
-                .setColor('#F1C40F')
-                .setFooter({ text: `White Walker XP System | Page ${page}`, iconURL: 'attachment://ww_logo.png' })
+                .setColor(trackInfo.color || '#F1C40F')
+                .setFooter({ text: `${trackingSince}  •  Page ${page}`, iconURL: 'attachment://ww_logo.png' })
                 .setTimestamp();
 
-            if (descriptionText) {
-                lbEmbed.setDescription(descriptionText);
-            }
-
             if (!trackInfo.isGlobal) {
-                lbEmbed.addFields(...getTrackTargetFields(trackInfo));
+                if (trackRequirements.description) {
+                    lbEmbed.setDescription(trackRequirements.description);
+                }
+                if (trackRequirements.fields.length > 0) {
+                    lbEmbed.addFields(...trackRequirements.fields);
+                }
             }
 
             if (users.length === 0) {
-                lbEmbed.setDescription(descriptionText ? `${descriptionText}\n\nNo data found for this track yet.` : 'No data found for this track yet.');
+                lbEmbed.addFields({ name: '\u2002', value: `No XP data has been registered for **${sort.label}\u2002${sort.emoji}**`, inline: false });
             } else {
                 const memberColumn = users.map((user, index) => {
                     const rank = offset + index + 1;
@@ -228,11 +257,9 @@ class Leaderboard {
                 const statColumn = users.map(user => {
                     return sort.stat(user);
                 }).join('\n');
-                if (descriptionText) {
-                    lbEmbed.setDescription(descriptionText);
-                }
+
                 lbEmbed.addFields(
-                    { name: `Leaderboard sorted by \`${sort.label}\``, value: '\u2002', inline: false },
+                    { name: '\u2002', value: `Leaderboard sorted by **${sort.label}\u2002${sort.emoji}**`, inline: false },
                     { name: 'Member', value: memberColumn, inline: true },
                     { name: sort.label, value: statColumn, inline: true }
                 );
@@ -267,6 +294,7 @@ class Leaderboard {
         if (action === 'next') newPage++;
         if (action === 'prev') newPage--;
 
+        await interaction.deferUpdate();
         await this.renderLeaderboard(interaction, newPage, track, sortKey);
         return true;
     }
@@ -276,6 +304,8 @@ class Leaderboard {
 
         const track = interaction.customId.replace('lb_sort_', '');
         const sortKey = interaction.values[0] || 'level';
+
+        await interaction.deferUpdate();
         await this.renderLeaderboard(interaction, 1, track, sortKey);
         return true;
     }

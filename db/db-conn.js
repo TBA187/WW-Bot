@@ -8,21 +8,23 @@ const db = mysql.createPool({
     database: process.env.DB_NAME,
     port: process.env.DB_PORT || 3306,
     waitForConnections: true,
-    connectionLimit: 10,
+    connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 1),
     connectTimeout: 30000,
     enableKeepAlive: true,
     keepAliveInitialDelay: 300000, // 5 minutes in milliseconds
-    maxIdle: 5,
+    maxIdle: Number(process.env.DB_MAX_IDLE || 1),
     idleTimeout: 300000, // 5 minutes
 });
 
 const TRANSIENT_DB_ERROR_CODES = new Set([
     'ETIMEDOUT',
+    'EAI_AGAIN',
     'ECONNRESET',
     'ECONNREFUSED',
     'EHOSTUNREACH',
     'ENOTFOUND',
-    'PROTOCOL_CONNECTION_LOST'
+    'PROTOCOL_CONNECTION_LOST',
+    'ER_CON_COUNT_ERROR'
 ]);
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -30,6 +32,26 @@ const rawQuery = db.query.bind(db);
 
 function shouldRetryDbError(err) {
     return err && TRANSIENT_DB_ERROR_CODES.has(err.code);
+}
+
+function getRetryDelayMs(err, attempt) {
+    if (err?.code === 'ER_CON_COUNT_ERROR') {
+        return 5000 * (attempt + 1);
+    }
+
+    if (err?.code === 'EAI_AGAIN') {
+        return 2000 * (attempt + 1);
+    }
+
+    return 750 * (attempt + 1);
+}
+
+function getStartupRetryDelayMs(err, attempt) {
+    if (err?.code === 'ER_CON_COUNT_ERROR') {
+        return Math.min(60000, 15000 * attempt);
+    }
+
+    return Math.min(30000, getRetryDelayMs(err, attempt - 1));
 }
 
 db.query = async function queryWithRetry(sql, params, retries = 2) {
@@ -45,7 +67,7 @@ db.query = async function queryWithRetry(sql, params, retries = 2) {
                 throw err;
             }
 
-            const delayMs = 750 * (attempt + 1);
+            const delayMs = getRetryDelayMs(err, attempt);
             console.warn(`[DB LOG] Transient query error (${err.code}). Retrying in ${delayMs}ms...`);
             await sleep(delayMs);
         }
@@ -54,23 +76,34 @@ db.query = async function queryWithRetry(sql, params, retries = 2) {
     throw lastErr;
 };
 
-// DB Retry Function
-const connectWithRetry = async (retries = 3, delayMs = 5000) => {
-    for (let i = 0; i < retries; i++) {
+// Startup uses rawQuery so the query retry wrapper does not create nested retry loops.
+const connectWithRetry = async () => {
+    const maxStartupRetries = Number(process.env.DB_STARTUP_MAX_RETRIES || 0);
+    let attempt = 0;
+
+    while (true) {
+        attempt++;
+
         try {
-            const [rows] = await db.query('SELECT 1 + 1 AS result;');
-            console.log('[DB LOG] ✅ Successfully connected to MySQL!');
+            await rawQuery('SELECT 1 + 1 AS result;');
+            console.log('[DB LOG] Successfully connected to MySQL!');
             return;
         } catch (err) {
-            console.error(`[DB LOG] ❌ Connection attempt ${i + 1} failed:`, err.code);
+            const errorCode = err.code || err.message;
+            console.error(`[DB LOG] Connection attempt ${attempt} failed:`, errorCode);
 
-            if (i < retries - 1) {
-                console.log(`[DB LOG] ⏳ Retrying in ${delayMs / 1000} seconds...`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-            } else {
-                console.error('[DB LOG] 🚨 Max retries reached. Database unavailable.');
-                process.exit(1);
+            if (!shouldRetryDbError(err)) {
+                throw err;
             }
+
+            if (maxStartupRetries > 0 && attempt >= maxStartupRetries) {
+                console.error('[DB LOG] Max startup retries reached. Database unavailable.');
+                throw err;
+            }
+
+            const delayMs = getStartupRetryDelayMs(err, attempt);
+            console.log(`[DB LOG] Database is unavailable (${errorCode}). Waiting ${Math.round(delayMs / 1000)} seconds before retrying...`);
+            await sleep(delayMs);
         }
     }
 };

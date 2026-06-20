@@ -23,6 +23,8 @@ class PvpCooldown {
             return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
         }
 
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
         try {
             const { guild } = interaction;
             const logChannel = guild.channels.cache.get(this.logChannelID);
@@ -31,29 +33,28 @@ class PvpCooldown {
 
             if (!kingRole) {
                 if (logChannel) await logChannel.send(`### 🚨 <@${this.ownerID}> — PvP King role missing! (${nowTime})`);
-                return interaction.reply({
+                return interaction.editReply({
                     content: '### ❌ PvP King role not found! Officers have been notified.',
-                    flags: MessageFlags.Ephemeral
                 });
             }
 
+            await guild.members.fetch().catch(err => {
+                console.error('[WW LOG] Failed to refresh members for /pvp_cooldown:', err.code || err.message);
+            });
+
             if (kingRole.members.size === 0) {
                 if (logChannel) { await logChannel.send(`### 🚨 <@${this.ownerID}> — No PvP King found! (${nowTime})`); }
-                return interaction.reply({
+                return interaction.editReply({
                     content: '### ⚠️ There is currently no member that has the PvP King role!',
-                    flags: MessageFlags.Ephemeral
                 });
             }
 
             if (kingRole.members.size > 1) {
                 if (logChannel) await logChannel.send(`### 🚨 <@${this.ownerID}> — Multiple PvP Kings detected: ${kingRole.members.size} — (${nowTime})`);
-                return interaction.reply({
+                return interaction.editReply({
                     content: '### ⚠️ Multiple PvP Kings detected! Officers have been notified.',
-                    flags: MessageFlags.Ephemeral
                 });
             }
-
-            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
             const currentKing = kingRole.members.first();
             if (currentKing.id === interaction.user.id) {

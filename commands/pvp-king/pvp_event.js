@@ -33,13 +33,18 @@ class PvpEvent {
                 ORDER BY created_at ASC
             `, [EVENT_START_DATE]);
 
+            await interaction.guild.members.fetch().catch(err => {
+                console.error('[WW LOG] Failed to refresh members for /pvp_event:', err.code || err.message);
+            });
+
             const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
             const currentKingId = kingRole?.members.first()?.id || null;
+            const currentKingText = currentKingId ? `<@${currentKingId}>` : '*No current PvP King found*';
 
             if (historyRows.length === 0) {
                 return interaction.editReply(
                     `### ⏳ The PvP Event has started, but no one has claimed a victory yet!\n` +
-                    `Be the first to challenge the current PvP King (<@${currentKingId}>) with the \`/pvp_challenge\` command in <#1469101041189523657>`
+                    `Be the first to challenge the current PvP King (${currentKingText}) with the \`/pvp_challenge\` command in <#1469101041189523657>`
                 );
             }
 
@@ -132,7 +137,7 @@ class PvpEvent {
                     `**The race is on! Only victories after May 6th, 2026 count towards this challenge.**\n` +
                     `### 🏆\u2002Goal: First to Win 10 times in a row!\n` +
                     `### 🥇\u2002Reward:\u200223 Coin Capsules\n` +
-                    `### 👑\u2002Current PvP King:\u2002<@${currentKingId}>\n` +
+                    `### 👑\u2002Current PvP King:\u2002${currentKingText}\n` +
                     `-# Challenge the current PvP King with the \`/pvp_challenge\` command in <#1469101041189523657>\n` +
                     `-# Read the PvP King **Rules** by using the \`/pvp_rules\` command.\n\n` +
                     `## <:pepe_king:1455434151262949535>\u2002PvP Event Kings:\n\n`;

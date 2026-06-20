@@ -39,13 +39,24 @@ class PvpLeaderboard {
             // Count Total PvP Kings
             const [[{ total_kings }]] = await this.db.query('SELECT COUNT(*) AS total_kings FROM pvp_king_stats');
 
-            // Count all PvP King entries
-            const [[{ totalKingEntries }]] = await this.db.query('SELECT COUNT(*) AS totalKingEntries FROM pvp_king_history');
+            // Count all PvP King entries and keep the latest history row as a display fallback.
+            const [[historyInfo]] = await this.db.query(`
+                SELECT
+                    COUNT(*) AS totalKingEntries,
+                    (SELECT king_id FROM pvp_king_history ORDER BY id DESC LIMIT 1) AS latestKingId
+                FROM pvp_king_history
+            `);
+            const totalKingEntries = historyInfo?.totalKingEntries || 0;
 
-            // Identify the current King from the Guild Cache
+            // Do not fetch all guild members here; opcode 8 member chunks are heavily rate limited.
+            // The commands that need strict role validation refresh members themselves.
             const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
-            const currentKingMember = kingRole?.members.first();
-            const currentKingId = currentKingMember ? currentKingMember.id : null;
+            const cachedKings = kingRole?.members;
+            let currentKingId = cachedKings?.size === 1 ? cachedKings.first().id : null;
+            if (!currentKingId && historyInfo?.latestKingId) {
+                currentKingId = String(historyInfo.latestKingId);
+            }
+            const currentKingText = currentKingId ? `<@${currentKingId}>` : '*No current PvP King found*';
 
             // Pagination & Sorting State
             const itemsPerPage = 10;
@@ -86,18 +97,18 @@ class PvpLeaderboard {
                     });
 
                 const sortTitles = {
-                    'longest_streak': 'by "Longest Streak"',
-                    'total_wins': 'by "Total Wins"',
-                    'first_crowned_asc': 'by First Victories (Oldest ➔ Newest)',
-                    'crowned_at_asc': 'by Last Victories (Newest ➔ Oldest)'
+                    'longest_streak': { emoji: '🔥', title: 'Longest Streak' },
+                    'total_wins': { emoji: '⚔️', title: 'Total Wins' },
+                    'first_crowned_asc': { emoji: '📜', title: 'First Victories (Oldest ➔ Newest)' },
+                    'crowned_at_asc': { emoji: '✨', title: 'Last Victories (Newest ➔ Oldest)' }
                 };
+                const activeSort = sortTitles[currentSort] || sortTitles.total_wins;
 
                 let descriptionText = `## 🏆\u2002White Walkers — PvP Hall of Fame\u2002🏆\n` +
-                    `### In the grip of endless winter, \`${total_kings}\` Kings stand frozen in time, their legacy etched in ice forever!\u2002🧊\n` +
-                    `- **Current PvP King:\u2002👑\u2002<@${currentKingId}>\u2002👑**\n` +
-                    `- Challenge the current PvP King with: **\`/pvp_challenge\`**\n`
-
-                descriptionText += `### PvP Kings sorted ${sortTitles[currentSort]}\n\n`;
+                    `**In the grip of endless winter, \`${total_kings}\` PvP Kings stand frozen in time, their legacy etched in ice forever!\u2002🧊**\n` +
+                    `-# - **Current PvP King:\u2002👑\u2002${currentKingText}\u2002👑**\n` +
+                    `-# - Challenge the current PvP King with: **\`/pvp_challenge\`**\n` +
+                    `### PvP Kings sorted by\u2002${activeSort.emoji}\u2002${activeSort.title}:\n`;
 
                 currentItems.forEach((row, index) => {
                     const overallIndex = start + index;
@@ -105,7 +116,7 @@ class PvpLeaderboard {
                     const unixLast = Math.floor(row.crowned_at / 1000);
 
                     // Check if this row is the current king
-                    const isCurrentKing = row.user_id === currentKingId;
+                    const isCurrentKing = String(row.user_id) === currentKingId;
                     const crownLabel = isCurrentKing ? " 👑" : "";
 
                     const rankMedal = overallIndex === 0 ? "🥇" : overallIndex === 1 ? "🥈" : overallIndex === 2 ? "🥉" : `**${overallIndex + 1}.**`;
@@ -116,7 +127,7 @@ class PvpLeaderboard {
                 });
 
                 if (this.historyThreadID) {
-                    descriptionText += `- View all \`${totalKingEntries}\` PvP King entries in <#${this.historyThreadID}>\n`;
+                    descriptionText += `-# View all \`${totalKingEntries}\` PvP King entries in <#${this.historyThreadID}>\n`;
                 }
 
                 embed.setDescription(descriptionText);

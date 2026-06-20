@@ -54,6 +54,17 @@ class PvpCrownKing {
             return interaction.reply({ content: '### ❌  PvP King role not found! Needs to be fixed manually!', flags: MessageFlags.Ephemeral });
         }
 
+        const newKing = interaction.options.getMember('user');
+        if (!newKing) {
+            return interaction.reply({ content: '### ❌  User not found.', flags: MessageFlags.Ephemeral });
+        }
+
+        await interaction.deferReply();
+
+        await interaction.guild.members.fetch().catch(err => {
+            console.error('[WW LOG] Failed to refresh members for /pvp_crown:', err.code || err.message);
+        });
+
         const kings = kingRole.members;
 
         // If more than 1 PvP King exist
@@ -69,21 +80,12 @@ class PvpCrownKing {
             }
 
             // User feedback message
-            return interaction.reply({
+            return interaction.editReply({
                 content:
                     `❌ **Error:** There are currently **${kingRole.members.size} members** with the PvP King role.\n` +
-                    `Please fix this manually before crowning a new king!`,
-                flags: MessageFlags.Ephemeral
+                    `Please fix this manually before crowning a new king!`
             });
         }
-
-        // If 0 OR 1 PvP Kings exist:
-        const newKing = interaction.options.getMember('user');
-        if (!newKing) {
-            return interaction.reply({ content: '### ❌  User not found.', flags: MessageFlags.Ephemeral });
-        }
-
-        await interaction.deferReply();
 
         try {
             // IF New King Crowned, OR Current King defends their crown

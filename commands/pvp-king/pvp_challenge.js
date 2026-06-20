@@ -65,6 +65,10 @@ class PvpChallengeKing {
                 });
             }
 
+            await interaction.guild.members.fetch().catch(err => {
+                console.error('[WW LOG] Failed to refresh members for /pvp_challenge:', err.code || err.message);
+            });
+
             // Check for multiple kings
             const kings = kingRole.members;
             if (kings.size > 1) {
@@ -168,7 +172,7 @@ class PvpChallengeKing {
             );
 
             await interaction.editReply({
-                content: `## ⚔️  Do you want to challenge the PvP King for the throne?  ⚔️\n- Curent PvP King: **👑 ${currentKing.displayName} 👑**\n` +
+                content: `## ⚔️  Do you want to challenge the PvP King for the throne?  ⚔️\n- Curent PvP King: **👑 <@${currentKing.id}> 👑**\n` +
                     `-# When the PvP King accepts your challenge, you will receive a **48-hour cooldown** before you can challenge **${currentKing.displayName}** again.\n` +
                     `-# If a new PvP King is crowned, the cooldown will reset and you may challenge the new King immediately.`,
                 components: [confirmRow]
