@@ -187,7 +187,7 @@ class DungeonRecruitment {
             )
             .addStringOption(o =>
                 o.setName('ping_dungeon_role')
-                    .setDescription('Should the @Dungeon role be tagged for this for this dungeon run?')
+                    .setDescription('Should the @Dungeon role be pinged for this dungeon run? Leave empty for NO!')
                     .setRequired(false)
                     .addChoices(
                         { name: 'No', value: 'no' },
@@ -196,9 +196,10 @@ class DungeonRecruitment {
             )
             .addStringOption(o =>
                 o.setName('multiple_assignments')
-                    .setDescription('Leave empty if: one player can only select one Dungeon role. "Yes" allows multiple role assignments.')
+                    .setDescription('Should a player be able to select multiple Dungeon roles? Leave empty for NO!')
                     .setRequired(false)
                     .addChoices(
+                        { name: 'No', value: 'no' },
                         { name: 'Yes', value: 'yes' }
                     )
             );
