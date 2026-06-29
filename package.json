@@ -3,7 +3,8 @@
     "diff": "^8.0.4",
     "discord.js": "^14.25.1",
     "dotenv": "^17.3.1",
-    "mysql2": "^3.18.2"
+    "mysql2": "^3.18.2",
+    "sharp": "^0.35.2"
   },
   "name": "discord-bot",
   "version": "1.0.0",

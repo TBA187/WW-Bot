@@ -18,6 +18,10 @@ function formatNickname(value) {
     return value || '*No server nickname*';
 }
 
+function auditChangeValue(change, key) {
+    return change?.[key] ?? change?.[`${key}_value`] ?? null;
+}
+
 function createLogoFile() {
     return new AttachmentBuilder('./images/ww_logo.png', { name: 'ww_logo.png' });
 }
@@ -50,6 +54,7 @@ async function sendNicknameLog(logChannel, oldMember, newMember) {
 
     let executor = newMember.user;
     let isModeratorAction = false;
+    let nicknameAuditChange = null;
 
     try {
         await new Promise(res => setTimeout(res, 1200));
@@ -65,13 +70,23 @@ async function sendNicknameLog(logChannel, oldMember, newMember) {
                 Date.now() - entry.createdTimestamp < 8000
         );
 
+        nicknameAuditChange = auditEntry?.changes?.find(c => c.key === 'nick') ?? null;
+        if (nicknameAuditChange === null) {
+            console.warn(`[WW LOG] Skipped nickname log for ${newMember.user.tag ?? newMember.id}: no recent nickname audit log found.`);
+            return;
+        }
+
         if (auditEntry && auditEntry.executor?.id !== newMember.id) {
             executor = auditEntry.executor;
             isModeratorAction = true;
         }
     } catch (error) {
         console.error('[WW LOG] Error fetching audit logs for nickname change:', error);
+        return;
     }
+
+    const auditedOldNickname = normalizeNickname(auditChangeValue(nicknameAuditChange, 'old'));
+    const auditedNewNickname = normalizeNickname(auditChangeValue(nicknameAuditChange, 'new'));
 
     const logoFile = createLogoFile();
     const embed = new EmbedBuilder()
@@ -87,8 +102,8 @@ async function sendNicknameLog(logChannel, oldMember, newMember) {
                 : `📝 <@${newMember.id}> changed their own nickname.`
         )
         .addFields(
-            { name: 'Old nickname', value: formatNickname(oldNickname), inline: true },
-            { name: 'New nickname', value: formatNickname(newNickname), inline: true }
+            { name: 'Old nickname', value: formatNickname(auditedOldNickname ?? oldNickname), inline: true },
+            { name: 'New nickname', value: formatNickname(auditedNewNickname ?? newNickname), inline: true }
         )
         .setFooter({ text: `ID: ${newMember.id}`, iconURL: 'attachment://ww_logo.png' })
         .setTimestamp();
