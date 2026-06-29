@@ -26,6 +26,8 @@ const COLOR_ROLE_ANCHOR_ID = botConfig.colorRoleAnchorID;
 const CUSTOM_COLOR_ROLE_ANCHOR_ID = botConfig.customColorRoleAnchorID;
 const COLOR_ROLE_PANEL_PAGE = 0;
 const COLOR_ROLE_PREVIEW_FILENAME = 'role-color-preview.png';
+const COLOR_PREVIEW_MAX_AGE_MS = 14 * 60 * 1000;
+const ACTIVE_COLOR_PREVIEWS = new Map();
 
 const COLOR_ROLE_PRESETS = [
     { id: 'sunset', roleId: '1520956112160166088', name: 'Sunset Gradient', emoji: '🌇', primary: '#FF512F', secondary: '#DD2476' },
@@ -565,6 +567,63 @@ async function deferHidden(interaction) {
 }
 
 
+async function deferPreviewUpdate(interaction) {
+    if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferUpdate();
+    }
+}
+
+
+function colorPreviewKey(interaction) {
+    return `${interaction.guildId ?? 'dm'}:${interaction.user.id}`;
+}
+
+
+async function deletePreviousColorPreview(interaction) {
+    const key = colorPreviewKey(interaction);
+    const previous = ACTIVE_COLOR_PREVIEWS.get(key);
+    if (!previous) return;
+
+    ACTIVE_COLOR_PREVIEWS.delete(key);
+    if (Date.now() - previous.createdAt > COLOR_PREVIEW_MAX_AGE_MS) return;
+
+    await previous.cleanup().catch(() => { });
+}
+
+
+function rememberColorPreview(interaction, cleanup) {
+    ACTIVE_COLOR_PREVIEWS.set(colorPreviewKey(interaction), {
+        cleanup,
+        createdAt: Date.now()
+    });
+}
+
+
+function forgetColorPreview(interaction) {
+    ACTIVE_COLOR_PREVIEWS.delete(colorPreviewKey(interaction));
+}
+
+
+async function editPreviewFeedback(interaction, content) {
+    const payload = {
+        content,
+        embeds: [],
+        components: [],
+        files: [],
+        attachments: [],
+        allowedMentions: { parse: [] }
+    };
+
+    if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(payload);
+    } else {
+        await interaction.update(payload);
+    }
+
+    forgetColorPreview(interaction);
+}
+
+
 async function memberFromInteraction(interaction) {
     if (interaction.member?.roles?.cache) {
         return interaction.member;
@@ -674,6 +733,15 @@ function customStyle(type, primary, secondary = null) {
 }
 
 
+function randomStyle(type, primary, secondary = null) {
+    return {
+        ...customStyle(type, primary, secondary),
+        randomGenerated: true,
+        name: type === 'gradient' ? 'Random Gradient' : 'Random Color'
+    };
+}
+
+
 function isGradientStyle(style) {
     return Boolean(style.secondary);
 }
@@ -715,20 +783,24 @@ function parseApplyStyle(args) {
 }
 
 
-function getRandomItem(items) {
-    return items[Math.floor(Math.random() * items.length)];
+function randomHexColor() {
+    return `#${Math.floor(Math.random() * 0x1000000).toString(16).padStart(6, '0').toUpperCase()}`;
 }
 
 
 function getRandomSolidStyle() {
-    const solidPresets = COLOR_ROLE_PRESETS.filter(preset => !preset.secondary);
-    return presetToStyle(getRandomItem(solidPresets));
+    return randomStyle('solid', randomHexColor());
 }
 
 
 function getRandomGradientStyle() {
-    const gradientPresets = COLOR_ROLE_PRESETS.filter(preset => preset.secondary);
-    return presetToStyle(getRandomItem(gradientPresets));
+    let primary = randomHexColor();
+    let secondary = randomHexColor();
+    while (secondary === primary) {
+        secondary = randomHexColor();
+    }
+
+    return randomStyle('gradient', primary, secondary);
 }
 
 
@@ -880,6 +952,8 @@ async function dismissHiddenPreview(interaction) {
         await interaction.deferUpdate();
     }
 
+    forgetColorPreview(interaction);
+
     try {
         await interaction.deleteReply();
     } catch (err) {
@@ -901,27 +975,35 @@ async function sendColorPreview(interaction, style, source = null) {
         return;
     }
 
+    await deletePreviousColorPreview(interaction);
+
     const previewPng = await makeColorPreviewPng(style);
     const attachment = new AttachmentBuilder(previewPng, { name: COLOR_ROLE_PREVIEW_FILENAME });
+    const content = style.randomGenerated
+        ? `### <@${interaction.user.id}>, please confirm that you want to use this randomly generated color:\n**💻  ${style.name}** (${styleText(style)})`
+        : `### <@${interaction.user.id}>, please confirm that you want to use this color:\n**${style.emoji ?? '🎨'}  ${style.name}** (${styleText(style)})`;
     const payload = {
-        content: `### Please confirm if you want to use this color:\n**${style.emoji ?? '🎨'}  ${style.name}** (${styleText(style)})`,
+        content,
         files: [attachment],
         components: buildPreviewComponents(style, source, interaction),
         flags: MessageFlags.Ephemeral,
-        allowedMentions: { parse: [] }
+        allowedMentions: { users: [interaction.user.id] }
     };
 
     if (interaction.deferred) {
         await interaction.editReply(payload);
+        rememberColorPreview(interaction, () => interaction.deleteReply());
         return;
     }
 
     if (interaction.replied) {
-        await interaction.followUp(payload);
+        const message = await interaction.followUp(payload);
+        rememberColorPreview(interaction, () => interaction.webhook.deleteMessage(message.id));
         return;
     }
 
     await interaction.reply(payload);
+    rememberColorPreview(interaction, () => interaction.deleteReply());
 }
 
 
@@ -1066,6 +1148,28 @@ async function getPresetColorRoles(guild) {
 }
 
 
+function isPresetColorRole(role) {
+    return COLOR_ROLE_PRESETS.some(preset => preset.roleId === role?.id);
+}
+
+
+async function deleteCustomColorRole(guild, role, user) {
+    if (role === null || isPresetColorRole(role)) {
+        return false;
+    }
+
+    const roleError = await manageableRoleError(guild, role);
+    if (roleError !== null) {
+        const err = new Error(roleError);
+        err.code = 'CUSTOM_COLOR_ROLE_DELETE_BLOCKED';
+        throw err;
+    }
+
+    await role.delete(`Delete removed custom color role for ${user.tag ?? user.username} (${user.id})`);
+    return true;
+}
+
+
 async function removeActiveColorRoles(member, user, exceptRoleId = null) {
     const presetRoles = await getPresetColorRoles(member.guild);
     const rolesToRemove = presetRoles.filter(role =>
@@ -1073,12 +1177,17 @@ async function removeActiveColorRoles(member, user, exceptRoleId = null) {
     );
 
     const customRole = await findMemberColorRole(member.guild, member, user);
+    const shouldDeleteCustomRole = customRole !== null && customRole.id !== exceptRoleId && !isPresetColorRole(customRole);
     if (customRole !== null && customRole.id !== exceptRoleId && member.roles.cache.has(customRole.id)) {
         rolesToRemove.push(customRole);
     }
 
     if (rolesToRemove.length > 0) {
         await member.roles.remove([...new Set(rolesToRemove)], `Remove previous color roles for ${user.tag ?? user.username} (${user.id})`);
+    }
+
+    if (shouldDeleteCustomRole) {
+        await deleteCustomColorRole(member.guild, customRole, user);
     }
 }
 
@@ -1108,35 +1217,35 @@ async function applyRoleColors(role, style, reason) {
 
 
 async function applyPresetColorRole(interaction, presetId) {
-    await deferHidden(interaction);
+    await deferPreviewUpdate(interaction);
 
     if (!interaction.guild) {
-        await sendHiddenFeedback(interaction, 'This panel only works inside the server.');
+        await editPreviewFeedback(interaction, 'This panel only works inside the server.');
         return;
     }
 
     const member = await memberFromInteraction(interaction);
     if (member === null) {
-        await sendHiddenFeedback(interaction, 'Server profile not found.');
+        await editPreviewFeedback(interaction, 'Server profile not found.');
         return;
     }
 
     const preset = getPresetById(presetId);
     const roleId = preset?.roleId;
     if (preset === null || !roleId) {
-        await sendHiddenFeedback(interaction, '### ❌ This preset color role is not configured. Ask an admin to check the Color Roles panel setup.');
+        await editPreviewFeedback(interaction, '### ❌ This preset color role is not configured. Ask an admin to check the Color Roles panel setup.');
         return;
     }
 
     const role = await fetchRoleById(interaction.guild, roleId);
     if (role === null) {
-        await sendHiddenFeedback(interaction, `### ❌ The **${preset.name}** color role is missing. Ask an admin to check the Color Roles preset role IDs.`);
+        await editPreviewFeedback(interaction, `### ❌ The **${preset.name}** color role is missing. Ask an admin to check the Color Roles preset role IDs.`);
         return;
     }
 
     const roleError = await manageableRoleError(interaction.guild, role);
     if (roleError !== null) {
-        await sendHiddenFeedback(interaction, roleError);
+        await editPreviewFeedback(interaction, roleError);
         return;
     }
 
@@ -1146,7 +1255,7 @@ async function applyPresetColorRole(interaction, presetId) {
             await member.roles.add(role, `Preset color role assigned to ${interaction.user.tag ?? interaction.user.username} (${interaction.user.id})`);
         }
 
-        await sendHiddenFeedback(
+        await editPreviewFeedback(
             interaction,
             `**✅  You have been assigned the ${role} color role!**\n` +
             `- Selected preset: **${preset.emoji ?? '🎨'} ${preset.name}**\n` +
@@ -1154,43 +1263,43 @@ async function applyPresetColorRole(interaction, presetId) {
         );
     } catch (err) {
         if (err?.code === 50013) {
-            await sendHiddenFeedback(interaction, 'Role update blocked. Check bot permissions and role order.');
+            await editPreviewFeedback(interaction, 'Role update blocked. Check bot permissions and role order.');
             return;
         }
 
         console.error('[WW LOG] Preset color role apply error:', err);
-        await sendHiddenFeedback(interaction, 'Role update failed. Try again shortly.');
+        await editPreviewFeedback(interaction, 'Role update failed. Try again shortly.');
     }
 }
 
 
 async function applyCustomColorRole(interaction, style) {
-    await deferHidden(interaction);
+    await deferPreviewUpdate(interaction);
 
     if (!interaction.guild) {
-        await sendHiddenFeedback(interaction, 'This panel only works inside the server.');
+        await editPreviewFeedback(interaction, 'This panel only works inside the server.');
         return;
     }
 
     if (isGradientStyle(style) && !hasEnhancedRoleColors(interaction.guild)) {
-        await sendHiddenFeedback(interaction, '### ❌ Gradient colors are not available on this server.');
+        await editPreviewFeedback(interaction, '### ❌ Gradient colors are not available on this server.');
         return;
     }
 
     const member = await memberFromInteraction(interaction);
     if (member === null) {
-        await sendHiddenFeedback(interaction, 'Server profile not found.');
+        await editPreviewFeedback(interaction, 'Server profile not found.');
         return;
     }
 
     const me = await getBotMember(interaction.guild);
     if (me === null) {
-        await sendHiddenFeedback(interaction, 'Bot role setup is incomplete.');
+        await editPreviewFeedback(interaction, 'Bot role setup is incomplete.');
         return;
     }
 
     if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-        await sendHiddenFeedback(interaction, 'The bot needs **Manage Roles** to update roles.');
+        await editPreviewFeedback(interaction, 'The bot needs **Manage Roles** to update roles.');
         return;
     }
 
@@ -1216,7 +1325,7 @@ async function applyCustomColorRole(interaction, style) {
 
         const roleError = await manageableRoleError(interaction.guild, role);
         if (roleError !== null) {
-            await sendHiddenFeedback(interaction, roleError);
+            await editPreviewFeedback(interaction, roleError);
             return;
         }
 
@@ -1228,7 +1337,7 @@ async function applyCustomColorRole(interaction, style) {
             await member.roles.add(role, `Color role assigned to ${interaction.user.tag ?? interaction.user.username} (${interaction.user.id})`);
         }
 
-        await sendHiddenFeedback(
+        await editPreviewFeedback(
             interaction,
             `**✅  Your personal color role has been updated!**\n` +
             `- Personal Role Name: ${role}\n` +
@@ -1237,12 +1346,12 @@ async function applyCustomColorRole(interaction, style) {
         );
     } catch (err) {
         if (err?.code === 50013) {
-            await sendHiddenFeedback(interaction, 'Role update blocked. Check bot permissions and role order.');
+            await editPreviewFeedback(interaction, 'Role update blocked. Check bot permissions and role order.');
             return;
         }
 
         console.error('[WW LOG] Custom color role apply error:', err);
-        await sendHiddenFeedback(interaction, 'Role update failed. Try again shortly.');
+        await editPreviewFeedback(interaction, 'Role update failed. Try again shortly.');
     }
 }
 
@@ -1262,7 +1371,35 @@ async function clearMemberColorRole(interaction) {
     }
 
     try {
-        await removeActiveColorRoles(member, interaction.user);
+        const presetRoles = await getPresetColorRoles(interaction.guild);
+        const customRole = await findMemberColorRole(interaction.guild, member, interaction.user);
+        const rolesToRemove = presetRoles.filter(role => member.roles.cache.has(role.id));
+        const customRoleToDelete = customRole !== null && !isPresetColorRole(customRole) ? customRole : null;
+
+        if (customRoleToDelete !== null && member.roles.cache.has(customRoleToDelete.id)) {
+            rolesToRemove.push(customRoleToDelete);
+        }
+
+        if (rolesToRemove.length > 0) {
+            await member.roles.remove(
+                [...new Set(rolesToRemove)],
+                `Clear active color roles for ${interaction.user.tag ?? interaction.user.username} (${interaction.user.id})`
+            );
+        }
+
+        if (customRoleToDelete !== null) {
+            try {
+                await deleteCustomColorRole(interaction.guild, customRoleToDelete, interaction.user);
+            } catch (deleteErr) {
+                if (deleteErr?.code === 'CUSTOM_COLOR_ROLE_DELETE_BLOCKED') {
+                    await sendHiddenFeedback(interaction, `${deleteErr.message}\n- Your active color role was removed, but the custom role could not be deleted.`);
+                    return;
+                }
+
+                throw deleteErr;
+            }
+        }
+
         await sendHiddenFeedback(interaction, '**❌  Your active color role has been removed.**');
     } catch (err) {
         if (err?.code === 50013) {
@@ -1784,10 +1921,8 @@ async function handleColorRoleButton(interaction, action, args) {
     if (action === 'apply') {
         const style = parseApplyStyle(args);
         if (style === null) {
-            await interaction.reply({
-                content: '### ❌ This color preview is invalid or expired. Please choose the color again.',
-                flags: MessageFlags.Ephemeral
-            });
+            await deferPreviewUpdate(interaction);
+            await editPreviewFeedback(interaction, '### ❌ This color preview is invalid or expired. Please choose the color again.');
             return true;
         }
 

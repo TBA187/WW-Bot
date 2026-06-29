@@ -1,7 +1,7 @@
-// ------------------------------------------
+// ---------------------------------------------------------
 // Dungeon recruitment commands:
 // /forlorn | /victini | /meloetta | /hoopa | /xmas_dungeon
-// -------------------------------------------
+// ---------------------------------------------------------
 const {
     SlashCommandBuilder,
     EmbedBuilder,
@@ -17,6 +17,10 @@ const MAX_TIMEOUT_MS = 2147483647;
 const REMINDER_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_AUTOCOMPLETE_CHOICES = 25;
 const NO_MULTIPLE_ASSIGNMENT_COMMANDS = new Set(['victini', 'xmas_dungeon']);
+const NOTIFICATION_MODES = {
+    DM: 'dm',
+    CHANNEL: 'channel'
+};
 
 const DUNGEONS = {
     forlorn: {
@@ -90,9 +94,9 @@ const DUNGEONS = {
             ['camerupt', 'houndoom']
         ],
         roles: [
-            { key: 'tyranitar', label: 'Tyranitar Boss', emoji: '🦖' },
-            { key: 'ninetales', label: 'Ninetales Boss', emoji: '<:ninetales:1520633565967024198>' },
-            { key: 'camerupt', label: 'Camerupt Boss', emoji: '🌋' },
+            { key: 'tyranitar', label: 'Tyranitar Boss', emoji: '<:tyranitar:1521280904796831875>' },
+            { key: 'ninetales', label: 'Ninetales Boss', emoji: '<:ninetales_alolan:1521281765157634088>' },
+            { key: 'camerupt', label: 'Camerupt Boss', emoji: '<:camerupt:1521280853689237676>' },
             { key: 'houndoom', label: 'Houndoom Boss', emoji: '<:houndoom:1520646615969300510>' },
             { key: 'reshiram', label: 'Reshiram Boss', emoji: '<a:reshiram:1474190687246225450>' }
         ]
@@ -238,18 +242,18 @@ class DungeonRecruitment {
             )
             .addStringOption(o =>
                 o.setName('ping_dungeon_role')
-                    .setDescription('Should the @Dungeon role be pinged for this dungeon run? Leave empty for NO!')
+                    .setDescription('Should the @Dungeon role be pinged for this dungeon run? (Leave empty for NO!)')
                     .setRequired(false)
                     .addChoices(
                         { name: 'No', value: 'no' },
                         { name: 'Yes', value: 'yes' }
                     )
-            );
+            )
 
         if (!NO_MULTIPLE_ASSIGNMENT_COMMANDS.has(commandName)) {
             builder.addStringOption(o =>
                 o.setName('multiple_assignments')
-                    .setDescription('Should a player be able to select multiple Dungeon roles? Leave empty for NO!')
+                    .setDescription('Should a player be able to select multiple Dungeon roles? (Leave empty for NO!)')
                     .setRequired(false)
                     .addChoices(
                         { name: 'No', value: 'no' },
@@ -257,6 +261,16 @@ class DungeonRecruitment {
                     )
             );
         }
+
+        builder.addStringOption(o =>
+            o.setName('notifications')
+                .setDescription('Receive a notification when someone joins or leaves your Dungeon Team? (Leave empty for NO!)')
+                .setRequired(false)
+                .addChoices(
+                    { name: 'Get notified in a DM (Direct Message)', value: NOTIFICATION_MODES.DM },
+                    { name: 'Get notified in the Dungeon Channel', value: NOTIFICATION_MODES.CHANNEL }
+                )
+        );
 
         return builder;
     }
@@ -319,17 +333,18 @@ class DungeonRecruitment {
             });
         }
 
-        // if (interaction.channelId !== this.dungeonChannelID) {
-        //     return interaction.reply({
-        //         content: `### ❌ The \`/${interaction.commandName}\` command can only be used in <#${this.dungeonChannelID}>.`,
-        //         flags: MessageFlags.Ephemeral
-        //     });
-        // }
+        if (interaction.channelId !== this.dungeonChannelID) {
+            return interaction.reply({
+                content: `### ❌ The \`/${interaction.commandName}\` command can only be used in <#${this.dungeonChannelID}>.`,
+                flags: MessageFlags.Ephemeral
+            });
+        }
 
         const nowMs = Date.now();
         const startInput = interaction.options.getString('dungeon_start', true);
         const registrationEndInput = interaction.options.getString('registration_end');
         const description = normalizeDescription(interaction.options.getString('description'));
+        const notificationMode = interaction.options.getString('notifications');
         const pingDungeonRole = interaction.options.getString('ping_dungeon_role') === 'yes';
         const multipleAssignments = interaction.options.getString('multiple_assignments') === 'yes';
 
@@ -379,8 +394,13 @@ class DungeonRecruitment {
             startTime,
             registrationEndTime,
             description,
+            notificationMode,
             multipleAssignments,
             assignments: {},
+            memberNames: {
+                [interaction.user.id]: interaction.member?.displayName ?? interaction.user.globalName ?? interaction.user.username
+            },
+            joinOrder: [],
             closed: false,
             createdAt: nowMs,
             reminderCounter: 0,
@@ -514,7 +534,7 @@ class DungeonRecruitment {
         const result = this.setRunReminders(run, enableReminder);
         if (result.expired) {
             return interaction.reply({
-                content: `### ⏳ Reminders cannot be re-enabled for **${run.dungeonName} Dungeon** because it is older than 24 hours.`,
+                content: `### ⏳ Reminders cannot be re-enabled for **${this.formatDungeonName(run)}** because it is older than 24 hours.`,
                 flags: MessageFlags.Ephemeral
             });
         }
@@ -522,7 +542,7 @@ class DungeonRecruitment {
         return interaction.reply({
             content:
                 `### ✅ Dungeon reminders updated\n` +
-                `- Dungeon: **${run.dungeonName} Dungeon** by <@${run.partyLeaderId}>\n` +
+                `- Dungeon: **${this.formatDungeonName(run)}** by <@${run.partyLeaderId}>\n` +
                 `- Reminders: **${enableReminder ? 'Enabled' : 'Disabled'}**`,
             flags: MessageFlags.Ephemeral
         });
@@ -599,7 +619,7 @@ class DungeonRecruitment {
     buildCloseOverviewEmbed(run) {
         const signedUpCount = this.getAssignedUserIds(run).length;
         const rolesOverview = signedUpCount === 0
-            ? `No members signed up for the ${run.dungeonName} dungeon.`
+            ? `No members signed up for the ${this.formatDungeonName(run)}.`
             : this.getRolesInButtonOrder(run)
                 .map(role => `- ${role.emoji}\u2002**${role.label}:** ${run.assignments[role.key] ? `<@${run.assignments[role.key]}>` : '*No assignment*'}`)
                 .join('\n');
@@ -680,6 +700,18 @@ class DungeonRecruitment {
         return run.roles.find(role => role.key === roleKey);
     }
 
+    formatRoleLabel(role) {
+        return `${role.emoji} ${role.label}`;
+    }
+
+    formatRoleTextList(roles) {
+        return roles.map(role => this.formatRoleLabel(role)).join(', ');
+    }
+
+    formatDungeonName(run) {
+        return `${run.titleEmoji} ${run.dungeonName} Dungeon`;
+    }
+
     getAssignedRoleForUser(run, userId) {
         return run.roles.find(role => run.assignments[role.key] === userId) ?? null;
     }
@@ -690,6 +722,109 @@ class DungeonRecruitment {
 
     isFull(run) {
         return run.roles.every(role => Boolean(run.assignments[role.key]));
+    }
+
+    plainMemberName(run, userId) {
+        const rawName = run.memberNames?.[userId] ?? 'Unknown';
+        return `@${rawName.replace(/[`*_~|>]/g, '')}`;
+    }
+
+    getAssignedRolesForUser(run, userId) {
+        return run.roles.filter(role => run.assignments[role.key] === userId);
+    }
+
+    getNotificationMemberOrder(run) {
+        const seen = new Set();
+        const ordered = [];
+
+        if (run.partyLeaderId) {
+            seen.add(run.partyLeaderId);
+            ordered.push(run.partyLeaderId);
+        }
+
+        for (const userId of run.joinOrder ?? []) {
+            if (seen.has(userId)) continue;
+            seen.add(userId);
+            ordered.push(userId);
+        }
+
+        for (const userId of this.getAssignedUserIds(run)) {
+            if (seen.has(userId)) continue;
+            seen.add(userId);
+            ordered.push(userId);
+        }
+
+        return ordered;
+    }
+
+    formatNotificationMemberLine(run, userId) {
+        const selectedRoles = this.getAssignedRolesForUser(run, userId);
+        const isPartyLeader = userId === run.partyLeaderId;
+
+        if (isPartyLeader && selectedRoles.length === 0) {
+            return `  - ${this.plainMemberName(run, userId)} (Party Leader)`;
+        }
+
+        const roleText = selectedRoles.length > 0 ? this.formatRoleTextList(selectedRoles) : 'No selected role';
+        const leaderText = isPartyLeader ? 'Party Leader — ' : '';
+        return `  - ${this.plainMemberName(run, userId)} (${leaderText}${roleText})`;
+    }
+
+    buildJoinNotification(run, memberUser, role, action = 'joined') {
+        const memberLines = this.getNotificationMemberOrder(run)
+            .map(userId => this.formatNotificationMemberLine(run, userId));
+        const memberCount = memberLines.length;
+        const claimedRoleCount = this.getAssignedUserIds(run).length;
+        const membersLine = run.multipleAssignments
+            ? `- **Members:** \`${memberCount}/${run.roles.length}\`  —  **Dungeon Roles:** \`${claimedRoleCount}/${run.roles.length}\``
+            : `- **Members:** \`${memberCount}/${run.roles.length}\``;
+        const actionEmoji = action === 'left' ? '❌' : '✅';
+        const actionText = action === 'left' ? 'left' : 'joined';
+        const lines = [
+            `**${actionEmoji}  ${this.plainMemberName(run, memberUser.id)} — ${this.formatRoleLabel(role)} — ** ${actionText} your **${this.formatDungeonName(run)}** run, <@${run.partyLeaderId}>`,
+            `### ${this.formatDungeonName(run)} Overview:\n`,
+            ...(run.multipleAssignments ? ['- **Multiple Assignments:** \`Yes!\`'] : []),
+            membersLine,
+            ...memberLines
+        ];
+
+        if (run.registrationEndTime) {
+            lines.push(`- **Registration End:** ${formatDungeonTime(run.registrationEndTime, run.closed)}`);
+        }
+
+        if (run.messageUrl) {
+            lines.push(`### [Jump to Dungeon Recruitment Panel](${run.messageUrl})  ↗️`);
+        }
+
+        return lines.join('\n');
+    }
+
+    async sendJoinNotification(run, interaction, role, action = 'joined') {
+        if (!run.notificationMode) return;
+        if (interaction.user.id === run.partyLeaderId) return;
+
+        const content = this.buildJoinNotification(run, interaction.user, role, action);
+
+        try {
+            if (run.notificationMode === NOTIFICATION_MODES.CHANNEL || run.notificationMode === 'channel_hidden') {
+                const channel = interaction.channel ?? await interaction.client.channels.fetch(run.channelId).catch(() => null);
+                if (!channel?.isTextBased?.()) return;
+
+                await channel.send({
+                    content,
+                    allowedMentions: { users: [run.partyLeaderId] }
+                });
+                return;
+            }
+
+            const leader = await interaction.client.users.fetch(run.partyLeaderId);
+            await leader.send({
+                content,
+                allowedMentions: { users: [run.partyLeaderId] }
+            });
+        } catch (err) {
+            console.warn(`[WW LOG] Failed to send Dungeon ${action} notification for ${run.dungeonName} (${run.id}):`, err);
+        }
     }
 
     scheduleDeadline(run) {
@@ -747,7 +882,14 @@ class DungeonRecruitment {
 
         const claimedBy = run.assignments[role.key];
         if (claimedBy === interaction.user.id) {
+            run.memberNames ??= {};
+            run.memberNames[interaction.user.id] ??= interaction.member?.displayName ?? interaction.user.globalName ?? interaction.user.username;
             delete run.assignments[role.key];
+            if (!this.getAssignedRoleForUser(run, interaction.user.id)) {
+                run.joinOrder = (run.joinOrder ?? []).filter(userId => userId !== interaction.user.id);
+            }
+
+            await this.sendJoinNotification(run, interaction, role, 'left');
 
             await interaction.message.edit({
                 embeds: [this.buildEmbed(run)],
@@ -755,14 +897,14 @@ class DungeonRecruitment {
             });
 
             await interaction.editReply({
-                content: `### ❌ You have been successfully removed from ${run.dungeonName} Dungeon with the role: **${role.label}**.`
+                content: `❌ You have been successfully removed from **${this.formatDungeonName(run)}** with the role: **${this.formatRoleLabel(role)}**.`
             });
             return true;
         }
 
         if (claimedBy) {
             await interaction.editReply({
-                content: `### ❌ **${role.label}** has already been claimed by <@${claimedBy}>.`
+                content: `❌ **${this.formatRoleLabel(role)}** has already been claimed by <@${claimedBy}>.`
             });
             return true;
         }
@@ -770,14 +912,22 @@ class DungeonRecruitment {
         const existingRole = this.getAssignedRoleForUser(run, interaction.user.id);
         if (!run.multipleAssignments && existingRole) {
             await interaction.editReply({
-                content: `### ❌ You are already assigned to **${existingRole.label}** in this ${run.dungeonName} Dungeon run.\n-# Press your current role button to leave before selecting another role.`
+                content: `❌ You are already assigned to **${this.formatRoleLabel(existingRole)}** in this **${this.formatDungeonName(run)}** run.\n-# Press your current role button to leave before selecting another role.`
             });
             return true;
         }
 
         run.assignments[role.key] = interaction.user.id;
+        run.memberNames ??= {};
+        run.memberNames[interaction.user.id] = interaction.member?.displayName ?? interaction.user.globalName ?? interaction.user.username;
+        run.joinOrder ??= [];
+        if (!run.joinOrder.includes(interaction.user.id)) {
+            run.joinOrder.push(interaction.user.id);
+        }
 
         const isNowFull = this.isFull(run);
+        await this.sendJoinNotification(run, interaction, role);
+
         if (isNowFull) {
             await this.closeRun(run.id, 'full', interaction.client, interaction.message);
         } else {
@@ -789,7 +939,7 @@ class DungeonRecruitment {
 
         await interaction.editReply({
             content:
-                `### ✅ You have been successfully assigned to ${run.dungeonName} Dungeon with the role: **${role.label}**.\n` +
+                `✅ You have been successfully assigned to **${this.formatDungeonName(run)}** with the role: **${this.formatRoleLabel(role)}**.\n` +
                 (isNowFull
                     ? '-# This filled the final Dungeon role, so recruitment is now closed.'
                     : '-# Press the button corresponding to your role to be removed from this Dungeon run.')
@@ -827,13 +977,13 @@ class DungeonRecruitment {
         if (reason === 'full') {
             content =
                 `${mentions}\n` +
-                `Recruitment for the ${run.dungeonName} Dungeon has been closed, as all 5 roles have been filled.\n` +
+                `Recruitment for the ${this.formatDungeonName(run)} has been closed, as all 5 roles have been filled.\n` +
                 '- Good luck, and have fun!\u2002<:man_of_culture:1186287184106496112>';
         } else {
             const signedUpCount = this.getAssignedUserIds(run).length;
             content =
                 `${mentions ? `${mentions}\n` : ''}` +
-                `The recruitment deadline for the ${run.dungeonName} Dungeon has passed, and recruitment is now closed.\n` +
+                `The recruitment deadline for the ${this.formatDungeonName(run)} has ended, and recruitment is now closed.\n` +
                 `${signedUpCount > 0 ? `- Good luck, and have fun!\u2002<:man_of_culture:1186287184106496112>` : ''}`;
         }
 
@@ -873,7 +1023,7 @@ class DungeonRecruitment {
             if (run.reminderCounter % 10 === 0 && run.messageUrl) {
                 await message.channel.send({
                     content:
-                        `## ${run.titleEmoji}\u2002Recruitment for ${run.dungeonName} Dungeon is still open!\n` +
+                        `## Recruitment for ${this.formatDungeonName(run)} is still open!\n` +
                         `- [Jump to Dungeon Recruitment](${run.messageUrl})`
                 });
             }
