@@ -334,7 +334,7 @@ const GUILD_ROLES_PANEL = autoRolePanelConfig({
         '-# - Select **Dungeon 🧙‍♂️** to be pinged for Dungeon runs.\n' +
         '-# - Select **Level / EV ✨** to be pinged for service requests.\n' +
         '-# - Select **Dex Service 🤝** to be pinged for service requests.\n' +
-        '-# - Select **Stream 🔔** to be pinged when someone from the Guild streams. You can also ping this role when you stream.',
+        '-# - Select **Stream 🔔** to be pinged when someone from the Guild streams. You can also ping this role when you go live.',
     colorHex: '#02F3D7',
     imagePath: 'images/ww_logo.png',
     imageFilename: 'ww_logo.png',
