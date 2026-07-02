@@ -1,6 +1,7 @@
 require('dotenv').config();
 const db = require('./db/db-conn.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
+const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
 const {
     Client,
     GatewayIntentBits,
@@ -12,7 +13,7 @@ const {
     MessageFlags
 } = require('discord.js');
 const {
-    guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, streamRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, historyThreadID, dungeonChannelID, dungeonRoleID
+    guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, streamRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, historyThreadID, dungeonChannelID, dungeonRoleID, giveawayChannelID
 } = require('./config.json');
 
 const fs = require("fs");
@@ -101,6 +102,7 @@ const commandMap = new Map();
 // let activeChallenge = null; // Global PvP Challenge Lock
 const challengeTimeouts = new Map(); // PvP challenge confirmation timers
 const pvpKingStorage = new PvpKingStorage({ db });
+const giveawayStore = createGiveawayStore({ db });
 
 // Build config object (Parameters to send to command classes)
 const commandConfig = {
@@ -124,6 +126,8 @@ const commandConfig = {
     historyThreadID,
     dungeonChannelID,
     dungeonRoleID,
+    giveawayChannelID,
+    giveawayStore,
     challengeTimeouts,
     pvpKingStorage,
     onCooldown,
@@ -145,6 +149,7 @@ async function bootstrap() {
         }
 
         await pvpKingStorage.restore();
+        await giveawayStore.restore();
 
         // Load commands
         const commandsForDiscord = []; // JSON for the REST API
@@ -335,6 +340,7 @@ client.once(Events.ClientReady, async () => {
 
     // Check if PvP King cooldowns naturally expired (every 60 seconds)
     pvpKingStorage.startSyncLoop();
+    startGiveawayLoop(client, commandConfig);
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
 });

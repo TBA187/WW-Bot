@@ -15,6 +15,8 @@ const db = mysql.createPool({
     connectTimeout: 30000,
     enableKeepAlive: true,
     keepAliveInitialDelay: 300000, // 5 minutes in milliseconds
+    supportBigNumbers: true,
+    bigNumberStrings: true,
     maxIdle: Number(process.env.DB_MAX_IDLE || 1),
     idleTimeout: 300000, // 5 minutes
 });

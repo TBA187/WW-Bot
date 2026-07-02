@@ -183,13 +183,16 @@ class PvpKingStorage {
     writeJsonStore(source = this.getJsonSource(), pendingSync = false, options = {}) {
         try {
             fs.mkdirSync(path.dirname(this.dataFile), { recursive: true });
+            const state = source === JSON_SOURCES.MYSQL_FALLBACK && !pendingSync
+                ? this.createEmptySerializedState()
+                : this.serializeState();
             fs.writeFileSync(
                 this.tempFile,
                 JSON.stringify({
                     version: STORAGE_VERSION,
                     source,
                     pendingSync,
-                    state: this.serializeState()
+                    state
                 }, null, 2)
             );
             fs.renameSync(this.tempFile, this.dataFile);
@@ -199,6 +202,17 @@ class PvpKingStorage {
             if (options.throwOnError) throw err;
             return false;
         }
+    }
+
+    createEmptySerializedState() {
+        return {
+            stats: [],
+            cooldowns: [],
+            history: [],
+            nextCooldownId: 1,
+            nextHistoryId: 1,
+            operations: []
+        };
     }
 
     writeJsonStoreOrThrow(source = this.getJsonSource(), pendingSync = false) {

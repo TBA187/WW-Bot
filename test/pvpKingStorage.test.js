@@ -368,6 +368,27 @@ test('recordCrownEvent commits dependent MySQL writes in one transaction', async
     assert.equal(fakeDb.cooldowns.find(row => row.challenger_id === 'old').king_id, 'new');
 }));
 
+test('successful MySQL storage leaves fallback JSON empty', async () => withDbEnv(async () => {
+    const file = tempDataFile();
+    const fakeDb = new FakeDb();
+    const storage = new PvpKingStorage({ db: fakeDb, storageMode: 'auto', dataFile: file });
+
+    await storage.restore();
+    await storage.recordCrownEvent({
+        newKingId: 'new',
+        newKingName: 'New King',
+        createdAt: '2026-01-03 00:00:00'
+    });
+
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(stored.source, 'mysql_fallback');
+    assert.equal(stored.pendingSync, false);
+    assert.deepEqual(stored.state.stats, []);
+    assert.deepEqual(stored.state.cooldowns, []);
+    assert.deepEqual(stored.state.history, []);
+    assert.deepEqual(stored.state.operations, []);
+}));
+
 test('recordCrownEvent rolls back MySQL failure and stores one fallback event', async () => withDbEnv(async () => {
     const file = tempDataFile();
     const fakeDb = new FakeDb();
