@@ -2,12 +2,13 @@
 // /pvp_history
 // ----------------------
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
 class PvpHistory {
 
     constructor(config) {
         this.name = "pvp_history";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.historyThreadID = config.historyThreadID;
         this.onCooldown = config.onCooldown;
 
@@ -23,9 +24,7 @@ class PvpHistory {
     }
 
     async execute(interaction) {
-        if (this.onCooldown(interaction.user.id, 'currentking', 2)) {
-            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
-        }
+        if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
 
         await interaction.deferReply();
 
@@ -33,18 +32,13 @@ class PvpHistory {
             const amount = interaction.options.getInteger('amount') ?? 10;
 
             // Count Total PvP Kings
-            const [[{ totalKings }]] = await this.db.query('SELECT COUNT(*) AS totalKings FROM pvp_king_stats');
+            const totalKings = await this.db.countStats();
 
             // Fetch latest 500 entries from history
-            const [rowsDesc] = await this.db.query(`
-                SELECT id, king_id, king_name, type, total_wins_after, streak_after, created_at
-                FROM pvp_king_history
-                ORDER BY id ASC
-                LIMIT 500
-            `);
+            const rowsDesc = await this.db.historyAscending(500);
 
             // Count all PvP King entries
-            const [[{ totalKingEntries }]] = await this.db.query('SELECT COUNT(*) AS totalKingEntries FROM pvp_king_history');
+            const totalKingEntries = await this.db.countHistory();
 
             if (!rowsDesc.length) {
                 return interaction.editReply('### ⚠️ No PvP King history found.');
@@ -111,10 +105,13 @@ class PvpHistory {
 
         } catch (err) {
             console.error(err);
+            const message = err.code === 'PVP_DATABASE_UNAVAILABLE'
+                ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                : '### ⚠️ Failed to fetch history.';
             if (interaction.replied || interaction.deferred) {
-                return interaction.editReply({ content: '### ⚠️ Failed to fetch history.' });
+                return interaction.editReply({ content: message });
             }
-            return interaction.reply({ content: '### ⚠️ Failed to fetch history.', flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
         }
     }
 }

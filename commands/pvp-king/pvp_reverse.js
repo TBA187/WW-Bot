@@ -3,12 +3,13 @@
 // /pvp_reverse
 // ----------------------
 const { SlashCommandBuilder, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { getLogChannel, requireAnyRole, stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
 class PvpReverse {
 
     constructor(config) {
         this.name = "pvp_reverse";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.leaderRoleID = config.leaderRoleID;
         this.adminRoleID = config.adminRoleID;
         this.officerRoleID = config.officerRoleID;
@@ -25,15 +26,11 @@ class PvpReverse {
     }
 
     async execute(interaction) {
-        if (this.onCooldown(interaction.user.id, 'currentking', 2)) {
-            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
-        }
+        if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
 
         // Check if user has Officer Role
         const allowedRoles = [this.leaderRoleID, this.adminRoleID, this.officerRoleID];
-        if (!interaction.member.roles.cache.some(role => allowedRoles.includes(role.id))) {
-            return interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
-        }
+        if (!await requireAnyRole(interaction, allowedRoles)) return;
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -42,32 +39,19 @@ class PvpReverse {
             console.log('"/pvp_reverse" command used!');
 
             const { guild } = interaction;
-            const logChannel = guild.channels.cache.get(this.logChannelID);
-            if (!logChannel) {
-                console.log(' - WARNING: Log channel not found! Channel ID: ' + this.logChannelID);
-            }
+            const logChannel = getLogChannel(guild, this.logChannelID);
 
             // 1) Get the last Crowned PvP King
-            const [lastRow] = await this.db.query(`
-                SELECT * FROM pvp_king_history
-                ORDER BY id DESC
-                LIMIT 1
-            `);
+            let wrongKing = await this.db.latestHistory();
 
-            if (!lastRow.length) {
+            if (!wrongKing) {
                 return interaction.editReply('### ⚠️ No PvP crown history found to reverse.');
             }
 
-            const wrongKing = lastRow[0];
             console.log('Wrong King: ', wrongKing);
 
             // 2) Get the previous King BEFORE wrong crown
-            const [prevRows] = await this.db.query(`
-                SELECT * FROM pvp_king_history
-                ORDER BY id DESC
-                LIMIT 1 OFFSET 1
-            `);
-            let prevKing = prevRows.length ? prevRows[0] : null;
+            let prevKing = await this.db.latestHistory(1);
             console.log('Previous King: ', prevKing);
 
             // 3) Send confirmation message with buttons
@@ -86,7 +70,7 @@ class PvpReverse {
             let type = 'Crown 👑';
             let typeTxt = 'Crowned:';
             let reverseWarningTxt = 'This will restore the Crown back to the previous PvP King';
-            if (prevKing.king_id == wrongKing.king_id) {
+            if (prevKing?.king_id == wrongKing.king_id) {
                 type = 'Defense 🛡️';
                 typeTxt = 'Defended Crown:';
                 reverseWarningTxt = 'This will undo the PvP stats for the Throne defender';
@@ -118,55 +102,31 @@ class PvpReverse {
                 if (i.customId === 'confirm_reverse') {
                     await i.update({ content: `🔄 Reversing PvP Crown of wrong King: **${wrongKing.king_name}...**`, components: [] });
 
-                    // 5) Remove the last history record
-                    const [delHistoryRes] = await this.db.query(`
-                        DELETE FROM pvp_king_history
-                        WHERE id = ?
-                    `, [wrongKing.id]);
-                    console.log("1) DELETE wrong King FROM pvp_king_history: ", delHistoryRes.affectedRows);
-
-                    // 6) Update Stats for wrong King in pvp_king_stats
-                    if (wrongKing.total_wins_after == 0 || wrongKing.total_wins_after == 1) {
-                        // If new King has 0 previous wins, then it's a new entry and needs to be deleted
-                        const [delStatsRes] = await this.db.query(`
-                            DELETE FROM pvp_king_stats
-                            WHERE user_id = ?
-                        `, [wrongKing.king_id]);
-                        console.log("2.1) DELETE wrong King FROM pvp_king_stats: ", delStatsRes.affectedRows);
-                    } else {
-                        let longestStreakAfter = 0;
-                        let consoleMsg = '';
-                        if (prevKing) {
-                            if (prevKing.king_id == wrongKing.king_id) {
-                                consoleMsg = 'prevKing.king_id == wrongKing.king_id';
-                                if (prevKing.longest_streak_after != wrongKing.longest_streak_after) {
-                                    longestStreakAfter = prevKing.longest_streak_after;
-                                    consoleMsg = ` - prevKing.longest_streak_after != wrongKing.longest_streak_after: "${longestStreakAfter}"`;
-                                } else {
-                                    longestStreakAfter = wrongKing.longest_streak_after;
-                                    consoleMsg = ` - prevKing.longest_streak_after == wrongKing.longest_streak_after: "${longestStreakAfter}"`;
-                                }
-                            } else {
-                                longestStreakAfter = wrongKing.longest_streak_after;
-                                consoleMsg = `prevKing.king_id != wrongKing.king_id: "${longestStreakAfter}"`;
-                            }
-                        } else {
-                            longestStreakAfter = wrongKing.longest_streak_after;
-                            consoleMsg = 'No prevKing!';
+                    let reverseResult;
+                    try {
+                        reverseResult = await this.db.reverseLatestCrownEvent({ expectedHistoryId: wrongKing.id });
+                    } catch (err) {
+                        if (err.code === 'PVP_STALE_REVERSE') {
+                            return interaction.editReply({
+                                content: '### ⚠️ The latest PvP crown changed before this reverse could finish.\n- Nothing was changed. Run `/pvp_reverse` again to review the newest crown event.',
+                                components: []
+                            });
                         }
 
-                        const [updateStatsRes] = await this.db.query(`
-                            UPDATE pvp_king_stats
-                            SET 
-                                total_wins = GREATEST(total_wins - 1, 0), 
-                                current_streak = 0, 
-                                longest_streak = ?, 
-                                crowned_at = ?
-                            WHERE user_id = ?
-                        `, [longestStreakAfter, wrongKing.last_crowned, wrongKing.king_id]);
-                        console.log(`2.2) UPDATE wrong King in pvp_king_stats: `, updateStatsRes.affectedRows);
-                        console.log(`2.2) Conditions: ${consoleMsg}`);
+                        console.error(err);
+                        return interaction.editReply({
+                            content: err.code === 'PVP_DATABASE_UNAVAILABLE'
+                                ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                                : '### ⚠️ Failed to reverse the last PvP crown. No PvP King changes were applied.',
+                            components: []
+                        });
                     }
+
+                    wrongKing = reverseResult.wrongKing;
+                    prevKing = reverseResult.prevKing;
+                    console.log("1) DELETE wrong King FROM pvp_king_history: ", reverseResult.delHistoryRes?.affectedRows ?? 0);
+                    console.log("2) UPDATE wrong King in pvp_king_stats: ", reverseResult.statsResult?.affectedRows ?? 0);
+                    if (reverseResult.statsConsoleMsg) console.log(`2) Conditions: ${reverseResult.statsConsoleMsg}`);
 
                     // 7) Update Discord roles
                     const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
@@ -188,14 +148,7 @@ class PvpReverse {
                         console.log("--) King Role not found!");
                     }
 
-                    // 8) Reset cooldowns any challengers have versus the wrong King
-                    const [resetCDsql] = await this.db.query(`
-                        UPDATE pvp_king_cooldowns
-                        SET 
-                            last_challenge = NULL
-                        WHERE king_id = ?
-                        `, [wrongKing.king_id]);
-                    console.log("5) UPDATE pvp_king_cooldowns to remove cooldowns against the wrong King: ", resetCDsql.affectedRows);
+                    console.log("5) UPDATE pvp_king_cooldowns to remove cooldowns against the wrong King: ", reverseResult.resetCooldownResult?.affectedRows ?? 0);
 
                     // 9) Delete wrong King Log in Discord History Thread
                     const thread = await this.client.channels.fetch(this.historyThreadID);
@@ -212,14 +165,15 @@ class PvpReverse {
                         console.log('6) No messages in Discord History Thread to delete!');
                     }
 
+                    const executorName = interaction.user.displayName;
+                    const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+
                     // Error handling: If no Previous King found!
                     if (!prevKing) {
                         console.log("No Previous King found!");
 
                         // Log to Discord Log Channel
                         if (logChannel) {
-                            const executorName = interaction.user.displayName;
-                            const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
                             await logChannel.send(
                                 `## 🚨  PvP Crown reversed! (${now})\n` +
                                 `- **${executorName}** successfully reversed the last PvP Crown of **<@${wrongKing.king_id}>**\n` +
@@ -239,18 +193,8 @@ class PvpReverse {
                         );
                     }
 
-                    // 10) Restore Stats for previous King (to be new current King)
-                    const [updatePrevKingRes] = await this.db.query(`
-                        UPDATE pvp_king_stats
-                        SET 
-                            ${prevKing.king_id != wrongKing.king_id ? 'total_crown_losses = GREATEST(total_crown_losses - 1, 0), ' : ''}
-                            current_streak = ?
-                        WHERE user_id = ?
-                    `, [prevKing.streak_after, prevKing.king_id]);
-                    console.log("7) UPDATE pvp_king_stats for previous King: ", updatePrevKingRes.affectedRows);
+                    console.log("7) UPDATE pvp_king_stats for previous King: ", reverseResult.prevKingResult?.affectedRows ?? 0);
 
-                    const executorName = interaction.user.displayName;
-                    const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
                     const last_crowned_time = wrongKing.created_at
                         ? `<t:${Math.floor(new Date(wrongKing.created_at).getTime() / 1000)}:F>`
                         : '*Error loading time!*';

@@ -2,12 +2,21 @@
 // /pvp_crown
 // ----------------------
 const { SlashCommandBuilder, MessageFlags, ThreadChannel, EmbedBuilder, AttachmentBuilder } = require('discord.js');
+const {
+    formatNowMinute,
+    getLogChannel,
+    refreshGuildMembers,
+    replyMissingMemberOption,
+    requireAnyRole,
+    requirePvpChannel,
+    stopIfOnCooldown
+} = require('./utils/pvpHelper.js');
 
 class PvpCrownKing {
 
     constructor(config) {
         this.name = "pvp_crown";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
         this.pvpWarriorRoleID = config.pvpWarriorRoleID;
         this.leaderRoleID = config.leaderRoleID;
@@ -28,50 +37,33 @@ class PvpCrownKing {
     }
 
     async execute(interaction) {
-        if (this.onCooldown(interaction.user.id, 'currentking', 2)) {
-            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
-        }
-
-        if (interaction.channelId !== this.pvpKingChannelID) {
-            return interaction.reply({ content: `### ❌  The \`/pvp_crown\` command can only be used in <#${this.pvpKingChannelID}>`, flags: MessageFlags.Ephemeral });
-        }
-
-        const { guild } = interaction;
-        const logChannel = guild.channels.cache.get(this.logChannelID);
-        if (!logChannel) {
-            console.log(' - WARNING: Log channel not found! Channel ID: ' + this.logChannelID);
-        }
+        if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
 
         // Check if user has Officer Role
-        const allowedRoles = [this.leaderRoleID, this.adminRoleID, this.officerRoleID, this.pvpWarriorRoleID];
-        if (!interaction.member.roles.cache.some(role => allowedRoles.includes(role.id))) {
-            return interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
-        }
+        if (!await requirePvpChannel(interaction, this.pvpKingChannelID, 'pvp_crown')) return;
 
-        // SAFETY CHECKS
+        const { guild } = interaction;
+        const logChannel = getLogChannel(guild, this.logChannelID);
+        const allowedRoles = [this.leaderRoleID, this.adminRoleID, this.officerRoleID, this.pvpWarriorRoleID];
+        if (!await requireAnyRole(interaction, allowedRoles)) return;
+
+        // Crown has slightly different rules than the normal "find one king" helper:
+        // no current king is allowed, but multiple current kings must be fixed manually.
         const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
         if (!kingRole) {
             return interaction.reply({ content: '### ❌  PvP King role not found! Needs to be fixed manually!', flags: MessageFlags.Ephemeral });
         }
 
-        const newKing = interaction.options.getMember('user');
-        if (!newKing) {
-            return interaction.reply({ content: '### ❌  User not found.', flags: MessageFlags.Ephemeral });
-        }
+        const newKing = await replyMissingMemberOption(interaction);
+        if (!newKing) return;
 
         await interaction.deferReply();
-
-        await interaction.guild.members.fetch().catch(err => {
-            console.error('[WW LOG] Failed to refresh members for /pvp_crown:', err.code || err.message);
-        });
+        await refreshGuildMembers(interaction.guild, '/pvp_crown');
 
         const kings = kingRole.members;
-
-        // If more than 1 PvP King exist
         if (kings.size > 1) {
-            // Log the issue to the Discord Log Channel
             if (logChannel) {
-                const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+                const now = formatNowMinute();
                 await logChannel.send(
                     `**🚨 <@${this.ownerID}> — Multiple PvP Kings Detected!**\n` +
                     `**${kingRole.members.size} members** currently have the PvP King role.\n` +
@@ -79,7 +71,6 @@ class PvpCrownKing {
                 );
             }
 
-            // User feedback message
             return interaction.editReply({
                 content:
                     `❌ **Error:** There are currently **${kingRole.members.size} members** with the PvP King role.\n` +
@@ -92,119 +83,21 @@ class PvpCrownKing {
             const oldKing = kings.first();
             const isDefense = oldKing && oldKing.id === newKing.id;
 
-            // Get new King's last crowned date if any
-            const [newKingRow] = await this.db.query(
-                'SELECT crowned_at FROM pvp_king_stats WHERE user_id = ?',
-                [newKing.id]
-            );
-            const newKing_last_crowned = newKingRow[0]?.crowned_at || 0;
-            let usersToNotify = [];
+            const crownResult = await this.db.recordCrownEvent({
+                newKingId: newKing.id,
+                newKingName: newKing.displayName,
+                oldKingId: oldKing?.id,
+                oldKingName: oldKing?.displayName,
+                isDefense
+            });
 
-            // =============================
-            // DEFENSE CASE
-            // =============================
-            if (isDefense) {
-                await this.db.query(`
-                INSERT INTO pvp_king_stats (user_id, king_name, total_wins, current_streak, longest_streak, crowned_at)
-                VALUES (?, ?, 1, 1, 1, UTC_TIMESTAMP())
-                ON DUPLICATE KEY UPDATE
-                    total_wins = total_wins + 1,
-                    current_streak = current_streak + 1,
-                    longest_streak = GREATEST(longest_streak, current_streak),
-                    crowned_at = UTC_TIMESTAMP()
-                `, [newKing.id, newKing.displayName]);
-            }
-            // =============================
-            // NEW KING CASE
-            // =============================
-            else {
+            // Discord changes happen only after storage succeeds.
+            if (!isDefense) {
                 if (oldKing) {
-                    // ----- Cooldown Notification Logic -----
-                    const [notifyRows] = await this.db.query(`
-                        SELECT challenger_id, last_challenge FROM pvp_king_cooldowns 
-                        WHERE king_id = ? AND notify_on_expire = 1 AND last_challenge IS NOT NULL
-                    `, [oldKing.id]);
-
-                    const now = new Date();
-                    const cooldownMs = 48 * 60 * 60 * 1000;
-                    for (const row of notifyRows) {
-                        const lastChallengeDate = new Date(row.last_challenge + 'Z');
-                        // Only notify if the 48h hasn't passed yet
-                        if (now - lastChallengeDate < cooldownMs) {
-                            usersToNotify.push(`<@${row.challenger_id}>`);
-                        }
-                    }
-
-                    // Remove old king role if exists
+                    // Remove old king, if role exists
                     await oldKing.roles.remove(this.pvpKingRoleID).catch(console.error);
 
-                    // Reset old king streak
-                    await this.db.query(`
-                    UPDATE pvp_king_stats
-                    SET 
-                        total_crown_losses = total_crown_losses + 1,
-                        current_streak = 0
-                    WHERE user_id = ?
-                    `, [oldKing.id]);
-
-                    // Reset cooldowns any challengers have versus the old King
-                    await this.db.query(`
-                    UPDATE pvp_king_cooldowns
-                    SET last_challenge = NULL
-                    WHERE king_id = ?
-                    `, [oldKing.id]);
-
-                    // Apply a fresh cooldown to the old King against the new King to prevent instant rematches
-                    await this.db.query(`
-                    INSERT INTO pvp_king_cooldowns (challenger_id, challenger_name, king_id, king_name, last_challenge)
-                    VALUES (?, ?, ?, ?, UTC_TIMESTAMP())
-                    ON DUPLICATE KEY UPDATE
-                        challenger_name = VALUES(challenger_name),
-                        king_id = VALUES(king_id),
-                        king_name = VALUES(king_name),
-                        last_challenge = VALUES(last_challenge)
-                    `, [oldKing.id, oldKing.displayName, newKing.id, newKing.displayName]);
-
-                    // If any challengers have an active cooldown against the fallen King AND enabled notifications, then send notifications to waiting challengers!
-                    if (usersToNotify.length > 0 && this.pvpKingChannelID) {
-                        const pvpKingChannel = guild.channels.cache.get(this.pvpKingChannelID);
-                        if (pvpKingChannel) {
-                            const logoFile = new AttachmentBuilder('./images/ww_logo.png', { name: 'ww_logo.png' });
-                            const pvpKingCdEmbed = new EmbedBuilder()
-                                .setColor(0x02f3d7)
-                                .setTitle('🔔 PvP Cooldowns Cleared!')
-                                .setThumbnail(newKing.displayAvatarURL({ size: 256 }))
-                                .setDescription(
-                                    `### The PvP Throne has been claimed by <@${newKing.id}>!\n` +
-                                    `The reign of **${oldKing.displayName}** has ended. **All cooldowns have been reset**, and you may now challenge the new PvP King! ⚔️`
-                                )
-                                .addFields(
-                                    { name: '👑 New PvP King', value: `<@${newKing.id}>`, inline: true },
-                                    { name: 'Old PvP King', value: `<@${oldKing.id}>`, inline: true }
-                                )
-                                .setFooter({ text: 'WW PvP King System', iconURL: 'attachment://ww_logo.png' })
-                                .setTimestamp();
-
-                            await pvpKingChannel.send({
-                                content: usersToNotify.length > 0 ? usersToNotify.join(' ') : null,
-                                embeds: [pvpKingCdEmbed],
-                                files: [logoFile]
-                            });
-                        }
-                    }
                 }
-
-                // Update new king stats
-                await this.db.query(`
-                INSERT INTO pvp_king_stats 
-                    (user_id, king_name, total_wins, current_streak, longest_streak, first_crowned, crowned_at)
-                VALUES (?, ?, 1, 1, 1, UTC_TIMESTAMP(), UTC_TIMESTAMP())
-                ON DUPLICATE KEY UPDATE
-                    total_wins = total_wins + 1,
-                    current_streak = 1,
-                    longest_streak = GREATEST(longest_streak, 1),
-                    crowned_at = UTC_TIMESTAMP()
-                `, [newKing.id, newKing.displayName]);
 
                 // Add role to new king
                 await newKing.roles.add(this.pvpKingRoleID).catch(console.error);
@@ -213,35 +106,44 @@ class PvpCrownKing {
                 if (!newKing.roles.cache.has(this.pvpWarriorRoleID)) {
                     await newKing.roles.add(this.pvpWarriorRoleID).catch(console.error);
                 }
+
+                const usersToNotify = (crownResult.usersToNotify ?? []).map(row => `<@${row.challenger_id}>`);
+                // If any challengers have an active cooldown against the fallen King AND enabled notifications, then send notifications to waiting challengers!
+                if (oldKing && usersToNotify.length > 0 && this.pvpKingChannelID) {
+                    const pvpKingChannel = guild.channels.cache.get(this.pvpKingChannelID);
+                    if (pvpKingChannel) {
+                        const logoFile = new AttachmentBuilder('./images/ww_logo.png', { name: 'ww_logo.png' });
+                        const pvpKingCdEmbed = new EmbedBuilder()
+                            .setColor(0x02f3d7)
+                            .setTitle('🔔 PvP Cooldowns Cleared!')
+                            .setThumbnail(newKing.displayAvatarURL({ size: 256 }))
+                            .setDescription(
+                                `### The PvP Throne has been claimed by <@${newKing.id}>!\n` +
+                                `The reign of **${oldKing.displayName}** has ended. **All cooldowns have been reset**, and you may now challenge the new PvP King! ⚔️`
+                            )
+                            .addFields(
+                                { name: '👑 New PvP King', value: `<@${newKing.id}>`, inline: true },
+                                { name: 'Old PvP King', value: `<@${oldKing.id}>`, inline: true }
+                            )
+                            .setFooter({ text: 'WW PvP King System', iconURL: 'attachment://ww_logo.png' })
+                            .setTimestamp();
+
+                        await pvpKingChannel.send({
+                            content: usersToNotify.join(' '),
+                            embeds: [pvpKingCdEmbed],
+                            files: [logoFile]
+                        });
+                    }
+                }
             }
 
             //currentKingId = newKing.id;
 
             // Get current King's Win Streak
-            const [rows] = await this.db.query(
-                'SELECT total_wins, current_streak, longest_streak, crowned_at FROM pvp_king_stats WHERE user_id = ?',
-                [newKing.id]
-            );
-            const totalWins = rows[0]?.total_wins || 0;
-            const streak = rows[0]?.current_streak || 0;
-            const longest = rows[0]?.longest_streak || 0;
-            const crowned_at = rows[0]?.crowned_at || 0;
-            let lastCrowned = (newKing_last_crowned === 0) ? crowned_at : newKing_last_crowned;
-
-            // Log to DB History
-            await this.db.query(`
-            INSERT INTO pvp_king_history
-                (king_id, king_name, type, total_wins_after, streak_after, longest_streak_after, last_crowned, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())
-            `, [
-                newKing.id,
-                newKing.displayName,
-                isDefense ? 'defense' : 'crown',
-                totalWins,
-                streak,
-                longest,
-                lastCrowned
-            ]);
+            const stats = crownResult.stats;
+            const totalWins = stats?.total_wins || 0;
+            const streak = stats?.current_streak || 0;
+            const longest = stats?.longest_streak || 0;
 
             // DELETE AFTER EVENT!
             // ==========================================
@@ -251,11 +153,7 @@ class PvpCrownKing {
 
             if (new Date() > new Date(EVENT_START)) {
                 // 1. Fetch history since event start (DESC to count backwards from this win)
-                const [fullEventHistory] = await this.db.query(`
-                    SELECT king_id, created_at FROM pvp_king_history 
-                    WHERE created_at > ? 
-                    ORDER BY created_at DESC
-                `, [EVENT_START]);
+                const fullEventHistory = await this.db.eventHistorySinceDesc(EVENT_START);
 
                 let eventStreakCounter = 0;
                 let eventVictoryDates = [];
@@ -388,10 +286,13 @@ class PvpCrownKing {
             }
         } catch (err) {
             console.error(err);
+            const message = err.code === 'PVP_DATABASE_UNAVAILABLE'
+                ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                : '### ⚠️ Database error during Crowning. No PvP King changes were applied.';
             if (interaction.replied || interaction.deferred) {
-                return interaction.editReply({ content: '### ⚠️ Database error during Crowning.' });
+                return interaction.editReply({ content: message });
             }
-            return interaction.reply({ content: '### ⚠️ Database error during Crowning.', flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
         }
     }
 }

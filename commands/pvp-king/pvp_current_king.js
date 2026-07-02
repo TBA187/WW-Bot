@@ -3,12 +3,13 @@
 // ----------------------
 const { SlashCommandBuilder, MessageFlags, EmbedBuilder } = require('discord.js');
 const { getServerLogo, createPvpFooter } = require('./utils/pvpAssets.js');
+const { formatNowMinute, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
 class PvpCurrentKing {
 
     constructor(config) {
         this.name = "pvp_current_king";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
         this.ownerID = config.ownerID;
         this.logChannelID = config.logChannelID;
@@ -20,69 +21,33 @@ class PvpCurrentKing {
     }
 
     async execute(interaction) {
-        if (this.onCooldown(interaction.user.id, 'currentking', 2)) {
-            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
-        }
+        if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
 
         await interaction.deferReply();
 
         try {
-            const { guild } = interaction;
-            const logChannel = guild.channels.cache.get(this.logChannelID);
-            if (!logChannel) {
-                console.log(' - WARNING: Log channel not found! Channel ID: ' + this.logChannelID);
-            }
-
-            const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
-            const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
-
-            if (!kingRole) {
-                if (logChannel) {
-                    await logChannel.send(`### 🚨 <@${this.ownerID}> — PvP King role missing! (${now})`);
-                }
-
-                return interaction.editReply({
-                    content: '### ❌ PvP King role not found! Officers have been notified and will resolve the issue as soon as possible.',
-                });
-            }
-
-            await interaction.guild.members.fetch().catch(err => {
-                console.error('[WW LOG] Failed to refresh members for /pvp_current_king:', err.code || err.message);
+            const kingCheck = await resolveSinglePvpKing(interaction, {
+                pvpKingRoleID: this.pvpKingRoleID,
+                logChannelID: this.logChannelID,
+                ownerID: this.ownerID,
+                now: formatNowMinute(),
+                contextLabel: '/pvp_current_king',
+                missingRoleReply: '### ❌ PvP King role not found! Officers have been notified and will resolve the issue as soon as possible.',
+                noKingReply: '### ⚠️ No PvP King found! Officers have been notified and will resolve the issue as soon as possible.',
+                multipleKingsReply: '### ⚠️ Multiple PvP Kings detected! Officers have been notified and will resolve the issue as soon as possible.'
             });
+            if (!kingCheck.ok) return;
 
-            if (kingRole.members.size === 0) {
-                if (logChannel) {
-                    await logChannel.send(`### 🚨 <@${this.ownerID}> — No PvP King found! (${now})`);
-                }
-
-                return interaction.editReply({
-                    content: '### ⚠️ No PvP King found! Officers have been notified and will resolve the issue as soon as possible.',
-                });
-            }
-
-            if (kingRole.members.size > 1) {
-                if (logChannel) {
-                    await logChannel.send(`### 🚨 <@${this.ownerID}> — Multiple PvP Kings detected: ${kingRole.members.size} — (${now})`);
-                }
-
-                return interaction.editReply({
-                    content: '### ⚠️ Multiple PvP Kings detected! Officers have been notified and will resolve the issue as soon as possible.',
-                });
-            }
-
-            const currentKing = kingRole.members.first();
+            const currentKing = kingCheck.currentKing;
 
             // Get PvP King stats from DB
-            const [rows] = await this.db.query(
-                'SELECT total_wins, current_streak, longest_streak, first_crowned, crowned_at FROM pvp_king_stats WHERE user_id = ?',
-                [currentKing.id]
-            );
+            const stats = await this.db.getStats(currentKing.id);
 
-            const totalWins = rows[0]?.total_wins || 0;
-            const currentStreak = rows[0]?.current_streak || 0;
-            const longestStreak = rows[0]?.longest_streak || 0;
-            const firstCrowned = rows[0]?.first_crowned ? `<t:${Math.floor(new Date(rows[0]?.first_crowned).getTime() / 1000)}:F>` : '*Never*';
-            const lastCrowned = rows[0]?.crowned_at ? `<t:${Math.floor(new Date(rows[0]?.crowned_at).getTime() / 1000)}:F>` : '*Never*';
+            const totalWins = stats?.total_wins || 0;
+            const currentStreak = stats?.current_streak || 0;
+            const longestStreak = stats?.longest_streak || 0;
+            const firstCrowned = stats?.first_crowned ? `<t:${Math.floor(new Date(stats?.first_crowned).getTime() / 1000)}:F>` : '*Never*';
+            const lastCrowned = stats?.crowned_at ? `<t:${Math.floor(new Date(stats?.crowned_at).getTime() / 1000)}:F>` : '*Never*';
             const embed = new EmbedBuilder()
                 .setTitle('<:kyurem:1472065995089645609>\u2002White Walker PvP King\u2002<:kyurem:1472065995089645609>')
                 .setDescription(`## 👑\u2002<@${currentKing.id}>\u2002👑`)
@@ -107,10 +72,13 @@ class PvpCurrentKing {
             });
         } catch (err) {
             console.error(err);
+            const message = err.code === 'PVP_DATABASE_UNAVAILABLE'
+                ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                : '### ⚠️ Database error.';
             if (interaction.replied || interaction.deferred) {
-                return interaction.editReply({ content: '### ⚠️ Database error.' });
+                return interaction.editReply({ content: message });
             }
-            return interaction.reply({ content: '### ⚠️ Database error.', flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
         }
     }
 }

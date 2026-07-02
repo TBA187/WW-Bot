@@ -14,7 +14,7 @@ const {
 class PvpLeaderboard {
     constructor(config) {
         this.name = "pvp_leaderboard";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
         this.historyThreadID = config.historyThreadID;
         this.data = new SlashCommandBuilder()
@@ -27,25 +27,17 @@ class PvpLeaderboard {
 
         try {
             // Fetch ALL records
-            const [rows] = await this.db.query(`
-                SELECT user_id, king_name, longest_streak, total_wins, first_crowned, crowned_at 
-                FROM pvp_king_stats
-            `);
+            const rows = await this.db.listStats();
 
             if (rows.length === 0) {
                 return interaction.editReply("### 📜 The Hall of Fame is currently empty!");
             }
 
             // Count Total PvP Kings
-            const [[{ total_kings }]] = await this.db.query('SELECT COUNT(*) AS total_kings FROM pvp_king_stats');
+            const total_kings = await this.db.countStats('total_kings');
 
             // Count all PvP King entries and keep the latest history row as a display fallback.
-            const [[historyInfo]] = await this.db.query(`
-                SELECT
-                    COUNT(*) AS totalKingEntries,
-                    (SELECT king_id FROM pvp_king_history ORDER BY id DESC LIMIT 1) AS latestKingId
-                FROM pvp_king_history
-            `);
+            const historyInfo = await this.db.getHistoryInfo();
             const totalKingEntries = historyInfo?.totalKingEntries || 0;
 
             // Do not fetch all guild members here; opcode 8 member chunks are heavily rate limited.
@@ -207,7 +199,11 @@ class PvpLeaderboard {
 
         } catch (err) {
             console.error(err);
-            interaction.editReply({ content: '### ⚠️ Failed to load the PvP King Hall of Fame!' }).catch(() => { });
+            interaction.editReply({
+                content: err.code === 'PVP_DATABASE_UNAVAILABLE'
+                    ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                    : '### ⚠️ Failed to load the PvP King Hall of Fame!'
+            }).catch(() => { });
         }
     }
 }

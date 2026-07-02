@@ -1,5 +1,6 @@
 require('dotenv').config();
 const db = require('./db/db-conn.js');
+const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const {
     Client,
     GatewayIntentBits,
@@ -99,6 +100,7 @@ const commandMap = new Map();
 // let currentKingId = null; // PvP Current King cache
 // let activeChallenge = null; // Global PvP Challenge Lock
 const challengeTimeouts = new Map(); // PvP challenge confirmation timers
+const pvpKingStorage = new PvpKingStorage({ db });
 
 // Build config object (Parameters to send to command classes)
 const commandConfig = {
@@ -123,6 +125,7 @@ const commandConfig = {
     dungeonChannelID,
     dungeonRoleID,
     challengeTimeouts,
+    pvpKingStorage,
     onCooldown,
     commandMap,
     guildSettingsCache
@@ -132,10 +135,16 @@ async function bootstrap() {
     try {
         // Wait for DB Connection
         console.log('[WW LOG] Establishing database connection...');
-        await db.initPromise;
+        const dbReady = await db.initPromise;
 
         // INITIAL SETTINGS LOAD: Load settings from the database BEFORE events start firing
-        await syncDBSettings();
+        if (dbReady) {
+            await syncDBSettings();
+        } else {
+            console.warn('[WW LOG] Database unavailable at startup. DB-backed features will retry when used.');
+        }
+
+        await pvpKingStorage.restore();
 
         // Load commands
         const commandsForDiscord = []; // JSON for the REST API
@@ -325,6 +334,7 @@ client.once(Events.ClientReady, async () => {
     });
 
     // Check if PvP King cooldowns naturally expired (every 60 seconds)
+    pvpKingStorage.startSyncLoop();
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
 });

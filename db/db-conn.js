@@ -1,6 +1,9 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
 
+const STORAGE_MODE = String(process.env.STORAGE_MODE || 'auto').toLowerCase();
+const hasRequiredDbConfig = Boolean(process.env.DB_HOST && process.env.DB_USER && process.env.DB_NAME);
+
 const db = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
@@ -78,7 +81,18 @@ db.query = async function queryWithRetry(sql, params, retries = 2) {
 
 // Startup uses rawQuery so the query retry wrapper does not create nested retry loops.
 const connectWithRetry = async () => {
-    const maxStartupRetries = Number(process.env.DB_STARTUP_MAX_RETRIES || 0);
+    if (STORAGE_MODE === 'json') {
+        console.log('[DB LOG] STORAGE_MODE=json. Skipping startup MySQL connection check.');
+        return false;
+    }
+
+    if (!hasRequiredDbConfig) {
+        console.warn('[DB LOG] MySQL credentials are incomplete. Database-backed features will be unavailable until configured.');
+        return false;
+    }
+
+    const defaultStartupRetries = ['auto', 'mysql', 'json'].includes(STORAGE_MODE) ? 3 : 0;
+    const maxStartupRetries = Number(process.env.DB_STARTUP_MAX_RETRIES || defaultStartupRetries);
     let attempt = 0;
 
     while (true) {
@@ -87,18 +101,19 @@ const connectWithRetry = async () => {
         try {
             await rawQuery('SELECT 1 + 1 AS result;');
             console.log('[DB LOG] Successfully connected to MySQL!');
-            return;
+            return true;
         } catch (err) {
             const errorCode = err.code || err.message;
             console.error(`[DB LOG] Connection attempt ${attempt} failed:`, errorCode);
 
             if (!shouldRetryDbError(err)) {
-                throw err;
+                console.error('[DB LOG] Database unavailable due to non-transient startup error.');
+                return false;
             }
 
             if (maxStartupRetries > 0 && attempt >= maxStartupRetries) {
                 console.error('[DB LOG] Max startup retries reached. Database unavailable.');
-                throw err;
+                return false;
             }
 
             const delayMs = getStartupRetryDelayMs(err, attempt);
@@ -108,6 +123,8 @@ const connectWithRetry = async () => {
     }
 };
 
+db.hasRequiredConfig = hasRequiredDbConfig;
+db.isTransientDbError = shouldRetryDbError;
 db.initPromise = connectWithRetry();
 
 module.exports = db;

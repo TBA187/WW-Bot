@@ -3,27 +3,44 @@
 // ======================================================================
 
 const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
+const { refreshGuildMembers } = require('../commands/pvp-king/utils/pvpHelper.js');
 
 const COOLDOWN_CHECK_INTERVAL_MS = 60000;
+const PVP_COOLDOWN_MS = 48 * 60 * 60 * 1000;
+const MAX_MISSED_NOTIFICATION_AGE_MS = 60 * 60 * 1000;
+
+function getCooldownExpiryMs(row) {
+    if (!row?.last_challenge) return null;
+
+    const rawDate = row.last_challenge instanceof Date
+        ? row.last_challenge
+        : new Date(`${row.last_challenge}Z`);
+    const lastChallengeMs = rawDate.getTime();
+
+    if (Number.isNaN(lastChallengeMs)) return null;
+    return lastChallengeMs + PVP_COOLDOWN_MS;
+}
+
+function shouldNotifyExpiredCooldown(row, nowMs = Date.now()) {
+    const expiryMs = getCooldownExpiryMs(row);
+    if (!expiryMs) return false;
+
+    return nowMs - expiryMs <= MAX_MISSED_NOTIFICATION_AGE_MS;
+}
 
 module.exports = {
     name: 'cooldownTask',
     execute(client, config) {
-        const { db, pvpKingChannelID, pvpKingRoleID, guildId } = config;
+        const db = config.pvpKingStorage || config.db;
+        const { pvpKingChannelID, pvpKingRoleID, guildId } = config;
         let isRunning = false;
 
-        setInterval(async () => {
+        const runCooldownCheck = async () => {
             if (isRunning) return;
             isRunning = true;
 
             try {
-                const [expired] = await db.query(`
-                    SELECT id, challenger_id, king_id
-                    FROM pvp_king_cooldowns
-                    WHERE notify_on_expire = 1
-                      AND last_challenge IS NOT NULL
-                      AND last_challenge <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 48 HOUR)
-                `);
+                const expired = await db.findExpiredNotifiableCooldowns();
 
                 if (expired.length === 0) return;
 
@@ -32,9 +49,7 @@ module.exports = {
                 const kingRole = guild?.roles.cache.get(pvpKingRoleID);
 
                 if (guild && kingRole && kingRole.members.size !== 1) {
-                    await guild.members.fetch().catch(err => {
-                        console.error('[WW LOG] Failed to refresh members for PvP cooldown task:', err.code || err.message);
-                    });
+                    await refreshGuildMembers(guild, 'PvP cooldown task');
                 }
 
                 const currentKing = kingRole?.members.first();
@@ -44,7 +59,7 @@ module.exports = {
                 const idsToReset = [];
 
                 for (const row of expired) {
-                    if (row.king_id === currentKing.id) {
+                    if (row.king_id === currentKing.id && shouldNotifyExpiredCooldown(row)) {
                         usersToPing.push(`<@${row.challenger_id}>`);
                     }
 
@@ -73,17 +88,19 @@ module.exports = {
                 }
 
                 if (idsToReset.length > 0) {
-                    const placeholders = idsToReset.map(() => '?').join(',');
-                    await db.query(
-                        `UPDATE pvp_king_cooldowns SET last_challenge = NULL WHERE id IN (${placeholders})`,
-                        idsToReset
-                    );
+                    await db.resetCooldownsByIds(idsToReset);
                 }
             } catch (err) {
                 console.error('[WW LOG] Cooldown Task Error:', err.code || err.message);
             } finally {
                 isRunning = false;
             }
-        }, COOLDOWN_CHECK_INTERVAL_MS);
+        };
+
+        runCooldownCheck();
+        const interval = setInterval(runCooldownCheck, COOLDOWN_CHECK_INTERVAL_MS);
+        interval.unref?.();
     }
 };
+
+module.exports.shouldNotifyExpiredCooldown = shouldNotifyExpiredCooldown;

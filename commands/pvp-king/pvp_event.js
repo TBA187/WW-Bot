@@ -9,11 +9,12 @@ const {
     ButtonBuilder,
     ButtonStyle
 } = require('discord.js');
+const { refreshGuildMembers } = require('./utils/pvpHelper.js');
 
 class PvpEvent {
     constructor(config) {
         this.name = "pvp_event";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
         this.data = new SlashCommandBuilder()
             .setName('pvp_event')
@@ -26,16 +27,9 @@ class PvpEvent {
         try {
             const EVENT_START_DATE = '2026-05-06 01:00:00';
 
-            const [historyRows] = await this.db.query(`
-                SELECT king_id, king_name, created_at 
-                FROM pvp_king_history 
-                WHERE created_at > ?
-                ORDER BY created_at ASC
-            `, [EVENT_START_DATE]);
+            const historyRows = await this.db.eventHistorySince(EVENT_START_DATE);
 
-            await interaction.guild.members.fetch().catch(err => {
-                console.error('[WW LOG] Failed to refresh members for /pvp_event:', err.code || err.message);
-            });
+            await refreshGuildMembers(interaction.guild, '/pvp_event');
 
             const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
             const currentKingId = kingRole?.members.first()?.id || null;
@@ -216,7 +210,11 @@ class PvpEvent {
 
         } catch (err) {
             console.error(err);
-            interaction.editReply({ content: '### ⚠️ Failed to load the Event Leaderboard!' }).catch(() => { });
+            interaction.editReply({
+                content: err.code === 'PVP_DATABASE_UNAVAILABLE'
+                    ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                    : '### ⚠️ Failed to load the Event Leaderboard!'
+            }).catch(() => { });
         }
     }
 }

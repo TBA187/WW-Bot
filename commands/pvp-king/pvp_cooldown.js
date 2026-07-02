@@ -2,12 +2,13 @@
 // /pvp_cooldown
 // ----------------------
 const { SlashCommandBuilder, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
+const { formatNowMinute, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
 class PvpCooldown {
 
     constructor(config) {
         this.name = "pvp_cooldown";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
         this.ownerID = config.ownerID;
         this.logChannelID = config.logChannelID;
@@ -19,56 +20,33 @@ class PvpCooldown {
     }
 
     async execute(interaction) {
-        if (this.onCooldown(interaction.user.id, 'pvp_cooldown', 2)) {
-            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
-        }
+        if (await stopIfOnCooldown(interaction, this.onCooldown, 'pvp_cooldown', 2)) return;
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         try {
-            const { guild } = interaction;
-            const logChannel = guild.channels.cache.get(this.logChannelID);
-            const nowTime = new Date().toISOString().slice(0, 16).replace('T', ' ');
-            const kingRole = guild.roles.cache.get(this.pvpKingRoleID);
-
-            if (!kingRole) {
-                if (logChannel) await logChannel.send(`### 🚨 <@${this.ownerID}> — PvP King role missing! (${nowTime})`);
-                return interaction.editReply({
-                    content: '### ❌ PvP King role not found! Officers have been notified.',
-                });
-            }
-
-            await guild.members.fetch().catch(err => {
-                console.error('[WW LOG] Failed to refresh members for /pvp_cooldown:', err.code || err.message);
+            const nowTime = formatNowMinute();
+            const kingCheck = await resolveSinglePvpKing(interaction, {
+                pvpKingRoleID: this.pvpKingRoleID,
+                logChannelID: this.logChannelID,
+                ownerID: this.ownerID,
+                now: nowTime,
+                contextLabel: '/pvp_cooldown',
+                missingRoleReply: '### ❌ PvP King role not found! Officers have been notified.',
+                noKingReply: '### ⚠️ There is currently no member that has the PvP King role!',
+                multipleKingsReply: '### ⚠️ Multiple PvP Kings detected! Officers have been notified.'
             });
+            if (!kingCheck.ok) return;
 
-            if (kingRole.members.size === 0) {
-                if (logChannel) { await logChannel.send(`### 🚨 <@${this.ownerID}> — No PvP King found! (${nowTime})`); }
-                return interaction.editReply({
-                    content: '### ⚠️ There is currently no member that has the PvP King role!',
-                });
-            }
-
-            if (kingRole.members.size > 1) {
-                if (logChannel) await logChannel.send(`### 🚨 <@${this.ownerID}> — Multiple PvP Kings detected: ${kingRole.members.size} — (${nowTime})`);
-                return interaction.editReply({
-                    content: '### ⚠️ Multiple PvP Kings detected! Officers have been notified.',
-                });
-            }
-
-            const currentKing = kingRole.members.first();
+            const currentKing = kingCheck.currentKing;
             if (currentKing.id === interaction.user.id) {
                 return interaction.editReply({ content: `### You can't have a cooldown against yourself, King xD` });
             }
 
-            const [cdRows] = await this.db.query(
-                'SELECT king_id, last_challenge, notify_on_expire FROM pvp_king_cooldowns WHERE challenger_id = ?',
-                [interaction.user.id]
-            );
-
-            const lastChallengeKing_id = cdRows[0]?.king_id;
-            const lastChallenge = cdRows[0]?.last_challenge;
-            let isNotifyEnabled = cdRows[0]?.notify_on_expire === 1;
+            const cooldown = await this.db.getCooldown(interaction.user.id);
+            const lastChallengeKing_id = cooldown?.king_id;
+            const lastChallenge = cooldown?.last_challenge;
+            let isNotifyEnabled = cooldown?.notify_on_expire === 1;
 
             // --- Logic for Cooldown State ---
             const lastChallengeDate = lastChallenge ? new Date(lastChallenge + 'Z') : null;
@@ -140,27 +118,15 @@ class PvpCooldown {
 
                 try {
                     // Fetch the MOST RECENT state from the database
-                    const [checkRows] = await this.db.query(
-                        'SELECT notify_on_expire FROM pvp_king_cooldowns WHERE challenger_id = ?',
-                        [i.user.id]
-                    );
-
-                    const hasChallenged = checkRows.length > 0;
-                    const currentDbState = hasChallenged ? (checkRows[0].notify_on_expire === 1) : false;
+                    const latestCooldown = await this.db.getCooldown(i.user.id);
+                    const hasChallenged = Boolean(latestCooldown);
+                    const currentDbState = hasChallenged ? (latestCooldown.notify_on_expire === 1) : false;
                     isNotifyEnabled = !currentDbState;
 
                     if (hasChallenged) {
-                        await this.db.query(
-                            'UPDATE pvp_king_cooldowns SET notify_on_expire = ? WHERE challenger_id = ?',
-                            [isNotifyEnabled ? 1 : 0, i.user.id]
-                        );
+                        await this.db.setCooldownNotification(i.user.id, isNotifyEnabled);
                     } else {
-                        await this.db.query(
-                            `INSERT INTO pvp_king_cooldowns 
-                            (challenger_id, challenger_name, king_id, king_name, last_challenge, notify_on_expire) 
-                            VALUES (?, ?, 'None', 'None', NULL, ?)`,
-                            [i.user.id, i.member.displayName, isNotifyEnabled ? 1 : 0]
-                        );
+                        await this.db.createNotificationCooldown(i.user.id, i.member.displayName, isNotifyEnabled);
                     }
 
                     await i.editReply({
@@ -190,7 +156,11 @@ class PvpCooldown {
 
         } catch (err) {
             console.error(err);
-            interaction.editReply({ content: '### ⚠️  Database error! Try again.' }).catch(() => { });
+            interaction.editReply({
+                content: err.code === 'PVP_DATABASE_UNAVAILABLE'
+                    ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                    : '### ⚠️  Database error! Try again.'
+            }).catch(() => { });
         }
     }
 }

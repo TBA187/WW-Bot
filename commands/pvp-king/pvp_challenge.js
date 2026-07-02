@@ -3,11 +3,12 @@
 // ----------------------
 const { SlashCommandBuilder, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const { getServerLogo, getServerBanner, pvpThumnbnail, pvpBannerImage, createPvpFooter, createPvpLogFooter } = require('./utils/pvpAssets.js');
+const { formatNowMinute, getLogChannel, requirePvpChannel, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
 class PvpChallengeKing {
     constructor(config) {
         this.name = "pvp_challenge";
-        this.db = config.db;
+        this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
         this.logChannelID = config.logChannelID;
         this.pvpKingChannelID = config.pvpKingChannelID;
@@ -22,13 +23,9 @@ class PvpChallengeKing {
     }
 
     async execute(interaction) {
-        if (this.onCooldown(interaction.user.id, 'currentking', 2)) {
-            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
-        }
+        if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
 
-        if (interaction.channelId !== this.pvpKingChannelID) {
-            return interaction.reply({ content: `### ❌  The \`/pvp_challenge\` command can only be used in <#${this.pvpKingChannelID}>`, flags: MessageFlags.Ephemeral });
-        }
+        if (!await requirePvpChannel(interaction, this.pvpKingChannelID, 'pvp_challenge')) return;
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -42,62 +39,22 @@ class PvpChallengeKing {
         //}
 
         try {
-            const { guild } = interaction;
-            const logChannel = guild.channels.cache.get(this.logChannelID);
-            if (!logChannel) {
-                console.log(' - WARNING: Log channel not found! Channel ID: ' + this.logChannelID);
-            }
-
-            const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
-
-            // Validate PvP King role:
-            const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
-            if (!kingRole) {
-                if (logChannel) {
-                    await logChannel.send(
-                        `**🚨 <@${this.ownerID}> — No PvP King Role found!**\n` +
-                        `- This needs to be fixed asap! (${now})`
-                    );
-                }
-
-                return interaction.editReply({
-                    content: '### ❌ PvP King Role not found! Officers have been notified and will resolve the issue as soon as possible.'
-                });
-            }
-
-            await interaction.guild.members.fetch().catch(err => {
-                console.error('[WW LOG] Failed to refresh members for /pvp_challenge:', err.code || err.message);
+            const now = formatNowMinute();
+            const kingCheck = await resolveSinglePvpKing(interaction, {
+                pvpKingRoleID: this.pvpKingRoleID,
+                logChannelID: this.logChannelID,
+                ownerID: this.ownerID,
+                now,
+                contextLabel: '/pvp_challenge',
+                missingRoleLog: `**🚨 <@${this.ownerID}> — No PvP King Role found!**\n- This needs to be fixed asap! (${now})`,
+                missingRoleReply: '### ❌ PvP King Role not found! Officers have been notified and will resolve the issue as soon as possible.',
+                noKingReply: '### ⚠️ No PvP King found. Officers have been notified and will resolve the issue as soon as possible.',
+                multipleKingsLog: kings => `### 🚨 <@${this.ownerID}> — A user tried to challenge the PvP King but failed.\n- **Error:** Multiple PvP Kings detected **(${kings.size})** — (${now})`,
+                multipleKingsReply: kings => `### ⚠️ There are currently: "${kings.size}" PvP Kings. This must be fixed before challenges can proceed.\n- **Officers have been notified and will resolve the issue as soon as possible.**`
             });
+            if (!kingCheck.ok) return;
 
-            // Check for multiple kings
-            const kings = kingRole.members;
-            if (kings.size > 1) {
-                if (logChannel) {
-                    await logChannel.send(
-                        `### 🚨 <@${this.ownerID}> — A user tried to challenge the PvP King but failed.\n- **Error:** Multiple PvP Kings detected **(${kings.size})** — (${now})`
-                    );
-                }
-
-                return interaction.editReply({
-                    content: `### ⚠️ There are currently: "${kings.size}" PvP Kings. This must be fixed before challenges can proceed.\n- **Officers have been notified and will resolve the issue as soon as possible.**`
-                });
-            }
-
-            // If no PvP Kings
-            if (kings.size === 0) {
-                if (logChannel) {
-                    await logChannel.send(
-                        `### 🚨 <@${this.ownerID}> — No PvP King found! (${now})`
-                    );
-                }
-
-                return interaction.editReply({
-                    content: '### ⚠️ No PvP King found. Officers have been notified and will resolve the issue as soon as possible.'
-                });
-            }
-
-            // At this point exactly 1 PvP King exists
-            const currentKing = kings.first();
+            const currentKing = kingCheck.currentKing;
             // currentKingId = currentKing.id; // re-sync automatically
 
             if (interaction.user.id === currentKing.id) {
@@ -108,12 +65,9 @@ class PvpChallengeKing {
 
             try {
                 // Check if challenger has a cooldown (48 hours)
-                const [cdRows] = await this.db.query(
-                    'SELECT king_id, last_challenge FROM pvp_king_cooldowns WHERE challenger_id = ?',
-                    [interaction.user.id]
-                );
-                const lastChallengeKing_id = cdRows[0]?.king_id;
-                const lastChallenge = cdRows[0]?.last_challenge;
+                const cooldown = await this.db.getCooldown(interaction.user.id);
+                const lastChallengeKing_id = cooldown?.king_id;
+                const lastChallenge = cooldown?.last_challenge;
                 if (lastChallenge && lastChallengeKing_id === currentKing.id) {
                     const lastChallengeDate = new Date(lastChallenge + 'Z'); // Z = UTC
                     const now = new Date();
@@ -149,7 +103,11 @@ class PvpChallengeKing {
                 }
             } catch (err) {
                 console.error(err);
-                await interaction.editReply({ content: '### ⚠️  Something went wrong. Please try again.' });
+                return interaction.editReply({
+                    content: err.code === 'PVP_DATABASE_UNAVAILABLE'
+                        ? '### ⚠️ Database is currently unavailable. Please try again later.'
+                        : '### ⚠️  Something went wrong. Please try again.'
+                });
             }
 
             //activeChallenge = {
@@ -374,15 +332,7 @@ class PvpChallengeKing {
             });
 
             // When King accepts challenge: Log timestamp for challenger cooldown in the DB
-            await this.db.query(`
-                        INSERT INTO pvp_king_cooldowns (challenger_id, challenger_name, king_id, king_name, last_challenge)
-                        VALUES (?, ?, ?, ?, UTC_TIMESTAMP())
-                        ON DUPLICATE KEY UPDATE
-                            challenger_name = VALUES(challenger_name),
-                            king_id = VALUES(king_id),
-                            king_name = VALUES(king_name),
-                            last_challenge = UTC_TIMESTAMP()
-                        `, [challengerId, challenger.displayName, kingId, currentKing.displayName]);
+            await this.db.upsertChallengeCooldown(challengerId, challenger.displayName, kingId, currentKing.displayName);
 
             // Log to Discord Log Channel
             if (logChannel) {
