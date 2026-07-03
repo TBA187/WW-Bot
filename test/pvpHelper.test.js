@@ -161,6 +161,25 @@ test('resolveSinglePvpKing handles zero, one, and multiple kings', async () => {
     assert.equal(manyKingsInteraction.edits[0].content, 'many kings');
 });
 
+test('resolveSinglePvpKing does not refresh all members when the king is cached', async () => {
+    let fetchCount = 0;
+    const interaction = fakeInteraction([{ id: 'king' }]);
+    interaction.guild.members.fetch = async () => {
+        fetchCount++;
+    };
+
+    const result = await resolveSinglePvpKing(interaction, {
+        logChannelID: 'log',
+        pvpKingRoleID: 'king-role',
+        ownerID: 'owner',
+        contextLabel: '/pvp_challenge'
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.currentKing.id, 'king');
+    assert.equal(fetchCount, 0);
+});
+
 test('refreshGuildMembers catches refresh failures', async () => {
     const oldError = console.error;
     console.error = () => { };

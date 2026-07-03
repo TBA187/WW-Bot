@@ -1,5 +1,8 @@
 const { MessageFlags } = require('discord.js');
 
+const MEMBER_REFRESH_COOLDOWN_MS = 10 * 60 * 1000;
+const memberRefreshCache = new WeakMap();
+
 function formatNowMinute(date = new Date()) {
     return date.toISOString().slice(0, 16).replace('T', ' ');
 }
@@ -59,9 +62,16 @@ async function replyMissingMemberOption(interaction, optionName = 'user', messag
 }
 
 async function refreshGuildMembers(guild, contextLabel) {
+    const lastRefresh = memberRefreshCache.get(guild) ?? 0;
+    if (Date.now() - lastRefresh < MEMBER_REFRESH_COOLDOWN_MS) {
+        return false;
+    }
+
     await guild.members.fetch().catch(err => {
         console.error(`[WW LOG] Failed to refresh members for ${contextLabel}:`, err.code || err.message);
     });
+    memberRefreshCache.set(guild, Date.now());
+    return true;
 }
 
 function getPvpKingRole(guild, pvpKingRoleID) {
@@ -101,11 +111,12 @@ async function getSinglePvpKing(options) {
         };
     }
 
-    if (contextLabel) {
+    let kings = kingRole.members;
+    if (kings.size === 0 && contextLabel) {
         await refreshGuildMembers(guild, contextLabel);
+        kings = kingRole.members;
     }
 
-    const kings = kingRole.members;
     if (kings.size === 0) {
         if (logChannel) {
             await logChannel.send(
