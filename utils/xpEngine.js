@@ -53,7 +53,7 @@ async function processXp(userId, guild, channelId, member, xpGained, trackInfo, 
         // 1. Database Logic: Insert or Update TOTAL XP + SPECIFIC XP + STATS
         // column names can be injected safely because they are strictly controlled in the switch statement above.
         const query = `
-            INSERT INTO user_levels (user_id, guild_id, xp_type, xp_date, xp_amount, level, username, ${xpColumn}, ${statColumn}) 
+            INSERT INTO xp_user_levels (user_id, guild_id, xp_type, xp_date, xp_amount, level, username, ${xpColumn}, ${statColumn}) 
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 0, ?, ?, ?) 
             ON DUPLICATE KEY UPDATE 
                 xp_amount = xp_amount + ?, 
@@ -73,7 +73,7 @@ async function processXp(userId, guild, channelId, member, xpGained, trackInfo, 
 
         // 2. Fetch current state to check for level up
         const [rows] = await commandConfig.db.query(
-            `SELECT xp_amount, level FROM user_levels WHERE user_id = ? AND guild_id = ? AND xp_type = ?`,
+            `SELECT xp_amount, level FROM xp_user_levels WHERE user_id = ? AND guild_id = ? AND xp_type = ?`,
             [userId, guildId, track]
         );
 
@@ -86,7 +86,7 @@ async function processXp(userId, guild, channelId, member, xpGained, trackInfo, 
         if (correctLevel > currentData.level) {
             // Update the DB to the new level
             await commandConfig.db.query(
-                `UPDATE user_levels SET level = ? WHERE user_id = ? AND guild_id = ? AND xp_type = ?`,
+                `UPDATE xp_user_levels SET level = ? WHERE user_id = ? AND guild_id = ? AND xp_type = ?`,
                 [correctLevel, userId, guildId, track]
             );
 

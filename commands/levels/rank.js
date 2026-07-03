@@ -122,7 +122,7 @@ class Rank {
                     message_xp, reaction_xp, command_xp, voice_xp,
                     messages_sent, reactions_added, commands_used, voice_minutes,
                     total_messages_sent, total_reactions_added, total_commands_used, total_voice_minutes
-                FROM user_levels
+                FROM xp_user_levels
                 WHERE user_id = ? AND guild_id = ? AND xp_type = ?
             `, [target.id, guildId, track]);
 

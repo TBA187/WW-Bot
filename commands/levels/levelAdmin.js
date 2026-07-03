@@ -94,7 +94,7 @@ class LevelAdmin {
 
     async writeLevelAdjustment(adjustment) {
         await this.db.query(`
-            INSERT INTO user_levels (user_id, guild_id, username, xp_type, xp_date, xp_amount, level)
+            INSERT INTO xp_user_levels (user_id, guild_id, username, xp_type, xp_date, xp_amount, level)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
             ON DUPLICATE KEY UPDATE
                 xp_amount = VALUES(xp_amount),
@@ -178,7 +178,7 @@ class LevelAdmin {
 
             if (sub.includes('add')) {
                 const [rows] = await this.db.query(
-                    'SELECT xp_amount, level FROM user_levels WHERE user_id = ? AND guild_id = ? AND xp_type = ?',
+                    'SELECT xp_amount, level FROM xp_user_levels WHERE user_id = ? AND guild_id = ? AND xp_type = ?',
                     [target.id, interaction.guild.id, track]
                 );
 

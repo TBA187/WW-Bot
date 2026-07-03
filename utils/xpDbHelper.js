@@ -125,7 +125,7 @@ async function fetchTrackById(db, trackId) {
 }
 
 /**
- * Resolve user-facing track input into the value stored in user_levels.xp_type.
+ * Resolve user-facing track input into the value stored in xp_user_levels.xp_type.
  * Blank/global input resolves to the global track; numeric input resolves by
  * track ID; non-numeric input resolves by exact track name for typed input.
  */
@@ -170,7 +170,7 @@ function formatTrackChoiceName(row) {
 
 /**
  * Fetch autocomplete choices for XP track options. Choice values are numeric IDs
- * so selected slash-command values map directly to user_levels.xp_type.
+ * so selected slash-command values map directly to xp_user_levels.xp_type.
  */
 async function fetchXpTrackAutocompleteChoices(db, focusedValue) {
     try {
@@ -212,7 +212,7 @@ async function recordRawActivity(db, userId, guildId, username, xpType, actionTy
 
     try {
         const query = `
-            INSERT INTO user_levels (user_id, guild_id, username, xp_type, xp_date, ${totalColumn})
+            INSERT INTO xp_user_levels (user_id, guild_id, username, xp_type, xp_date, ${totalColumn})
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             ON DUPLICATE KEY UPDATE
                 username = VALUES(username),

@@ -962,7 +962,7 @@ function buildGiveawayEmbed(giveaway, { participantCount = 0 } = {}) {
     }
 
     embed.addFields(
-        { name: '<:pepe_man_of_culture:1461854935821058098> Host', value: fieldValue(giveaway.host_text || 'White Walkers Team'), inline: true },
+        { name: '<:man_of_culture:1186287184106496112> Host', value: fieldValue(giveaway.host_text || 'White Walkers Team'), inline: true },
         { name: '🎁 Prize', value: fieldValue(giveaway.prize || 'Unknown'), inline: true },
         { name: '🏆 Winners', value: fieldValue(giveaway.winners_total || 1), inline: true },
         { name: '👥 Participants', value: fieldValue(participantCount), inline: true }
@@ -1175,7 +1175,7 @@ function drawAnnouncementContent(giveaway, winnerIds, { drawType }) {
         return `### ${heading}\n- Nobody joined this giveaway.`;
     }
     const mentions = winnerIds.map(userId => `<@${userId}>`).join(', ');
-    return `### ${heading}\n- Congratulations ${mentions}! You won **${prize}  <:pepe_man_of_culture:1461854935821058098>**`;
+    return `### ${heading}\n- Congratulations ${mentions}! You won **${prize}  <:man_of_culture:1186287184106496112>**`;
 }
 
 function linkTextToGiveaway(giveaway, text) {
@@ -1558,9 +1558,24 @@ function resolveRoleIds(guild, value) {
     const text = String(value).trim();
     const roleIds = [];
     const notFound = [];
+    const notRoles = [];
     const addRoleId = roleId => {
         if (!roleIds.includes(roleId)) roleIds.push(roleId);
     };
+
+    for (const match of text.matchAll(/<@(?!&)[^>]*>|<#[^>]*>|@everyone|@here/g)) {
+        notRoles.push(match[0]);
+    }
+
+    for (const part of text.split(/[,;\n|]+/).map(item => item.trim()).filter(Boolean)) {
+        if (/^@/.test(part) && !/^<@&\d+>$/.test(part) && !findRoleByName(guild, part.replace(/^@+/, ''))) {
+            notRoles.push(part);
+        }
+    }
+
+    if (notRoles.length) {
+        throw new Error(`**${uniqueList(notRoles).join(', ')}** is not a role! Only roles are accepted!\n- Type the **@** prefix and select a role.`);
+    }
 
     for (const match of text.matchAll(/<@&(\d+)>|\b(\d{15,25})\b/g)) {
         const roleId = match[1] || match[2];
@@ -1572,15 +1587,19 @@ function resolveRoleIds(guild, value) {
     if (textWithoutIds) {
         const roleNames = textWithoutIds.split(/[,;\n|]+/).map(part => part.trim()).filter(Boolean);
         for (const roleName of roleNames) {
-            const role = findRoleByName(guild, roleName);
+            const role = findRoleByName(guild, roleName.replace(/^@+/, ''));
             if (!role) notFound.push(roleName);
             else addRoleId(role.id);
         }
     }
 
-    if (notFound.length) throw new Error(`Could not find role(s): ${notFound.join(', ')}`);
+    if (notFound.length) throw new Error(`Could not find role(s): **${uniqueList(notFound).join(', ')}**\n- Type the **@** prefix and select a role.`);
     if (!roleIds.length) throw new Error('Please mention one or more valid roles.');
     return roleIds;
+}
+
+function uniqueList(values) {
+    return [...new Set(values.map(value => String(value)).filter(Boolean))];
 }
 
 function findRoleByName(guild, roleName) {
@@ -1590,7 +1609,7 @@ function findRoleByName(guild, roleName) {
 
 function canManageGiveaways(member, config) {
     if (!member?.roles?.cache) return false;
-    const allowed = new Set([config.adminRoleID, config.officerRoleID].filter(Boolean).map(String));
+    const allowed = new Set([config.leaderRoleID, config.adminRoleID, config.officerRoleID].filter(Boolean).map(String));
     return member.roles.cache.some(role => allowed.has(role.id));
 }
 

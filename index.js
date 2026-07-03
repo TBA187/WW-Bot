@@ -1,4 +1,6 @@
 require('dotenv').config();
+const appConfig = require('./config.json');
+process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
@@ -13,11 +15,15 @@ const {
     MessageFlags
 } = require('discord.js');
 const {
-    guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, streamRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, historyThreadID, dungeonChannelID, dungeonRoleID, giveawayChannelID
-} = require('./config.json');
+    botTimezone, guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, streamRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, historyThreadID, dungeonChannelID, dungeonRoleID, giveawayChannelID
+} = appConfig;
 
 const fs = require("fs");
 const path = require("path");
+
+const GUILD_SETTINGS_FILE = path.join(__dirname, 'data', 'guild_settings.json');
+const GUILD_SETTINGS_TEMP_FILE = `${GUILD_SETTINGS_FILE}.tmp`;
+const GUILD_SETTINGS_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 const token = process.env.TOKEN;
 const clientId = process.env.CLIENT_ID;
@@ -44,12 +50,163 @@ const client = new Client({
 // Map with DB Guild Settings where Key = guild_id, Value = { xp_enabled: false, ... }
 const guildSettingsCache = new Map();
 
+function guildSettingsStorageMode() {
+    const mode = String(process.env.STORAGE_MODE || 'auto').toLowerCase();
+    return ['auto', 'mysql', 'json'].includes(mode) ? mode : 'auto';
+}
+
+function canUseGuildSettingsMysql() {
+    return guildSettingsStorageMode() !== 'json' && db.hasRequiredConfig;
+}
+
+function normalizeGuildSettingsDate(value) {
+    if (!value) return null;
+    if (value instanceof Date) return value.toISOString();
+    return String(value);
+}
+
+function defaultGuildSettingsRows() {
+    if (!guildId) return [];
+    return [{
+        guild_id: String(guildId),
+        guild_name: 'White Walkers',
+        xp_enabled: 1,
+        xp_date_enabled: '2026-05-11 04:56:00',
+        logging_enabled: 1,
+        updated_at: '2026-06-05 02:12:20'
+    }];
+}
+
+function normalizeGuildSettingsRow(row) {
+    return {
+        guild_id: String(row.guild_id),
+        guild_name: row.guild_name ?? null,
+        xp_enabled: Number(row.xp_enabled || 0),
+        xp_date_enabled: normalizeGuildSettingsDate(row.xp_date_enabled),
+        logging_enabled: Number(row.logging_enabled || 0),
+        updated_at: normalizeGuildSettingsDate(row.updated_at)
+    };
+}
+
+function guildSettingsMirrorData(rows = defaultGuildSettingsRows(), pendingSync = false) {
+    return {
+        version: 1,
+        source: 'mysql_mirror',
+        pendingSync,
+        settings: rows.map(normalizeGuildSettingsRow)
+    };
+}
+
+function writeGuildSettingsMirror(rows, pendingSync = false) {
+    fs.mkdirSync(path.dirname(GUILD_SETTINGS_FILE), { recursive: true });
+    fs.writeFileSync(GUILD_SETTINGS_TEMP_FILE, JSON.stringify(guildSettingsMirrorData(rows, pendingSync), null, 2));
+    fs.renameSync(GUILD_SETTINGS_TEMP_FILE, GUILD_SETTINGS_FILE);
+}
+
+function readGuildSettingsMirror() {
+    fs.mkdirSync(path.dirname(GUILD_SETTINGS_FILE), { recursive: true });
+
+    if (!fs.existsSync(GUILD_SETTINGS_FILE)) {
+        const data = guildSettingsMirrorData();
+        writeGuildSettingsMirror(data.settings, false);
+        return data;
+    }
+
+    try {
+        const parsed = JSON.parse(fs.readFileSync(GUILD_SETTINGS_FILE, 'utf8'));
+        const settings = Array.isArray(parsed.settings) && parsed.settings.length > 0
+            ? parsed.settings.map(normalizeGuildSettingsRow)
+            : defaultGuildSettingsRows();
+
+        return {
+            version: 1,
+            source: 'mysql_mirror',
+            pendingSync: parsed.pendingSync === true,
+            settings
+        };
+    } catch (err) {
+        console.error('[WW LOG] Failed to read guild settings JSON mirror:', err);
+        const data = guildSettingsMirrorData();
+        writeGuildSettingsMirror(data.settings, false);
+        return data;
+    }
+}
+
+function cacheGuildSettingsRows(rows) {
+    guildSettingsCache.clear();
+
+    rows.forEach(row => {
+        if (row.guild_id) {
+            // Ensure ID is always a string for Map consistency
+            guildSettingsCache.set(String(row.guild_id), {
+                xpEnabled: Number(row.xp_enabled) === 1,
+                xpDateEnabled: row.xp_date_enabled,
+                loggingEnabled: Number(row.logging_enabled) === 1
+            });
+        }
+    });
+}
+
+async function upsertGuildSettingsRows(rows) {
+    for (const row of rows.map(normalizeGuildSettingsRow)) {
+        await db.query(`
+            INSERT INTO guild_settings (guild_id, guild_name, xp_enabled, xp_date_enabled, logging_enabled)
+            VALUES (?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                guild_name = VALUES(guild_name),
+                xp_enabled = VALUES(xp_enabled),
+                xp_date_enabled = VALUES(xp_date_enabled),
+                logging_enabled = VALUES(logging_enabled)
+        `, [
+            row.guild_id,
+            row.guild_name,
+            row.xp_enabled,
+            row.xp_date_enabled,
+            row.logging_enabled
+        ]);
+    }
+}
+
+async function syncPendingGuildSettingsMirror() {
+    const mirror = readGuildSettingsMirror();
+    if (!mirror.pendingSync || !canUseGuildSettingsMysql()) return false;
+
+    await upsertGuildSettingsRows(mirror.settings);
+    writeGuildSettingsMirror(mirror.settings, false);
+    return true;
+}
+
+function loadGuildSettingsFromMirror() {
+    const mirror = readGuildSettingsMirror();
+    cacheGuildSettingsRows(mirror.settings);
+    console.warn(`[WW LOG] Loaded ${guildSettingsCache.size} guild setting(s) from JSON mirror.`);
+    return mirror;
+}
+
+function saveGuildSettingToMirror(row, { pendingSync = false } = {}) {
+    const mirror = readGuildSettingsMirror();
+    const byGuildId = new Map(mirror.settings.map(setting => [String(setting.guild_id), setting]));
+    const normalized = normalizeGuildSettingsRow(row);
+    byGuildId.set(String(normalized.guild_id), normalized);
+    const settings = [...byGuildId.values()];
+
+    writeGuildSettingsMirror(settings, mirror.pendingSync || pendingSync);
+    cacheGuildSettingsRows(settings);
+}
+
 /**
  * Fetch database settings for all guilds and store them in memory.
  */
 // TO-DO: ADD API CALL: When a setting is changed from the website dashboard, run syncDBSettings()
 async function syncDBSettings() {
+    if (!canUseGuildSettingsMysql()) {
+        loadGuildSettingsFromMirror();
+        return false;
+    }
+
     try {
+        await syncPendingGuildSettingsMirror();
+
         await db.query(`
             UPDATE guild_settings
             SET xp_date_enabled = CURRENT_TIMESTAMP
@@ -58,30 +215,33 @@ async function syncDBSettings() {
         `);
 
         // Get the newest guild settings from the Database
-        const [rows] = await db.query('SELECT guild_id, xp_enabled, xp_date_enabled, logging_enabled FROM guild_settings');
+        const [rows] = await db.query('SELECT guild_id, guild_name, xp_enabled, xp_date_enabled, logging_enabled, updated_at FROM guild_settings');
+        const settings = rows.map(normalizeGuildSettingsRow);
 
-        guildSettingsCache.clear();
-
-        if (!rows || !Array.isArray(rows) || rows.length === 0) {
+        if (!settings.length) {
             console.log('[WW LOG] ⚠️ No rows found in guild_settings table.');
-            return;
+            loadGuildSettingsFromMirror();
+            return false;
         }
 
-        rows.forEach(row => {
-            if (row.guild_id) {
-                // Ensure ID is always a string for Map consistency
-                guildSettingsCache.set(String(row.guild_id), {
-                    xpEnabled: row.xp_enabled === 1,
-                    xpDateEnabled: row.xp_date_enabled,
-                    loggingEnabled: row.logging_enabled === 1
-                });
-            }
-        });
-
+        cacheGuildSettingsRows(settings);
+        writeGuildSettingsMirror(settings, false);
         console.log(`[WW LOG] ✅ Cached settings for ${guildSettingsCache.size} guilds.`);
+        return true;
     } catch (err) {
         console.error('[WW LOG] ❌ Failed to sync settings:', err);
+        loadGuildSettingsFromMirror();
+        return false;
     }
+}
+
+function startGuildSettingsSyncLoop() {
+    if (client.guildSettingsSyncLoop) return;
+
+    client.guildSettingsSyncLoop = setInterval(() => {
+        syncDBSettings().catch(err => console.error('[WW LOG] Guild settings sync loop failed:', err));
+    }, GUILD_SETTINGS_SYNC_INTERVAL_MS);
+    client.guildSettingsSyncLoop.unref?.();
 }
 
 // Cooldowns to prevent Discord Rate Limits
@@ -108,6 +268,7 @@ const giveawayStore = createGiveawayStore({ db });
 const commandConfig = {
     client,
     db,
+    botTimezone,
     guildId,
     welcomeChannelID,
     ownerID,
@@ -141,12 +302,11 @@ async function bootstrap() {
         console.log('[WW LOG] Establishing database connection...');
         const dbReady = await db.initPromise;
 
-        // INITIAL SETTINGS LOAD: Load settings from the database BEFORE events start firing
-        if (dbReady) {
-            await syncDBSettings();
-        } else {
+        // INITIAL SETTINGS LOAD: Load settings before events start firing.
+        if (!dbReady) {
             console.warn('[WW LOG] Database unavailable at startup. DB-backed features will retry when used.');
         }
+        await syncDBSettings();
 
         await pvpKingStorage.restore();
         await giveawayStore.restore();
@@ -340,6 +500,8 @@ client.once(Events.ClientReady, async () => {
 
     // Check if PvP King cooldowns naturally expired (every 60 seconds)
     pvpKingStorage.startSyncLoop();
+    startGuildSettingsSyncLoop();
+    // Check active Giveaways to end them on time
     startGiveawayLoop(client, commandConfig);
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
@@ -348,16 +510,26 @@ client.once(Events.ClientReady, async () => {
 // Auto-Config DB settings for New Servers the bot just joined
 client.on('guildCreate', async (guild) => {
     console.log(`[WW LOG] New Guild joined: ${guild.name} (${guild.id})`);
+    const defaultSetting = {
+        guild_id: guild.id,
+        guild_name: guild.name,
+        xp_enabled: 0,
+        xp_date_enabled: null,
+        logging_enabled: 0,
+        updated_at: new Date().toISOString()
+    };
+
     try {
-        // Insert with defaults (0/False)
-        await db.query(
-            'INSERT IGNORE INTO guild_settings (guild_id, guild_name, xp_enabled, logging_enabled) VALUES (?, ?, 0, 0)',
-            [guild.id, guild.name]
-        );
-        // Add to local cache
-        guildSettingsCache.set(String(guild.id), { xpEnabled: false, xpDateEnabled: null, loggingEnabled: false });
+        if (canUseGuildSettingsMysql()) {
+            // Insert with defaults (0/False)
+            await upsertGuildSettingsRows([defaultSetting]);
+            saveGuildSettingToMirror(defaultSetting);
+        } else {
+            saveGuildSettingToMirror(defaultSetting, { pendingSync: true });
+        }
     } catch (err) {
         console.error('[WW LOG] Error setting up new guild:', err);
+        saveGuildSettingToMirror(defaultSetting, { pendingSync: true });
     }
 });
 

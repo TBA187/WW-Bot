@@ -161,7 +161,7 @@ class Giveaways {
                     )
                     .addStringOption(o =>
                         o.setName('required_role')
-                            .setDescription('Require entrants to have one or more roles.')
+                            .setDescription('Officer-only: required role(s) to enter. Only one matching role is needed.')
                             .setRequired(false)
                             .setMaxLength(1000)
                     )
@@ -263,7 +263,7 @@ class Giveaways {
 
         const requiredRoleText = interaction.options.getString('required_role');
         if (requiredRoleText?.trim() && !canManageGiveaways(interaction.member, this.config)) {
-            return interaction.reply({ content: '`required_role` can only be used by Admin/Staff.', flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: '`required_role` is Officer-only!', flags: MessageFlags.Ephemeral });
         }
 
         let winners;

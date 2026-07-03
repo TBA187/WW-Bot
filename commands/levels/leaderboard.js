@@ -216,7 +216,7 @@ class Leaderboard {
 
             const [users] = await this.config.db.query(
                 `SELECT user_id, ${sort.select}
-                 FROM user_levels
+                 FROM xp_user_levels
                  WHERE guild_id = ? AND xp_type = ?
                    AND ${sort.visibleWhere}
                  ORDER BY ${sort.orderBy}
