@@ -73,7 +73,7 @@ Local runtime state is stored in `data/` and ignored by Git.
 - `data/giveaways.json`: temporary giveaway fallback state.
 - `data/guild_settings.json`: mirror of guild settings, kept populated so XP/logging settings still load during a database outage.
 
-The fallback files are not meant to be edited by hand while the bot is running.
+The fallback files are not meant to be manually edited while the bot is running!
 
 ## Feature Overview
 
