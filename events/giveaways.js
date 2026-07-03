@@ -9,6 +9,7 @@ const {
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { writeJsonIfChanged } = require('../utils/jsonFile.js');
 
 const DEFAULT_GIVEAWAY_COLOR = '#39FF14';
 const GIVEAWAY_ACTIVE = 'active';
@@ -425,9 +426,7 @@ class GiveawayStore {
     }
 
     writeJsonData(data) {
-        fs.mkdirSync(path.dirname(this.dataFile), { recursive: true });
-        fs.writeFileSync(this.tempFile, JSON.stringify(data, null, 2));
-        fs.renameSync(this.tempFile, this.dataFile);
+        writeJsonIfChanged(this.dataFile, this.tempFile, data);
     }
 
     hasPendingSync() {

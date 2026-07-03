@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { writeJsonIfChanged } = require('../../../utils/jsonFile.js');
 
 const STORAGE_VERSION = 1;
 const JSON_SOURCES = {
@@ -186,17 +187,12 @@ class PvpKingStorage {
             const state = source === JSON_SOURCES.MYSQL_FALLBACK && !pendingSync
                 ? this.createEmptySerializedState()
                 : this.serializeState();
-            fs.writeFileSync(
-                this.tempFile,
-                JSON.stringify({
-                    version: STORAGE_VERSION,
-                    source,
-                    pendingSync,
-                    state
-                }, null, 2)
-            );
-            fs.renameSync(this.tempFile, this.dataFile);
-            return true;
+            return writeJsonIfChanged(this.dataFile, this.tempFile, {
+                version: STORAGE_VERSION,
+                source,
+                pendingSync,
+                state
+            });
         } catch (err) {
             console.error('[WW LOG] Failed to save PvP King JSON storage:', err);
             if (options.throwOnError) throw err;

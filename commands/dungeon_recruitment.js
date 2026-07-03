@@ -13,6 +13,7 @@ const {
 } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
+const { writeJsonIfChanged } = require('../utils/jsonFile.js');
 
 const DUNGEON_RUNS_DATA_DIR = path.join(__dirname, '../data');
 const DUNGEON_RUNS_FILE = path.join(DUNGEON_RUNS_DATA_DIR, 'dungeon_runs.json');
@@ -542,12 +543,12 @@ class DungeonRecruitment {
 
     writeJsonStore(runs, source, pendingSync) {
         try {
-            fs.mkdirSync(DUNGEON_RUNS_DATA_DIR, { recursive: true });
-            fs.writeFileSync(
-                DUNGEON_RUNS_TEMP_FILE,
-                JSON.stringify({ version: DUNGEON_RUNS_STORAGE_VERSION, source, pendingSync, runs }, null, 2)
-            );
-            fs.renameSync(DUNGEON_RUNS_TEMP_FILE, DUNGEON_RUNS_FILE);
+            writeJsonIfChanged(DUNGEON_RUNS_FILE, DUNGEON_RUNS_TEMP_FILE, {
+                version: DUNGEON_RUNS_STORAGE_VERSION,
+                source,
+                pendingSync,
+                runs
+            });
         } catch (err) {
             console.error('[WW LOG] Failed to save Dungeon JSON storage:', err);
         }

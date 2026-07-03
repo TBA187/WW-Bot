@@ -4,6 +4,7 @@ process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
+const { writeJsonIfChanged } = require('./utils/jsonFile.js');
 const {
     Client,
     GatewayIntentBits,
@@ -98,9 +99,7 @@ function guildSettingsMirrorData(rows = defaultGuildSettingsRows(), pendingSync 
 }
 
 function writeGuildSettingsMirror(rows, pendingSync = false) {
-    fs.mkdirSync(path.dirname(GUILD_SETTINGS_FILE), { recursive: true });
-    fs.writeFileSync(GUILD_SETTINGS_TEMP_FILE, JSON.stringify(guildSettingsMirrorData(rows, pendingSync), null, 2));
-    fs.renameSync(GUILD_SETTINGS_TEMP_FILE, GUILD_SETTINGS_FILE);
+    return writeJsonIfChanged(GUILD_SETTINGS_FILE, GUILD_SETTINGS_TEMP_FILE, guildSettingsMirrorData(rows, pendingSync));
 }
 
 function readGuildSettingsMirror() {
@@ -173,6 +172,7 @@ async function syncPendingGuildSettingsMirror() {
 
     await upsertGuildSettingsRows(mirror.settings);
     writeGuildSettingsMirror(mirror.settings, false);
+    console.log(`[WW LOG] Synced ${mirror.settings.length} pending guild setting(s) to MySQL.`);
     return true;
 }
 
@@ -198,14 +198,14 @@ function saveGuildSettingToMirror(row, { pendingSync = false } = {}) {
  * Fetch database settings for all guilds and store them in memory.
  */
 // TO-DO: ADD API CALL: When a setting is changed from the website dashboard, run syncDBSettings()
-async function syncDBSettings() {
+async function syncDBSettings({ quiet = false } = {}) {
     if (!canUseGuildSettingsMysql()) {
         loadGuildSettingsFromMirror();
         return false;
     }
 
     try {
-        await syncPendingGuildSettingsMirror();
+        const syncedPending = await syncPendingGuildSettingsMirror();
 
         await db.query(`
             UPDATE guild_settings
@@ -225,8 +225,10 @@ async function syncDBSettings() {
         }
 
         cacheGuildSettingsRows(settings);
-        writeGuildSettingsMirror(settings, false);
-        console.log(`[WW LOG] ✅ Cached settings for ${guildSettingsCache.size} guilds.`);
+        const mirrorChanged = writeGuildSettingsMirror(settings, false);
+        if (!quiet || syncedPending || mirrorChanged) {
+            console.log(`[WW LOG] ✅ Cached settings for ${guildSettingsCache.size} guilds.`);
+        }
         return true;
     } catch (err) {
         console.error('[WW LOG] ❌ Failed to sync settings:', err);
@@ -239,7 +241,7 @@ function startGuildSettingsSyncLoop() {
     if (client.guildSettingsSyncLoop) return;
 
     client.guildSettingsSyncLoop = setInterval(() => {
-        syncDBSettings().catch(err => console.error('[WW LOG] Guild settings sync loop failed:', err));
+        syncDBSettings({ quiet: true }).catch(err => console.error('[WW LOG] Guild settings sync loop failed:', err));
     }, GUILD_SETTINGS_SYNC_INTERVAL_MS);
     client.guildSettingsSyncLoop.unref?.();
 }
