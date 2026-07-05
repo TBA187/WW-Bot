@@ -505,6 +505,7 @@ client.once(Events.ClientReady, async () => {
     startGuildSettingsSyncLoop();
     // Check active Giveaways to end them on time
     startGiveawayLoop(client, commandConfig);
+    require('./events/userUpdatesLogger.js').primeUserProfileCache(commandConfig);
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
 });

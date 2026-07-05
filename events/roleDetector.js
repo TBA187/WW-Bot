@@ -40,7 +40,6 @@ module.exports = {
             });
 
             if (relevantLogs.size === 0) {
-                console.log(` - No recent WW role audit log found for ${newMember.user.tag}.`);
                 return;
             }
 
