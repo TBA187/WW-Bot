@@ -5,6 +5,10 @@ const { SlashCommandBuilder, MessageFlags, EmbedBuilder } = require('discord.js'
 const { getServerLogo, createPvpFooter } = require('./utils/pvpAssets.js');
 const { replyMissingMemberOption, stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
+function formatWinTimesTxt(count) {
+    return `${count} ${count === 1 ? 'time' : 'times'}`;
+}
+
 class PvpStats {
 
     constructor(config) {
@@ -41,19 +45,25 @@ class PvpStats {
                 );
             }
 
+            const eventCounts = await this.db.getHistoryEventCounts(user.id);
             const firstCrowned = stats.first_crowned ? `<t:${Math.floor(new Date(stats.first_crowned).getTime() / 1000)}:F>` : '*Never*';
             const lastCrowned = stats.crowned_at ? `<t:${Math.floor(new Date(stats.crowned_at).getTime() / 1000)}:F>` : '*Never*';
             const embed = new EmbedBuilder()
                 .setTitle('<:kyurem:1472065995089645609>\u2002White Walker PvP King Stats\u2002<:kyurem:1472065995089645609>')
-                .setDescription(`## 📈 PvP Stats for <@${user.id}>`)
+                .setDescription(`### 📈\u2002PvP Stats for <@${user.id}>`)
                 .addFields(
-                    { name: `🔥\u2002 Current Win Streak:\u2002${stats.current_streak ?? 0}`, value: '\u2002', inline: false },
-                    { name: `⚔️\u2002 Longest Streak:\u2002${stats.longest_streak ?? 0}`, value: `\u2002`, inline: false },
-                    // { name: `💥\u2002 Total Dethrones: ${stats.total_crown_losses ?? 0}`, value: `\u2002`, inline: false },
-                    { name: `🏆\u2002 Total Wins:\u2002${stats.total_wins ?? 0}`, value: '\u2002', inline: false },
-                    { name: `🥇\u2002 First Victory:\u2002${firstCrowned}`, value: '\u2002', inline: false },
-                    { name: `<:pepe_king:1455434151262949535>\u2002 Last Victory:\u2002${lastCrowned}`, value: '\u2002', inline: false },
-                    { name: '\u2002', value: '\u2002', inline: false }
+                    { name: `🔥\u2002Current Win Streak:\u2002${stats.current_streak ?? 0}`, value: '', inline: false },
+                    { name: `⚔️\u2002Longest Streak:\u2002${stats.longest_streak ?? 0}`, value: '', inline: false },
+                    // { name: `💥\u2002Total Dethrones:\u2002${stats.total_crown_losses ?? 0}`, value: '', inline: false },
+                    {
+                        name: `🏆\u2002Total Wins:\u2002${stats.total_wins ?? 0}`,
+                        value:
+                            `-# └ 👑\u2002Crowned as King: **${formatWinTimesTxt(eventCounts.crown)}**\n` +
+                            `-# └ 🛡️\u2002Defended Throne: **${formatWinTimesTxt(eventCounts.defense)}**`,
+                        inline: false
+                    },
+                    { name: `🥇\u2002First Victory:\u2002${firstCrowned}`, value: '', inline: false },
+                    { name: `<:pepe_king:1455434151262949535>\u2002Last Victory:\u2002${lastCrowned}`, value: '', inline: false }
                 )
                 .setColor(0x02f3d7)
                 .setThumbnail(user.displayAvatarURL())

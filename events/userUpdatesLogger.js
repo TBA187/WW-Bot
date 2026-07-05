@@ -72,7 +72,6 @@ async function sendNicknameLog(logChannel, oldMember, newMember) {
 
         nicknameAuditChange = auditEntry?.changes?.find(c => c.key === 'nick') ?? null;
         if (nicknameAuditChange === null) {
-            console.warn(`[WW LOG] Skipped nickname log for ${newMember.user.tag ?? newMember.id}: no recent nickname audit log found.`);
             return;
         }
 

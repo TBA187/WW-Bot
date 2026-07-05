@@ -1150,6 +1150,22 @@ class PvpKingStorage {
         return rows[0] ?? null;
     }
 
+    async getHistoryEventCounts(userId) {
+        const [rows] = await this.query(`
+            SELECT type, COUNT(*) AS total
+            FROM pvp_king_history
+            WHERE king_id = ?
+            GROUP BY type
+        `, [userId]);
+
+        const counts = { crown: 0, defense: 0 };
+        for (const row of rows) {
+            if (row.type === 'crown') counts.crown = toNumber(row.total);
+            if (row.type === 'defense') counts.defense = toNumber(row.total);
+        }
+        return counts;
+    }
+
     async getStatsCrownedAt(userId) {
         const [rows] = await this.query(
             'SELECT crowned_at FROM pvp_king_stats WHERE user_id = ?',
@@ -1887,6 +1903,18 @@ class PvpKingStorage {
 
     selectHistory(normalized, params) {
         let rows = [...this.state.history].map(cloneRow);
+
+        if (normalized.includes('count(*) as total') && normalized.includes('group by type')) {
+            if (normalized.includes('where king_id = ?')) {
+                rows = rows.filter(row => String(row.king_id) === String(params[0]));
+            }
+
+            const counts = new Map();
+            for (const row of rows) {
+                counts.set(row.type, (counts.get(row.type) ?? 0) + 1);
+            }
+            return [...counts.entries()].map(([type, total]) => ({ type, total }));
+        }
 
         if (normalized.includes('count(*) as totalkingentries') && normalized.includes('select king_id from pvp_king_history')) {
             const latest = [...rows].sort((a, b) => toNumber(b.id) - toNumber(a.id))[0];

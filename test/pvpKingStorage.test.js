@@ -80,6 +80,13 @@ class FakeDb {
         if (normalized.startsWith('select id from pvp_king_history where sync_event_id')) {
             return [this.history.filter(row => row.sync_event_id === params[0]).map(row => ({ id: row.id }))];
         }
+        if (normalized.startsWith('select type, count(*) as total from pvp_king_history')) {
+            const counts = new Map();
+            for (const row of this.history.filter(entry => String(entry.king_id) === String(params[0]))) {
+                counts.set(row.type, (counts.get(row.type) ?? 0) + 1);
+            }
+            return [[...counts.entries()].map(([type, total]) => ({ type, total }))];
+        }
         if (normalized.startsWith('select crowned_at from pvp_king_stats')) {
             const row = this.stats.find(stat => String(stat.user_id) === String(params[0]));
             return [[row ? { crowned_at: row.crowned_at } : undefined].filter(Boolean)];
@@ -454,6 +461,21 @@ test('pending fallback reads use local state when sync cannot reach MySQL', asyn
 
     assert.equal(stats.king_name, 'Local King');
 }));
+
+test('getHistoryEventCounts returns crown and defense totals', async () => {
+    const file = tempDataFile();
+    const storage = new PvpKingStorage({ db: new FakeDb(), storageMode: 'json', dataFile: file });
+
+    await storage.restore();
+    await storage.insertHistory('400', 'King', 'crown', 1, 1, 1, null);
+    await storage.insertHistory('400', 'King', 'defense', 2, 2, 2, null);
+    await storage.insertHistory('400', 'King', 'defense', 3, 3, 3, null);
+    await storage.insertHistory('other', 'Other King', 'crown', 1, 1, 1, null);
+
+    const counts = await storage.getHistoryEventCounts('400');
+
+    assert.deepEqual(counts, { crown: 1, defense: 2 });
+});
 
 test('reverse-style local operations remove fallback history and stats', async () => {
     const file = tempDataFile();
