@@ -49,7 +49,7 @@ class Test {
             .setDescription(`### User Information for <@${user.id}>\n` +
                 `- Discord Username (@handle): **${username}**\n` +
                 `- Legacy Discord User Tag: **${userTag}**\n` +
-                `-# **Deprecated:** Discord has phased out the legacy **username#1234** discriminator system. <@${user.id}> has transitioned to the new unique username format, and the legacy tag is no longer in use!\n` +
+                `  - **Deprecated:** Discord has phased out the legacy **username#1234** discriminator system. <@${user.id}> has transitioned to the new unique username format, and the legacy tag is no longer in use!\n` +
                 `- Discord Global Display Name: **${globalName}**\n` +
                 `- WW Server Nickname: **${displayName}**\n` +
                 `- Discord User ID: **${member.id}**\n`
