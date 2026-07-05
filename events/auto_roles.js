@@ -1114,6 +1114,8 @@ async function findMemberColorRole(guild, member, user) {
     const legacyName = `color-${user.id}`;
     const customAnchor = await fetchRoleById(guild, CUSTOM_COLOR_ROLE_ANCHOR_ID);
     const presetRoleIds = new Set(COLOR_ROLE_PRESETS.map(preset => preset.roleId).filter(Boolean));
+
+    // Custom color roles are member-owned roles below the custom role anchor in Discord.
     const isCustomCandidate = role =>
         customAnchor !== null &&
         role.position < customAnchor.position &&
@@ -1166,6 +1168,32 @@ async function deleteCustomColorRole(guild, role, user) {
     }
 
     await role.delete(`Delete removed custom color role for ${user.tag ?? user.username} (${user.id})`);
+    return true;
+}
+
+
+async function syncMemberColorRoleName(member, user = member.user) {
+    // Called after a user changes their server nickname, keeping the color role name in sync with their current display name.
+    const role = await findMemberColorRole(member.guild, member, user);
+    if (role === null || isPresetColorRole(role)) {
+        return false;
+    }
+
+    const roleName = getMemberColorRoleName(member, user);
+    if (!roleName || role.name === roleName) {
+        return false;
+    }
+
+    const roleError = await manageableRoleError(member.guild, role);
+    if (roleError !== null) {
+        console.warn(`[WW LOG] Could not rename custom color role for ${user.tag ?? user.username} (${user.id}): ${roleError}`);
+        return false;
+    }
+
+    await member.guild.roles.edit(role.id, {
+        name: roleName,
+        reason: `Color role renamed after server nickname update for ${user.tag ?? user.username} (${user.id})`
+    });
     return true;
 }
 
@@ -2038,5 +2066,6 @@ module.exports = {
     handleAutoRoleModal,
     handleAutoRoleSelect,
     COLOR_ROLE_PRESETS,
+    syncMemberColorRoleName,
     sendAutoRolePanel
 };

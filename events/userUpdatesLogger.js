@@ -4,6 +4,7 @@
 // ========================================
 
 const { AttachmentBuilder, AuditLogEvent, EmbedBuilder } = require('discord.js');
+const { syncMemberColorRoleName } = require('./auto_roles.js');
 
 const RECENT_NAME_LOG_TTL_MS = 30 * 1000;
 const recentNameLogs = new Map();
@@ -285,6 +286,11 @@ async function sendNicknameLog(logChannel, oldMember, newMember) {
         oldDisplayValue: displayOldNickname ? formatNickname(displayOldNickname) : serverNicknameFallbackText(oldMember.user),
         newDisplayValue: displayNewNickname ? boldValue(formattedNewNickname) : formattedNewNickname,
         color: 0xf1c40f
+    });
+
+    // Color Role Name Sync: If the user has a custom Color Role, change the Color Role Name to their new server nickname.
+    await syncMemberColorRoleName(newMember).catch(error => {
+        console.warn(`[WW LOG] Could not sync custom color role name for ${newMember.user.tag ?? newMember.id}:`, error);
     });
 }
 
