@@ -24,7 +24,7 @@ const {
     refreshGiveawayMessage,
     resolveRoleIds,
     sendEmbedFollowUp,
-    sendGiveawayMessage,
+    replyWithGiveawayMessage,
     sendParticipantEmbeds,
     shouldRestrictGiveawayChannel,
     utcNowIso,
@@ -285,7 +285,7 @@ class Giveaways {
             return interaction.reply({ content: 'This command must be used in a message channel.', flags: MessageFlags.Ephemeral });
         }
 
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply();
 
         const giveawayId = makeGiveawayId();
         const name = interaction.options.getString('name');
@@ -323,15 +323,15 @@ class Giveaways {
 
         let message;
         try {
-            message = await sendGiveawayMessage(interaction.channel, giveaway, this.config);
+            message = await replyWithGiveawayMessage(interaction, giveaway, this.config);
         } catch (err) {
             console.error('[WW LOG] Giveaway create message failed:', err);
-            await interaction.editReply('Discord returned an error while creating the giveaway.');
+            await interaction.editReply('Discord returned an error while creating the giveaway.').catch(() => { });
             return;
         }
 
         giveaway = await this.giveawayStore.updateGiveaway(giveawayId, { message_id: message.id });
-        await interaction.editReply(`Giveaway created: ${message.url}`);
+        await interaction.followUp({ content: `Giveaway created: ${message.url}`, flags: MessageFlags.Ephemeral });
     }
 
     async edit(interaction) {
@@ -398,15 +398,25 @@ class Giveaways {
             return interaction.reply({ content: "You don't have permission.", flags: MessageFlags.Ephemeral });
         }
 
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply();
         const giveawayId = interaction.options.getString('giveaway', true);
         const record = await this.giveawayStore.getGiveaway(giveawayId);
         if (!record || record.status !== GIVEAWAY_ACTIVE) {
             return interaction.editReply('That active giveaway could not be found.');
         }
 
-        const [ended, winnerIds] = await endGiveaway(interaction.client, this.config, record, { actor: interaction.user, drawType: 'end' });
-        await interaction.editReply(drawSummary('Ended', ended, winnerIds, interaction.guild));
+        const [ended, winnerIds] = await endGiveaway(interaction.client, this.config, record, {
+            actor: interaction.user,
+            drawType: 'end',
+            announceInteraction: interaction
+        });
+
+        const summary = drawSummary('Ended', ended, winnerIds, interaction.guild);
+        if (interaction.replied || interaction.deferred) {
+            await interaction.followUp({ content: summary, flags: MessageFlags.Ephemeral });
+        } else {
+            await interaction.reply({ content: summary, flags: MessageFlags.Ephemeral });
+        }
     }
 
     async delete(interaction) {
@@ -438,7 +448,8 @@ class Giveaways {
             return interaction.reply({ content: "You don't have permission.", flags: MessageFlags.Ephemeral });
         }
 
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply();
+
         const giveawayId = interaction.options.getString('giveaway', true);
         const record = await this.giveawayStore.getGiveaway(giveawayId);
         if (!record || record.status !== GIVEAWAY_ENDED) {
@@ -455,9 +466,16 @@ class Giveaways {
         const [rerolled, winnerIds] = await endGiveaway(interaction.client, this.config, record, {
             actor: interaction.user,
             drawType: 'reroll',
-            winnerCount
+            winnerCount,
+            announceInteraction: interaction
         });
-        await interaction.editReply(drawSummary('Rerolled', rerolled, winnerIds, interaction.guild));
+
+        const summary = drawSummary('Rerolled', rerolled, winnerIds, interaction.guild);
+        if (interaction.replied || interaction.deferred) {
+            await interaction.followUp({ content: summary, flags: MessageFlags.Ephemeral });
+        } else {
+            await interaction.reply({ content: summary, flags: MessageFlags.Ephemeral });
+        }
     }
 
     async participants(interaction) {

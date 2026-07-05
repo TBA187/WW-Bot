@@ -1066,6 +1066,26 @@ async function sendGiveawayMessage(channel, giveaway, config) {
     return channel.send(payload);
 }
 
+async function replyWithGiveawayMessage(interaction, giveaway, config) {
+    const entries = await config.giveawayStore.listEntries(giveaway.giveaway_id, { activeOnly: true });
+    const embed = buildGiveawayEmbed(giveaway, { participantCount: entries.length });
+    const file = logoFile();
+    const payload = {
+        content: giveawayMessageContent(giveaway),
+        embeds: [embed],
+        components: buildGiveawayComponents(giveaway),
+        allowedMentions: { parse: [], roles: normalizeRoleIds(giveaway.ping_role_ids) }
+    };
+    if (file) payload.files = [file];
+
+    if (interaction.deferred && !interaction.replied) {
+        await interaction.editReply(payload);
+    } else {
+        await interaction.reply(payload);
+    }
+    return interaction.fetchReply();
+}
+
 async function refreshGiveawayMessage(client, config, giveaway, { disabled = null } = {}) {
     if (!giveaway?.message_id) return;
     const channel = await getChannel(client, giveaway.channel_id);
@@ -1101,7 +1121,7 @@ async function deleteGiveawayMessage(client, config, giveaway) {
     }
 }
 
-async function endGiveaway(client, config, giveaway, { actor = null, drawType, winnerCount = null } = {}) {
+async function endGiveaway(client, config, giveaway, { actor = null, drawType, winnerCount = null, announceInteraction = null } = {}) {
     const giveawayId = giveaway.giveaway_id;
     const entries = await config.giveawayStore.listEntries(giveawayId, { activeOnly: true });
     const count = winnerCount || Number(giveaway.winners_total || 1);
@@ -1140,16 +1160,29 @@ async function endGiveaway(client, config, giveaway, { actor = null, drawType, w
 
     const updated = await config.giveawayStore.updateGiveaway(giveawayId, updates);
     await refreshGiveawayMessage(client, config, updated, { disabled: true });
-    await announceGiveawayDraw(client, updated, winnerIds, { drawType });
+    await announceGiveawayDraw(client, updated, winnerIds, { drawType, interaction: announceInteraction });
     return [updated, winnerIds];
 }
 
-async function announceGiveawayDraw(client, giveaway, winnerIds, { drawType }) {
+async function announceGiveawayDraw(client, giveaway, winnerIds, { drawType, interaction = null }) {
     const channel = await getChannel(client, giveaway.channel_id);
     if (!channel) return;
     const content = drawAnnouncementContent(giveaway, winnerIds, { drawType });
     const message = await fetchGiveawayMessage(channel, giveaway);
     try {
+        if (interaction && !interaction.replied) {
+            try {
+                if (interaction.deferred) {
+                    await interaction.editReply({ content, allowedMentions: { users: winnerIds } });
+                } else {
+                    await interaction.reply({ content, allowedMentions: { users: winnerIds } });
+                }
+                return;
+            } catch {
+                // If the interaction reply window was missed, fall back to the normal giveaway message reply.
+            }
+        }
+
         if (message) {
             await message.reply({ content, allowedMentions: { users: winnerIds }, failIfNotExists: false });
         } else {
@@ -1623,7 +1656,16 @@ function shouldRestrictGiveawayChannel(config) {
 function drawSummary(action, giveaway, winnerIds, guild = null) {
     const winners = winnerIds.length ? winnerIds.map(userId => `<@${userId}>`).join(', ') : 'No winners';
     const label = winnerIds.length === 1 ? 'Winner' : 'Winners';
-    return `${action} **${giveawayDisplayLabel(giveaway, { guild })}**. ${label}: ${winners}`;
+    const giveawayLabel = giveawayDisplayLabel(giveaway, { guild });
+    const giveawayLink = linkTextToGiveaway(giveaway, giveawayLabel);
+    if (action === 'Rerolled') {
+        return `Rerolled Giveaway: **${giveawayLink}**\n- ${label}: ${winners}`;
+    }
+    if (action === 'Ended') {
+        return `Ended Giveaway: **${giveawayLink}**\n- ${label}: ${winners}`;
+    }
+
+    return `${action} **${giveawayLabel}**. ${label}: ${winners}`;
 }
 
 function startGiveawayLoop(client, config) {
@@ -1669,6 +1711,7 @@ module.exports = {
     parseGiveawayEndTime,
     resolveRoleIds,
     sendGiveawayMessage,
+    replyWithGiveawayMessage,
     sendEmbedFollowUp,
     sendParticipantEmbeds,
     shouldRestrictGiveawayChannel,
