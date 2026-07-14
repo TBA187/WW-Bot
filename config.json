@@ -1,6 +1,13 @@
 {
   "botTimezone": "Etc/UTC",
+  "forumGuildApplicationPage": "https://pokemonrevolution.net/forum/topic/228820-white-walkers-the-memory-of-the-winter/",
+  "forumGuildApplicationCooldownHours": 0,
+  "forumGuildApplicationIgnoredUsers": [
+    "vangogsan"
+  ],
   "guildId": "1148499020038295582",
+  "officerChannelID": "1365345796328787968",
+  "courtHouseChannelID": "1367451187472760863",
   "welcomeChannelID": "1180559448968790098",
   "ownerID": "291142291073269761",
   "leaderRoleID": "1180559376499617852",

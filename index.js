@@ -4,6 +4,7 @@ process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
+const { createGuildApplicationMonitor } = require('./features/guild-applications/index.js');
 const { writeJsonIfChanged } = require('./utils/jsonFile.js');
 const {
     Client,
@@ -265,6 +266,7 @@ const commandMap = new Map();
 const challengeTimeouts = new Map(); // PvP challenge confirmation timers
 const pvpKingStorage = new PvpKingStorage({ db });
 const giveawayStore = createGiveawayStore({ db });
+const guildApplicationMonitor = createGuildApplicationMonitor({ client, db, config: appConfig });
 
 // Build config object (Parameters to send to command classes)
 const commandConfig = {
@@ -505,6 +507,8 @@ client.once(Events.ClientReady, async () => {
     startGuildSettingsSyncLoop();
     // Check active Giveaways to end them on time
     startGiveawayLoop(client, commandConfig);
+    // The first forum scan builds a silent baseline; later scans only report newly submitted applications.
+    guildApplicationMonitor.start().catch(err => console.error('[WW LOG] Guild Application monitor failed to start:', err));
     require('./events/userUpdatesLogger.js').primeUserProfileCache(commandConfig);
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
