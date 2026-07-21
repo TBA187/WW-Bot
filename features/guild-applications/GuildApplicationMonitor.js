@@ -37,6 +37,11 @@ function latestPostId(posts, fallback = null) {
     ), fallback);
 }
 
+function postNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : 0;
+}
+
 function topicIdFromUrl(url) {
     return String(url || '').match(/\/topic\/(\d+)/i)?.[1] || TOPIC_ID;
 }
@@ -132,18 +137,41 @@ class GuildApplicationMonitor {
         }
     }
 
-    async fetchPages(pageNumbers, firstPage = null) {
-        const pages = [];
-        for (const pageNumber of [...new Set(pageNumbers)].sort((a, b) => a - b)) {
-            pages.push(pageNumber === 1 && firstPage ? firstPage : await this.forum.fetchPage(pageNumber));
+    async readablePage(pageNumber, firstPage = null) {
+        const page = pageNumber === 1 && firstPage ? firstPage : await this.forum.fetchPage(pageNumber);
+        if (!(page.posts || []).length) {
+            throw new ForumRequestError(`PRO Forum page ${pageNumber} did not contain any readable posts.`);
         }
-        return pages;
+        return page;
+    }
+
+    async fetchPages(pageNumbers, firstPage = null, boundaryPostId = null) {
+        const requested = [...new Set(pageNumbers)].sort((a, b) => a - b);
+        const pages = new Map();
+        for (const pageNumber of requested) {
+            pages.set(pageNumber, await this.readablePage(pageNumber, firstPage));
+        }
+
+        // If the forum changes its page size, the saved post can move several pages backward.
+        const boundary = postNumber(boundaryPostId);
+        let earliestPage = requested[0] || 1;
+        const boundaryFound = () => [...pages.values()].some(page =>
+            (page.posts || []).some(post => postNumber(post.postId) <= boundary)
+        );
+        while (boundary > 0 && earliestPage > 1 && !boundaryFound()) {
+            earliestPage--;
+            pages.set(earliestPage, await this.readablePage(earliestPage, firstPage));
+        }
+
+        return [...pages.entries()]
+            .sort(([left], [right]) => left - right)
+            .map(([, page]) => page);
     }
 
     async buildSilentBaseline() {
         const firstPage = await this.forum.fetchPage(1);
         await this.removeStoredTemplateImages();
-        const lastPage = Math.max(1, firstPage.lastPage);
+        const lastPage = Math.max(1, Number(firstPage.lastPage) || 1);
         const pages = await this.fetchPages(Array.from({ length: lastPage }, (_, index) => index + 1), firstPage);
         const posts = pages.flatMap(page => page.posts).sort(comparePosts);
         const latestApplications = {};
@@ -185,8 +213,12 @@ class GuildApplicationMonitor {
         const checkpoint = this.store.getCheckpoint();
         const firstPage = await this.forum.fetchPage(1);
         await this.removeStoredTemplateImages();
-        const lastPage = Math.max(1, firstPage.lastPage);
-        const pages = await this.fetchPages(this.pagesToInspect(lastPage, checkpoint), firstPage);
+        const lastPage = Math.max(1, Number(firstPage.lastPage) || 1);
+        const pages = await this.fetchPages(
+            this.pagesToInspect(lastPage, checkpoint),
+            firstPage,
+            checkpoint.lastPostId
+        );
         const posts = pages.flatMap(page => page.posts).sort(comparePosts);
         const knownIds = await this.store.knownPostIds(posts.map(post => post.postId));
         const unseen = posts.filter(post => !knownIds.has(String(post.postId)));
@@ -397,5 +429,6 @@ module.exports = {
     applicationKey,
     comparePosts,
     latestPostId,
+    postNumber,
     topicIdFromUrl
 };

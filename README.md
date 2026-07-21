@@ -1,6 +1,6 @@
 # WW-Bot
 
-WW-Bot is the White Walkers Discord bot. It handles XP tracking, level rewards, PvP King challenges, dungeon recruitment, giveaways, guild application monitoring, auto-role panels, welcome messages, and server audit logging.
+WW-Bot is the White Walkers Discord bot. It handles XP tracking, level rewards, PvP King challenges, dungeon recruitment, giveaways, guild application and forum shop monitoring, auto-role panels, welcome messages, and server audit logging.
 
 ## Requirements
 
@@ -59,6 +59,8 @@ Server IDs and feature IDs live in `config.json`, including:
 - `forumGuildApplicationPage` for the PRO forum topic monitored for applications
 - `forumGuildApplicationCooldownHours`: number of hours the bot ignores additional valid applications from the same forum user after announcing one. Once the cooldown ends, the next valid application is announced. Use `0` to disable this filtering.
 - `forumGuildApplicationIgnoredUsers` for forum usernames whose posts should never trigger application handling
+- `tbaProForumShop` and `tbaProDungeonShop` for the two PRO shop topics monitored for new replies
+- `tbaProForumNotifications`: use `1` to enable the shop DMs or `0` to disable them
 
 ## Database Setup
 
@@ -80,6 +82,7 @@ Local runtime state is stored in `data/` and ignored by Git.
 - `data/giveaways.json`: temporary giveaway fallback state.
 - `data/guild_settings.json`: mirror of guild settings, kept populated so XP/logging settings still load during a database outage.
 - `data/guild_applications.json`: forum scan checkpoint and temporary application records during a MySQL outage. In `json` mode it is the permanent local store.
+- `data/tba_forum_shops.json`: lightweight JSON-only checkpoints for the two TBA shop topics. It never synchronizes with MySQL.
 
 The fallback files are not meant to be manually edited while the bot is running!
 
@@ -110,18 +113,31 @@ Giveaways:
 
 Guild applications:
 
-- checks the configured White Walkers PRO forum recruitment topic every five minutes
+- checks the configured White Walkers PRO forum recruitment topic every ten minutes
 - silently records the existing topic on first setup, then processes only newly detected posts
 - pings the Officer role for valid applications and alerts `ownerID` when a newly observed post is not classified as a valid application
 - extracts reordered and loosely formatted application fields, prioritizes the trainer card, posts additional images in batches of ten, and uses local OCR when the IGN is missing from text
 - falls back to the stored raw forum post in a `Guild Application` field when too little structured information can be extracted
 - creates a 24-hour Yes/No poll in the Court House when the IGN is reliable
 - reminds the Officer role after 12 and 18 hours when fewer than half of current Officers have voted
+- follows changing forum pagination and relocates its saved post if the forum page size changes
 - can ignore repeat applications from the same forum user. Setting `forumGuildApplicationCooldownHours`; `0` announces every valid application
 - ignores configured forum usernames, quoted posts, signatures, and copied recruitment-template images
 - stores all scanned forum posts and classifications in MySQL, with the same `STORAGE_MODE` JSON fallback behavior as other persistent systems
 
 Before enabling the monitor in production, run `sql/create_guild_applications_table.sql`. Tesseract language data is loaded only when OCR is actually needed; normal labelled applications do not start the OCR worker.
+
+TBA forum shop notifications:
+
+- checks each configured shop topic every twelve minutes; the Forum Shop starts after three minutes and the Dungeon Shop after seven minutes so all three forum monitors are staggered
+- silently records each topic's latest post on first startup, so historical replies do not generate DMs
+- sends `ownerID` a DM containing the author, complete message content, timestamp, direct forum-post link, and every image from each new reply
+- places the first image in the embed and sends additional images immediately afterward in batches of ten
+- catches up on every reply posted while the bot was offline, including new pages and forum page-size changes
+- uses exponential backoff for forum outages and rate limits, and retries failures without advancing the saved post checkpoint
+- adds a warning and keeps the original forum link when some post details or images cannot be fetched
+- ignores replies posted by the forum username `tba7`, using a case-insensitive comparison
+- stores only page and post checkpoints in `data/tba_forum_shops.json`; this feature never uses MySQL
 
 Preview a random strong historical application without posting it:
 

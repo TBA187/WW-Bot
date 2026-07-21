@@ -1,7 +1,13 @@
 'use strict';
 
 // Sends the owner a compact review alert for new forum posts that are not valid applications.
-const { EmbedBuilder } = require('discord.js');
+const {
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    EmbedBuilder,
+    MessageFlags
+} = require('discord.js');
 const {
     EMBED_COLOR,
     addLongField,
@@ -12,6 +18,34 @@ const {
 const { TOPIC_URL } = require('../constants.js');
 
 const NOT_AVAILABLE = '*N/A*';
+const FEEDBACK_BUTTON_PREFIX = 'guild_application_feedback:';
+
+function feedbackButton(postId) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`${FEEDBACK_BUTTON_PREFIX}${postId || 'unknown'}`)
+            .setLabel('AI Training Feedback')
+            .setEmoji('⭐')
+            .setStyle(ButtonStyle.Primary)
+    );
+}
+
+async function handleGuildForumFeedbackButton(interaction, options = {}) {
+    if (!String(interaction.customId || '').startsWith(FEEDBACK_BUTTON_PREFIX)) return false;
+
+    const ownerId = String(options.ownerID || options.ownerId || '');
+    if (interaction.user.id !== ownerId) {
+        await interaction.reply({
+            content: `Feedback for improving the detection algorithm and training database can only be submitted by <@${ownerId}>`,
+            flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] }
+        });
+        return true;
+    }
+
+    await interaction.reply({ content: 'Coming soon...', flags: MessageFlags.Ephemeral });
+    return true;
+}
 
 class GuildForumPostNotifier {
     constructor(options = {}) {
@@ -33,7 +67,7 @@ class GuildForumPostNotifier {
     }
 
     content(record) {
-        return `<@${this.ownerId}>, a new message was detected on the **White Walkers guild application forum page**, but it was not classified as a valid guild application.\n`
+        return `<@${this.ownerId}>, a new message was detected on the **White Walkers guild application forum page**, but it was **not** classified as a valid guild application!\n`
             .trim();
     }
 
@@ -46,7 +80,7 @@ class GuildForumPostNotifier {
                 iconURL: 'attachment://ww_logo.png'
             })
             .addFields(
-                { name: 'Application likelihood', value: `**${percentage}%**`, inline: true },
+                { name: 'Probability Score', value: `**${percentage}%**`, inline: true },
                 { name: 'Posted by Vangogsan', value: '**No**', inline: true },
                 { name: 'View Forum Application', value: `[**Click Here!**](<${record.postUrl}>)`, inline: true },
                 {
@@ -66,6 +100,7 @@ class GuildForumPostNotifier {
         const message = await officerChannel.send({
             content: this.content(record),
             embeds: [this.embed(record)],
+            components: [feedbackButton(record.postId)],
             files: [logoFile()],
             allowedMentions: { parse: [], users: [this.ownerId] }
         });
@@ -77,5 +112,8 @@ class GuildForumPostNotifier {
 }
 
 module.exports = {
-    GuildForumPostNotifier
+    FEEDBACK_BUTTON_PREFIX,
+    GuildForumPostNotifier,
+    feedbackButton,
+    handleGuildForumFeedbackButton
 };

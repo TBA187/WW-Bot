@@ -4,7 +4,11 @@ process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
-const { createGuildApplicationMonitor } = require('./features/guild-applications/index.js');
+const {
+    createGuildApplicationMonitor,
+    handleGuildForumFeedbackButton
+} = require('./features/guild-applications/index.js');
+const { createTbaForumShopMonitor } = require('./features/tba-forum-shops/index.js');
 const { writeJsonIfChanged } = require('./utils/jsonFile.js');
 const {
     Client,
@@ -267,6 +271,7 @@ const challengeTimeouts = new Map(); // PvP challenge confirmation timers
 const pvpKingStorage = new PvpKingStorage({ db });
 const giveawayStore = createGiveawayStore({ db });
 const guildApplicationMonitor = createGuildApplicationMonitor({ client, db, config: appConfig });
+const tbaForumShopMonitor = createTbaForumShopMonitor({ client, config: appConfig });
 
 // Build config object (Parameters to send to command classes)
 const commandConfig = {
@@ -509,6 +514,8 @@ client.once(Events.ClientReady, async () => {
     startGiveawayLoop(client, commandConfig);
     // The first forum scan builds a silent baseline; later scans only report newly submitted applications.
     guildApplicationMonitor.start().catch(err => console.error('[WW LOG] Guild Application monitor failed to start:', err));
+    // The two shop checks are staggered after the application monitor to avoid a burst of forum requests.
+    tbaForumShopMonitor.start().catch(err => console.error('[WW LOG] TBA PRO Forum shop monitor failed to start:', err));
     require('./events/userUpdatesLogger.js').primeUserProfileCache(commandConfig);
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
@@ -554,6 +561,8 @@ client.on('interactionCreate', async interaction => {
 
         // Button Handling
         if (interaction.isButton()) {
+            if (await handleGuildForumFeedbackButton(interaction, { ownerID: appConfig.ownerID })) return true;
+
             for (const command of new Set(commandMap.values())) {
                 if (typeof command.handleButton === 'function') {
                     const handled = await command.handleButton(interaction);

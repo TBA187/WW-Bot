@@ -7,7 +7,10 @@ const { GuildApplicationParser } = require('./parsing/GuildApplicationParser.js'
 const { GuildApplicationOcr } = require('./parsing/GuildApplicationOcr.js');
 const { GuildApplicationStore } = require('./storage/GuildApplicationStore.js');
 const { GuildApplicationNotifier } = require('./discord/GuildApplicationNotifier.js');
-const { GuildForumPostNotifier } = require('./discord/GuildForumPostNotifier.js');
+const {
+    GuildForumPostNotifier,
+    handleGuildForumFeedbackButton
+} = require('./discord/GuildForumPostNotifier.js');
 const { GuildApplicationVoteReminder } = require('./discord/GuildApplicationVoteReminder.js');
 
 function createGuildApplicationMonitor(options = {}) {
@@ -76,6 +79,7 @@ module.exports = {
     GuildApplicationParser,
     GuildApplicationStore,
     GuildApplicationVoteReminder,
+    handleGuildForumFeedbackButton,
     ProForumClient,
     createGuildApplicationMonitor
 };
