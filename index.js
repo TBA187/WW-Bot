@@ -519,6 +519,15 @@ client.once(Events.ClientReady, async () => {
     require('./events/userUpdatesLogger.js').primeUserProfileCache(commandConfig);
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
+
+    // ============================================================
+    // TEMPORARY ALTO MARE REMINDER - REMOVE THESE 2 LINES LATER
+    // ============================================================
+    const tempSixHourRolePing = require('./tasks/tempSixHourRolePing.js');
+    tempSixHourRolePing.execute(client);
+    // ============================================================
+    // END TEMPORARY ALTO MARE REMINDER
+    // ============================================================
 });
 
 // Auto-Config DB settings for New Servers the bot just joined
