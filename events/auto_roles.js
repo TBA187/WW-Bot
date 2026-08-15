@@ -332,10 +332,11 @@ const GUILD_ROLES_PANEL = autoRolePanelConfig({
     description:
         '**Choose your Guild Roles by clicking the buttons below.**\nYou can select multiple roles.\n' +
         'To remove a role, simply click the button corresponding to the role you want to remove.\n' +
-        '-# - Select **PvP ⚔️** to be pinged for PvP-related content.\n' +
+        '-# - Select **PvP ⚔️** if you are interested in PvP-related content.\n' +
         '-# - Select **Dungeon 🧙‍♂️** to be pinged for Dungeon runs.\n' +
         '-# - Select **Level / EV ✨** to be pinged for service requests.\n' +
         '-# - Select **Dex Service 🤝** to be pinged for service requests.\n' +
+        '-# - Select **PRO Notifications 🔔** to receive notifications about useful game information, updates, and upcoming events.\n' +
         '-# - Select **Stream 🔔** to be pinged when someone from the Guild streams. You can also ping this role when you go live.',
     colorHex: '#02F3D7',
     imagePath: 'images/ww_logo.png',
@@ -385,6 +386,14 @@ const GUILD_ROLES_PANEL = autoRolePanelConfig({
             unicodeEmoji: '🤝',
             buttonStyle: ButtonStyle.Success,
             row: 0
+        }),
+        autoRoleChoiceConfig({
+            key: 'pro_notifications',
+            label: 'PRO Notifications',
+            roleId: '1537991574162640906',
+            unicodeEmoji: '🔔',
+            buttonStyle: ButtonStyle.Primary,
+            row: 1
         }),
         autoRoleChoiceConfig({
             key: 'stream',
@@ -1839,6 +1848,27 @@ async function sendAutoRolePanel(channel, panel) {
 }
 
 
+// =============================================================================
+// AUTO ROLE PANEL - UPDATE EXISTING MESSAGE
+// =============================================================================
+async function updateAutoRolePanel(message, panel) {
+    const embed = buildAutoRoleEmbed(panel);
+    const files = buildAutoRoleFiles(panel);
+    const components = buildComponentsForPanel(panel);
+    const messageText = panel.messageText || null;
+
+    return message.edit({
+        content: messageText,
+        embeds: [embed],
+        components,
+
+        // Replace old panel attachments with the files from the current config.
+        attachments: [],
+        files
+    });
+}
+
+
 async function handleAutoRoleButton(interaction) {
     if (!interaction.customId.startsWith(`${CUSTOM_ID_PREFIX}:`)) return false;
 
@@ -2067,5 +2097,6 @@ module.exports = {
     handleAutoRoleSelect,
     COLOR_ROLE_PRESETS,
     syncMemberColorRoleName,
-    sendAutoRolePanel
+    sendAutoRolePanel,
+    updateAutoRolePanel
 };
