@@ -16,6 +16,7 @@ const {
     giveawayAutocomplete,
     giveawayChannelOnlyError,
     giveawayDisplayLabel,
+    giveawayEndedWithinRerollWindow,
     handleGiveawayButton,
     makeGiveawayId,
     normalizeGiveawayDescription,
@@ -28,7 +29,8 @@ const {
     sendParticipantEmbeds,
     shouldRestrictGiveawayChannel,
     utcNowIso,
-    validateWinnerCount
+    validateWinnerCount,
+    withGiveawayLock
 } = require('../events/giveaways');
 
 class Giveaways {
@@ -341,10 +343,6 @@ class Giveaways {
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const giveawayId = interaction.options.getString('giveaway', true);
-        const record = await this.giveawayStore.getGiveaway(giveawayId);
-        if (!record || record.status !== GIVEAWAY_ACTIVE) {
-            return interaction.editReply('That active giveaway could not be found.');
-        }
 
         const updates = {};
         try {
@@ -388,7 +386,12 @@ class Giveaways {
             return interaction.editReply('No giveaway changes were provided.');
         }
 
-        const updated = await this.giveawayStore.updateGiveaway(giveawayId, updates);
+        const updated = await withGiveawayLock(giveawayId, async () => {
+            const record = await this.giveawayStore.getGiveaway(giveawayId);
+            if (!record || record.status !== GIVEAWAY_ACTIVE) return null;
+            return this.giveawayStore.updateGiveaway(giveawayId, updates);
+        });
+        if (!updated) return interaction.editReply('That active giveaway could not be found.');
         await refreshGiveawayMessage(interaction.client, this.config, updated);
         await interaction.editReply(`Updated **${giveawayDisplayLabel(updated, { guild: interaction.guild })}**.`);
     }
@@ -411,9 +414,15 @@ class Giveaways {
             announceInteraction: interaction
         });
 
+        if (ended.status !== GIVEAWAY_ENDED) {
+            return interaction.editReply('That active giveaway could not be found.');
+        }
+
         const summary = drawSummary('Ended', ended, winnerIds, interaction.guild);
-        if (interaction.replied || interaction.deferred) {
+        if (interaction.replied) {
             await interaction.followUp({ content: summary, flags: MessageFlags.Ephemeral });
+        } else if (interaction.deferred) {
+            await interaction.editReply({ content: summary });
         } else {
             await interaction.reply({ content: summary, flags: MessageFlags.Ephemeral });
         }
@@ -426,15 +435,15 @@ class Giveaways {
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const giveawayId = interaction.options.getString('giveaway', true);
-        const record = await this.giveawayStore.getGiveaway(giveawayId);
-        if (!record) {
-            return interaction.editReply('That giveaway could not be found.');
-        }
-
-        const updated = await this.giveawayStore.updateGiveaway(giveawayId, {
-            status: GIVEAWAY_DELETED,
-            deleted_at: utcNowIso()
+        const updated = await withGiveawayLock(giveawayId, async () => {
+            const record = await this.giveawayStore.getGiveaway(giveawayId);
+            if (!record) return null;
+            return this.giveawayStore.updateGiveaway(giveawayId, {
+                status: GIVEAWAY_DELETED,
+                deleted_at: utcNowIso()
+            });
         });
+        if (!updated) return interaction.editReply('That giveaway could not be found.');
         await deleteGiveawayMessage(interaction.client, this.config, updated);
         await interaction.editReply(`Deleted **${giveawayDisplayLabel(updated, { guild: interaction.guild })}**.`);
     }
@@ -455,6 +464,9 @@ class Giveaways {
         if (!record || record.status !== GIVEAWAY_ENDED) {
             return interaction.editReply('That ended giveaway could not be found.');
         }
+        if (!giveawayEndedWithinRerollWindow(record)) {
+            return interaction.editReply('That giveaway ended more than 48 hours ago and cannot be rerolled.');
+        }
 
         let winnerCount;
         try {
@@ -470,9 +482,15 @@ class Giveaways {
             announceInteraction: interaction
         });
 
+        if (rerolled.status !== GIVEAWAY_ENDED) {
+            return interaction.editReply('That ended giveaway could not be found.');
+        }
+
         const summary = drawSummary('Rerolled', rerolled, winnerIds, interaction.guild);
-        if (interaction.replied || interaction.deferred) {
+        if (interaction.replied) {
             await interaction.followUp({ content: summary, flags: MessageFlags.Ephemeral });
+        } else if (interaction.deferred) {
+            await interaction.editReply({ content: summary });
         } else {
             await interaction.reply({ content: summary, flags: MessageFlags.Ephemeral });
         }

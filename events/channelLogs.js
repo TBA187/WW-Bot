@@ -22,6 +22,29 @@ const {
 
 const channelUpdateCache = new Map();
 
+function normalizeForumLayout(value) {
+    return value === 1 || value === 2 ? value : 0;
+}
+
+function normalizeForumSortOrder(value) {
+    // Discord represents the normal "Latest Activity" default as either null or 0.
+    return value === 1 ? 1 : 0;
+}
+
+function getForumLayoutLabel(value) {
+    const layout = normalizeForumLayout(value);
+    return layout === 1 ? 'List' : (layout === 2 ? 'Gallery' : 'Not Set');
+}
+
+function getForumSortLabel(value) {
+    return normalizeForumSortOrder(value) === 1 ? 'Creation Time' : 'Latest Activity';
+}
+
+function forumReactionKey(emoji) {
+    if (!emoji) return '';
+    return `${emoji.id || ''}:${emoji.name || ''}`;
+}
+
 module.exports = {
     // ---------------------------
     // Handle Channel Creation ✅
@@ -185,7 +208,7 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
     await sleep(1500);
     let logEntry = null;
     try {
-        const fetchedLogs = await newChannel.guild.fetchAuditLogs({ limit: 15 });
+        const fetchedLogs = await newChannel.guild.fetchAuditLogs({ limit: 100 });
         logEntry = fetchedLogs.entries.find(e => {
             const isCorrectAction = [
                 AuditLogEvent.ChannelUpdate,
@@ -208,7 +231,7 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
 
     const parent = newChannel.parent ? `${newChannel.parent.name}` : '*Uncategorized!*';
     const { name: typeName, emoji: typeEmoji } = getChannelTypeInfo(newChannel.type);
-    const { name: oldTypeName, moji: oldTypeEmoji } = getChannelTypeInfo(oldChannel.type);
+    const { name: oldTypeName } = getChannelTypeInfo(oldChannel.type);
     const channelLabel = newChannel.type === ChannelType.GuildText ? 'Channel' : typeName;
     const isCategory = newChannel.type === ChannelType.GuildCategory;
 
@@ -288,23 +311,27 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
 
     // 8) Forum Channels Specifics
     if (newChannel.type === ChannelType.GuildForum) {
-        if (oldChannel.defaultForumLayout !== newChannel.defaultForumLayout) {
-            const getLayout = (l) => l === 1 ? 'List' : (l === 2 ? 'Gallery' : 'Not Set');
-            changes.push(`- **Default Layout:** \`${getLayout(oldChannel.defaultForumLayout)}\` ➔ \`${getLayout(newChannel.defaultForumLayout)}\``);
+        const oldLayout = normalizeForumLayout(oldChannel.defaultForumLayout);
+        const newLayout = normalizeForumLayout(newChannel.defaultForumLayout);
+        if (oldLayout !== newLayout) {
+            changes.push(`- **Default Layout:** \`${getForumLayoutLabel(oldLayout)}\` ➔ \`${getForumLayoutLabel(newLayout)}\``);
         }
-        if (oldChannel.defaultSortOrder !== newChannel.defaultSortOrder) {
-            const getSort = (s) => s === 0 ? 'Latest Activity' : (s === 1 ? 'Creation Time' : 'Default');
-            changes.push(`- **Default Sort Order:** \`${getSort(oldChannel.defaultSortOrder)}\` ➔ \`${getSort(newChannel.defaultSortOrder)}\``);
+        const oldSortOrder = normalizeForumSortOrder(oldChannel.defaultSortOrder);
+        const newSortOrder = normalizeForumSortOrder(newChannel.defaultSortOrder);
+        if (oldSortOrder !== newSortOrder) {
+            changes.push(`- **Default Sort Order:** \`${getForumSortLabel(oldSortOrder)}\` ➔ \`${getForumSortLabel(newSortOrder)}\``);
         }
-        if (JSON.stringify(oldChannel.defaultReactionEmoji) !== JSON.stringify(newChannel.defaultReactionEmoji)) {
+        if (forumReactionKey(oldChannel.defaultReactionEmoji) !== forumReactionKey(newChannel.defaultReactionEmoji)) {
             const oldEmoji = oldChannel.defaultReactionEmoji ? `${formatEmoji(oldChannel.defaultReactionEmoji)}` : '*No Emoji*';
             const newEmoji = newChannel.defaultReactionEmoji ? `${formatEmoji(newChannel.defaultReactionEmoji)}` : '*No Emoji*';
             changes.push(`- **Default Reaction:** ${oldEmoji} ➔ ${newEmoji}`);
         }
-        if (oldChannel.defaultThreadRateLimitPerUser !== newChannel.defaultThreadRateLimitPerUser) {
-            const oldTR = oldChannel.defaultThreadRateLimitPerUser || 'Off';
-            const newTR = newChannel.defaultThreadRateLimitPerUser || 'Off';
-            changes.push(`- **Post Slowmode:** \`${oldTR}${typeof oldTR === 'number' ? 's' : ''}\` ➔ \`${newTR}${typeof newTR === 'number' ? 's' : ''}\``);
+        const oldPostSlowmode = Number(oldChannel.defaultThreadRateLimitPerUser || 0);
+        const newPostSlowmode = Number(newChannel.defaultThreadRateLimitPerUser || 0);
+        if (oldPostSlowmode !== newPostSlowmode) {
+            const oldTR = oldPostSlowmode ? `${oldPostSlowmode}s` : 'Off';
+            const newTR = newPostSlowmode ? `${newPostSlowmode}s` : 'Off';
+            changes.push(`- **Post Slowmode:** \`${oldTR}\` ➔ \`${newTR}\``);
         }
         if ((oldChannel.flags?.has('RequireTag') || false) !== (newChannel.flags?.has('RequireTag') || false)) {
             changes.push(`- **Require tags to post:** \`${oldChannel.flags?.has('RequireTag') ? 'Enabled' : 'Disabled'}\` ➔ \`${newChannel.flags?.has('RequireTag') ? 'Enabled' : 'Disabled'}\``);
@@ -337,7 +364,7 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
     }
 
     // 10) Category Permissions Sync Status
-    if (oldChannel.permissionsLocked !== newChannel.permissionsLocked) {
+    if (Boolean(oldChannel.permissionsLocked) !== Boolean(newChannel.permissionsLocked)) {
         changes.push(`- **Category Sync:** \`${newChannel.permissionsLocked ? 'Synced with Category' : 'Custom Permissions'}\``);
     }
 
@@ -419,3 +446,6 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
 
     await logChannel.send(logPayload);
 }
+
+module.exports.normalizeForumLayout = normalizeForumLayout;
+module.exports.normalizeForumSortOrder = normalizeForumSortOrder;

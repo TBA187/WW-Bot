@@ -17,9 +17,12 @@ module.exports = {
     fetchTargetAuditLog: async (guild, actionType, targetId, maxAgeMs = 15000) => {
         if (!guild) return null;
         try {
-            // Increase limit to 10 to ensure we don't miss the entry if 
-            // multiple things happen at once.
-            const fetchedLogs = await guild.fetchAuditLogs({ limit: 10 });
+            // A busy moderation action can create far more than ten entries at once.
+            // Filtering by action lets Discord return the full recent batch for that action.
+            const fetchedLogs = await guild.fetchAuditLogs({
+                limit: 100,
+                ...(actionType ? { type: actionType } : {})
+            });
 
             return fetchedLogs.entries.find(e => {
                 // 1. Match the action type (if provided)
@@ -33,9 +36,9 @@ module.exports = {
                 // 3. THE CRITICAL FIX: Check targetId (raw string) OR extra data
                 // This covers standard Create/Delete AND the tricky Permission Overwrites
                 return (
-                    e.targetId === targetId ||
-                    e.extra?.channel?.id === targetId ||
-                    e.extra?.id === targetId
+                    String(e.targetId || e.target?.id || '') === String(targetId) ||
+                    String(e.extra?.channel?.id || '') === String(targetId) ||
+                    String(e.extra?.id || '') === String(targetId)
                 );
             });
         } catch (error) {
@@ -123,7 +126,7 @@ module.exports = {
             } else {
                 targetLabel = 'Member';
                 const member = guild.members.cache.get(id);
-                targetTag = `<@${id}> (${member.user.username})`;
+                targetTag = member ? `<@${id}> (${member.user?.username || 'Unknown User'})` : `<@${id}>`;
             }
 
             const canView = perm.allow.has('ViewChannel');

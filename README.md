@@ -80,7 +80,7 @@ Local runtime state is stored in `data/` and ignored by Git.
 
 - `data/dungeon_runs.json`: temporary dungeon fallback state.
 - `data/pvp_king_data.json`: temporary PvP King fallback state.
-- `data/giveaways.json`: temporary giveaway fallback state.
+- `data/giveaways.json`: giveaway metadata mirror, plus entries and draw history for active and recently ended giveaways. It preserves pending changes during an outage and syncs them to MySQL when the connection returns.
 - `data/guild_settings.json`: mirror of guild settings, kept populated so XP/logging settings still load during a database outage.
 - `data/notifications.json`: notification settings and member subscriptions, used during a MySQL outage and synchronized when MySQL returns.
 - `data/guild_applications.json`: forum scan checkpoint and temporary application records during a MySQL outage. In `json` mode it is the permanent local store.

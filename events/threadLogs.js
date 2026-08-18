@@ -59,8 +59,13 @@ function getPinnedState(thread) {
     return thread.flags?.has?.('Pinned') ?? false;
 }
 
+function isAutomaticArchiveUpdate(oldThread, newThread, auditEntry) {
+    return !oldThread.archived && newThread.archived && !auditEntry;
+}
+
 module.exports = {
     name: 'threadLogs',
+    isAutomaticArchiveUpdate,
 
     async handleThreadCreate(thread, config) {
         if (!thread.guild) return;
@@ -161,6 +166,10 @@ module.exports = {
 
         await sleep(2000);
         const entry = await fetchTargetAuditLog(newThread.guild, AuditLogEvent.ThreadUpdate, newThread.id, 20000);
+
+        // Skip automatic updates from Discord.
+        if (isAutomaticArchiveUpdate(oldThread, newThread, entry)) return;
+
         const executor = extractExecutor(entry, null, newThread.guild);
 
         const changes = [];

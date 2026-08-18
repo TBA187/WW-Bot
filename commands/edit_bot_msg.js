@@ -94,22 +94,24 @@ class EditBotMsg {
             return interaction.reply({ content: '### ❌  Editing bot messages is not allowed in this channel!', flags: MessageFlags.Ephemeral });
         }
 
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
         try {
             const channel = await interaction.client.channels.fetch(channelId);
             const message = await channel.messages.fetch(messageId);
 
             // Check if message is a bot message
             if (message.author.id !== interaction.client.user.id) {
-                return interaction.reply({ content: '### ❌  Only bot messages can be edited!', flags: MessageFlags.Ephemeral });
+                return interaction.editReply('### ❌  Only bot messages can be edited!');
             }
 
             await message.edit(newContent);
 
-            return interaction.reply({ content: '### ✅  Message edited!', flags: MessageFlags.Ephemeral });
+            return interaction.editReply('### ✅  Message edited!');
 
         } catch (err) {
             console.error(err);
-            return interaction.reply({ content: '### ❌  Failed to edit message.', flags: MessageFlags.Ephemeral });
+            return interaction.editReply('### ❌  Failed to edit message.');
         }
     }
 
@@ -262,7 +264,7 @@ class EditBotMsg {
             }
 
             // Prepare embeds
-            let finalEmbeds = message.embeds;
+            let finalEmbeds = null;
             let embedStatus = 'no changes';
             const trimmedEmbed = cache.embedRaw ? cache.embedRaw.trim() : '';
             if (trimmedEmbed.length > 0) {
@@ -276,10 +278,12 @@ class EditBotMsg {
                 }
             }
 
-            await message.edit({
-                content: finalContent || message.content,
-                embeds: finalEmbeds
-            });
+            const editPayload = {
+                content: finalContent || message.content
+            };
+
+            if (finalEmbeds) editPayload.embeds = finalEmbeds;
+            await message.edit(editPayload);
 
             // Ignore log events for specified channels (this.ignoredLogChannels)
             if (this.logChannelID && !this.ignoredLogChannels.includes(channel.id)) {

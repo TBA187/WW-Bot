@@ -8,6 +8,68 @@ const activeTimeouts = new Map(); // !NOTE! - Add timestamps to DB instead, to a
 
 // Short-term memory: (Key: UserID, Value: Nickname)
 const nicknameCache = new Map();
+const recentBanEvents = new Map();
+const moderationAuditFetches = new Map();
+const MODERATION_AUDIT_MAX_AGE_MS = 30000;
+const MODERATION_AUDIT_CACHE_MS = 750;
+const BAN_EVENT_CACHE_MS = 30000;
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function moderationKey(guildId, userId) {
+    return `${guildId}:${userId}`;
+}
+
+function rememberBanEvent(guildId, userId) {
+    const key = moderationKey(guildId, userId);
+    if (recentBanEvents.has(key)) return false;
+
+    recentBanEvents.set(key, Date.now());
+    const timeout = setTimeout(() => recentBanEvents.delete(key), BAN_EVENT_CACHE_MS);
+    timeout.unref?.();
+    return true;
+}
+
+function isRecentBanEvent(guildId, userId) {
+    return recentBanEvents.has(moderationKey(guildId, userId));
+}
+
+async function fetchModerationAuditLogs(guild, actionType) {
+    const key = `${guild.id}:${actionType}`;
+    const cached = moderationAuditFetches.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.promise;
+
+    const promise = guild.fetchAuditLogs({ limit: 100, type: actionType }).catch(error => {
+        moderationAuditFetches.delete(key);
+        throw error;
+    });
+    moderationAuditFetches.set(key, {
+        expiresAt: Date.now() + MODERATION_AUDIT_CACHE_MS,
+        promise
+    });
+    return promise;
+}
+
+async function findModerationAuditEntry(guild, actionType, userId, {
+    attempts = 3,
+    retryDelayMs = 750,
+    matches = () => true
+} = {}) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        const fetchedLogs = await fetchModerationAuditLogs(guild, actionType);
+        const entry = fetchedLogs.entries.find(candidate =>
+            String(candidate.targetId || candidate.target?.id || '') === String(userId) &&
+            Date.now() - candidate.createdTimestamp < MODERATION_AUDIT_MAX_AGE_MS &&
+            matches(candidate)
+        );
+        if (entry) return entry;
+
+        if (attempt + 1 < attempts) await sleep(retryDelayMs);
+    }
+    return null;
+}
 
 module.exports = {
     // --------------------------
@@ -19,20 +81,28 @@ module.exports = {
             if (!channel || !channel.isTextBased()) return;
 
             const userId = member.id;
-            const userNickame = member.displayName ?? '*Nickname not found!*';
+            const userNickname = member.displayName ?? '*Nickname not found!*';
 
             // Store Nickname immediately to pass to handleGuildBanAdd()
-            nicknameCache.set(userId, userNickame);
-            setTimeout(() => nicknameCache.delete(userId), 10000); // Delete after 10 seconds to not leak memory.
+            nicknameCache.set(userId, userNickname);
+            const nicknameTimeout = setTimeout(() => nicknameCache.delete(userId), 20000); // Keep it long enough for a busy ban batch to reach the ban event.
+            nicknameTimeout.unref?.();
 
-            // Add 1.2 second buffer to let Discord's Audit Log catch up
-            await new Promise(res => setTimeout(res, 1200));
+            // guildBanAdd can arrive before guildMemberRemove. The ban handler marks it immediately.
+            if (isRecentBanEvent(member.guild.id, userId)) return;
+
+            // Give Discord a moment to add the ban audit entry before treating this as a leave.
+            await sleep(1200);
+            if (isRecentBanEvent(member.guild.id, userId)) return;
 
             // ------- Silent Ban Check -------
-            const banLogs = await member.guild.fetchAuditLogs({ limit: 5, type: AuditLogEvent.MemberBanAdd });
-            const isBanned = banLogs.entries.find(e => e.target.id === userId && Date.now() - e.createdTimestamp < 5000);
+            const isBanned = await findModerationAuditEntry(
+                member.guild,
+                AuditLogEvent.MemberBanAdd,
+                userId
+            );
 
-            if (isBanned) return;
+            if (isBanned || isRecentBanEvent(member.guild.id, userId)) return;
             // ------- If it's a ban, STOP HERE! handleGuildBanAdd() handles the rest! -------
             // -------------------------------------------------------------------------------
 
@@ -42,14 +112,11 @@ module.exports = {
             const total = member.guild.memberCount;
 
             // ------- Check Kick -------
-            const kickLogs = await member.guild.fetchAuditLogs({
-                limit: 5,
-                type: AuditLogEvent.MemberKick,
-            });
-
-            const kickEntry = kickLogs.entries.find(
-                entry => entry.target.id === member.id &&
-                    Date.now() - entry.createdTimestamp < 5000
+            const kickEntry = await findModerationAuditEntry(
+                member.guild,
+                AuditLogEvent.MemberKick,
+                member.id,
+                { attempts: 1 }
             );
 
             if (kickEntry) {
@@ -85,12 +152,15 @@ module.exports = {
     // Handle Bans (Manual & Bot bans)
     // --------------------------------
     async handleGuildBanAdd(ban, logChannelID) {
+        // Mark this before waiting for audit logs so guildMemberRemove never creates a second leave log.
+        if (!rememberBanEvent(ban.guild.id, ban.user.id)) return;
+
         try {
             const channel = ban.guild.channels.cache.get(logChannelID);
             if (!channel || !channel.isTextBased()) return;
 
-            // Add 1.5 second buffer to let Discord's Audit Log catch up
-            await new Promise(res => setTimeout(res, 1500));
+            // Add a short buffer so the member removal event can save the server nickname.
+            await sleep(1500);
 
             // Pick up the Nickname from handleMemberRemove()
             const savedNickname = nicknameCache.get(ban.user.id) ?? '*Nickname not found!*';
@@ -98,14 +168,10 @@ module.exports = {
 
             const total = ban.guild.memberCount;
 
-            const fetchedLogs = await ban.guild.fetchAuditLogs({
-                limit: 5,
-                type: AuditLogEvent.MemberBanAdd,
-            });
-
-            const banLog = fetchedLogs.entries.find(
-                entry => entry.target.id === ban.user.id &&
-                    Date.now() - entry.createdTimestamp < 5000
+            const banLog = await findModerationAuditEntry(
+                ban.guild,
+                AuditLogEvent.MemberBanAdd,
+                ban.user.id
             );
 
             const executor = banLog?.executor;
@@ -135,20 +201,18 @@ module.exports = {
     // Handle Unbans
     // ---------------
     async handleGuildBanRemove(ban, logChannelID) {
+        recentBanEvents.delete(moderationKey(ban.guild.id, ban.user.id));
+
         try {
             const channel = ban.guild.channels.cache.get(logChannelID);
             if (!channel || !channel.isTextBased()) return;
 
-            await new Promise(res => setTimeout(res, 1000));
+            await sleep(1000);
 
-            const fetchedLogs = await ban.guild.fetchAuditLogs({
-                limit: 5,
-                type: AuditLogEvent.MemberBanRemove,
-            });
-
-            const unbanLog = fetchedLogs.entries.find(
-                entry => entry.target.id === ban.user.id &&
-                    Date.now() - entry.createdTimestamp < 5000
+            const unbanLog = await findModerationAuditEntry(
+                ban.guild,
+                AuditLogEvent.MemberBanRemove,
+                ban.user.id
             );
 
             const executor = unbanLog?.executor;
@@ -187,15 +251,13 @@ module.exports = {
 
             await new Promise(res => setTimeout(res, 2500));
 
-            const fetchedLogs = await newMember.guild.fetchAuditLogs({
-                limit: 5,
-                type: AuditLogEvent.MemberUpdate,
-            });
-
-            const timeoutLog = fetchedLogs.entries.find(
-                entry => entry.target.id === newMember.id &&
-                    entry.changes.some(c => c.key === 'communication_disabled_until') &&
-                    Date.now() - entry.createdTimestamp < 8000
+            const timeoutLog = await findModerationAuditEntry(
+                newMember.guild,
+                AuditLogEvent.MemberUpdate,
+                newMember.id,
+                {
+                    matches: entry => entry.changes?.some(change => change.key === 'communication_disabled_until')
+                }
             );
 
             const executor = timeoutLog?.executor;
@@ -282,5 +344,7 @@ module.exports = {
         } catch (err) {
             console.error('Timeout message failed:', err);
         }
-    }
+    },
+    // Exported for the audit-log tests.
+    findModerationAuditEntry
 };
