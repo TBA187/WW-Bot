@@ -4,6 +4,8 @@ process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
+const NotificationStore = require('./features/pro-notifications/NotificationStore.js');
+const { NOTIFICATION_DEFINITIONS } = require('./features/pro-notifications/notificationCatalog.js');
 const {
     createGuildApplicationMonitor,
     handleGuildForumFeedbackButton
@@ -270,6 +272,11 @@ const commandMap = new Map();
 const challengeTimeouts = new Map(); // PvP challenge confirmation timers
 const pvpKingStorage = new PvpKingStorage({ db });
 const giveawayStore = createGiveawayStore({ db });
+const notificationStore = new NotificationStore({
+    db,
+    guildId,
+    definitions: NOTIFICATION_DEFINITIONS
+});
 const guildApplicationMonitor = createGuildApplicationMonitor({ client, db, config: appConfig });
 const tbaForumShopMonitor = createTbaForumShopMonitor({ client, config: appConfig });
 
@@ -298,6 +305,7 @@ const commandConfig = {
     dungeonRoleID,
     giveawayChannelID,
     giveawayStore,
+    notificationStore,
     challengeTimeouts,
     pvpKingStorage,
     onCooldown,
@@ -319,6 +327,7 @@ async function bootstrap() {
 
         await pvpKingStorage.restore();
         await giveawayStore.restore();
+        await notificationStore.restore();
 
         // Load commands
         const commandsForDiscord = []; // JSON for the REST API
@@ -509,6 +518,7 @@ client.once(Events.ClientReady, async () => {
 
     // Check if PvP King cooldowns naturally expired (every 60 seconds)
     pvpKingStorage.startSyncLoop();
+    notificationStore.startSyncLoop();
     startGuildSettingsSyncLoop();
     // Check active Giveaways to end them on time
     startGiveawayLoop(client, commandConfig);
@@ -521,13 +531,10 @@ client.once(Events.ClientReady, async () => {
     cooldownTask.execute(client, commandConfig);
 
     // ============================================================
-    // TEMPORARY ALTO MARE REMINDER - REMOVE THESE 2 LINES LATER
+    // PRO NOTIFICATION PINGS
     // ============================================================
-    const tempSixHourRolePing = require('./tasks/tempSixHourRolePing.js');
-    tempSixHourRolePing.execute(client);
-    // ============================================================
-    // END TEMPORARY ALTO MARE REMINDER
-    // ============================================================
+    const proNotifications = require('./tasks/proNotifications.js');
+    proNotifications.execute(client, appConfig, notificationStore);
 });
 
 // Auto-Config DB settings for New Servers the bot just joined

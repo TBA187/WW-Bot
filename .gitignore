@@ -22,6 +22,8 @@ data/giveaways.json
 data/giveaways.json.tmp
 data/guild_settings.json
 data/guild_settings.json.tmp
+data/notifications.json
+data/notifications.json.tmp
 data/guild_applications.json
 data/guild_applications.json.tmp
 data/tba_forum_shops.json

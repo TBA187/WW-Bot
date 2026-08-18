@@ -52,8 +52,8 @@ Server IDs and feature IDs live in `config.json`, including:
 
 - `botTimezone`: default bot timezone. Current value is `Etc/UTC`.
 - `guildId`
-- role IDs such as `leaderRoleID`, `adminRoleID`, `officerRoleID`, `pvpKingRoleID`, and `dungeonRoleID`
-- channel IDs such as `botChannelID`, `logChannelID`, `pvpKingChannelID`, `dungeonChannelID`, and `giveawayChannelID`
+- role IDs such as `leaderRoleID`, `adminRoleID`, `officerRoleID`, `pvpKingRoleID`, `dungeonRoleID`, and `proNotificationRoleID`
+- channel IDs such as `botChannelID`, `logChannelID`, `pvpKingChannelID`, `dungeonChannelID`, `giveawayChannelID`, and `generalChannelID`
 - `officerChannelID` and `courtHouseChannelID` for guild application alerts and polls
 - `ownerID` for owner-only forum post review alerts
 - `forumGuildApplicationPage` for the PRO forum topic monitored for applications
@@ -69,6 +69,7 @@ Ready-to-run SQL files are grouped by feature in `sql/`:
 - `sql/create_dungeon_tables.sql`
 - `sql/create_giveaway_tables.sql`
 - `sql/create_guild_settings_table.sql`
+- `sql/create_notification_tables.sql`
 - `sql/create_pvp_king_tables.sql`
 - `sql/create_xp_level_tables.sql`
 - `sql/create_guild_applications_table.sql`
@@ -81,6 +82,7 @@ Local runtime state is stored in `data/` and ignored by Git.
 - `data/pvp_king_data.json`: temporary PvP King fallback state.
 - `data/giveaways.json`: temporary giveaway fallback state.
 - `data/guild_settings.json`: mirror of guild settings, kept populated so XP/logging settings still load during a database outage.
+- `data/notifications.json`: notification settings and member subscriptions, used during a MySQL outage and synchronized when MySQL returns.
 - `data/guild_applications.json`: forum scan checkpoint and temporary application records during a MySQL outage. In `json` mode it is the permanent local store.
 - `data/tba_forum_shops.json`: lightweight JSON-only checkpoints for the two TBA shop topics. It never synchronizes with MySQL.
 
