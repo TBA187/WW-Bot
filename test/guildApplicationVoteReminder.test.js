@@ -27,7 +27,7 @@ function applicationRecord(overrides = {}) {
     };
 }
 
-function createFixture({ now, record, officerCount = 5, voterIds = [], voterError = null }) {
+function createFixture({ now, record, officerCount = 5, voterIds = [], voterError = null, existingReminder = null }) {
     const saved = [];
     const sent = [];
     let candidateCalls = 0;
@@ -58,7 +58,11 @@ function createFixture({ now, record, officerCount = 5, voterIds = [], voterErro
     const court = {
         id: 'court',
         isTextBased: () => true,
-        messages: { fetch: async () => pollMessage },
+        messages: {
+            fetch: async input => typeof input === 'string'
+                ? pollMessage
+                : new Collection(existingReminder ? [[existingReminder.id, existingReminder]] : [])
+        },
         async send(payload) {
             sent.push(payload);
             return { id: `reminder-${sent.length}` };
@@ -76,6 +80,7 @@ function createFixture({ now, record, officerCount = 5, voterIds = [], voterErro
     };
     const reminder = new GuildApplicationVoteReminder({
         client: {
+            user: { id: 'bot-id' },
             guilds: { cache: new Map([['guild', guild]]), fetch: async () => guild },
             channels: { cache: new Map([['court', court]]), fetch: async () => court }
         },
@@ -153,6 +158,29 @@ test('poll fetch failures leave the reminder stage unchecked for a later retry',
 
     assert.equal(fixture.sent.length, 0);
     assert.equal(fixture.saved.length, 0);
+});
+
+test('recovers an already-sent vote reminder after a crash without pinging twice', async () => {
+    const record = applicationRecord();
+    const existingReminder = {
+        id: 'existing-reminder',
+        author: { id: 'bot-id' },
+        content: `It has been **12 hours** ${record.pollMessageUrl}`,
+        embeds: []
+    };
+    const fixture = createFixture({
+        now: '2026-07-13T12:00:00.000Z',
+        record,
+        officerCount: 5,
+        voterIds: ['officer-1'],
+        existingReminder
+    });
+
+    await fixture.reminder.runOnce();
+
+    assert.equal(fixture.sent.length, 0);
+    assert.equal(fixture.saved[0].voteReminder12hMessageId, 'existing-reminder');
+    assert.equal(fixture.saved[0].voteReminder12hCheckedAt, '2026-07-13T12:00:00.000Z');
 });
 
 test('overlapping runs share the running guard', async () => {

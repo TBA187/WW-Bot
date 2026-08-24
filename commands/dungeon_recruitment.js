@@ -14,6 +14,7 @@ const {
 const fs = require('fs');
 const path = require('path');
 const { writeJsonIfChanged } = require('../utils/jsonFile.js');
+const { findRecentBotMessage } = require('../utils/discordMessageHistory.js');
 
 const DUNGEON_RUNS_DATA_DIR = path.join(__dirname, '../data');
 const DUNGEON_RUNS_FILE = path.join(DUNGEON_RUNS_DATA_DIR, 'dungeon_runs.json');
@@ -219,6 +220,7 @@ class DungeonRecruitment {
         this.activeRuns = new Map();
         this.pendingStorageWrite = Promise.resolve();
         this.storageSyncInterval = null;
+        this.mysqlOutage = false;
         // STORAGE_MODE: auto = MySQL with JSON fallback, mysql = prefer MySQL with JSON fallback, json = local JSON only.
         this.storageMode = this.parseStorageMode(process.env.STORAGE_MODE);
         this.dungeonChannelID = config.dungeonChannelID;
@@ -354,6 +356,37 @@ class DungeonRecruitment {
 
     canUseMysql() {
         return this.storageMode !== 'json' && this.db && this.hasMysqlCredentials();
+    }
+
+    noteMysqlFailure(err) {
+        if (this.db?.isDatabaseUnavailableError && !this.db.isDatabaseUnavailableError(err)) {
+            console.error('[WW LOG] Unexpected MySQL Dungeon storage error:', err);
+            return;
+        }
+        if (this.mysqlOutage) return;
+        this.mysqlOutage = true;
+        const errorCode = this.db?.getErrorCode?.(err) || err?.causeCode || err?.code || err?.message || err;
+        console.warn(
+            `[WW LOG] MySQL Dungeon storage unavailable (${errorCode}). ` +
+            'Using JSON; pending runs will synchronize automatically.'
+        );
+    }
+
+    noteMysqlRestored() {
+        if (!this.mysqlOutage) return;
+        this.mysqlOutage = false;
+        console.log('[WW LOG] MySQL Dungeon storage restored; pending JSON runs are synchronizing.');
+    }
+
+    async mysqlQuery(sql, params = []) {
+        try {
+            const result = await this.db.query(sql, params);
+            this.noteMysqlRestored();
+            return result;
+        } catch (err) {
+            this.noteMysqlFailure(err);
+            throw err;
+        }
     }
 
     getRunStatus(run) {
@@ -615,7 +648,7 @@ class DungeonRecruitment {
         if (!this.canUseMysql()) return false;
 
         try {
-            const [rows] = await this.db.query(`
+            const [rows] = await this.mysqlQuery(`
                 SELECT *
                 FROM dungeon_runs
                 WHERE status = 'open'
@@ -630,13 +663,13 @@ class DungeonRecruitment {
 
             return true;
         } catch (err) {
-            console.warn(`[WW LOG] Failed to load Dungeon runs from MySQL. Using JSON fallback if available: ${err.code || err.message}`);
+            this.noteMysqlFailure(err);
             return false;
         }
     }
 
     async upsertMysqlRun(storedRun, storageOrigin = 'mysql') {
-        await this.db.query(`
+        await this.mysqlQuery(`
             INSERT INTO dungeon_runs (
                 run_id, guild_id, channel_id, message_id, message_url,
                 party_leader_id, party_leader_name,
@@ -663,9 +696,9 @@ class DungeonRecruitment {
                 assignments = VALUES(assignments),
                 member_names = VALUES(member_names),
                 join_order = VALUES(join_order),
-                status = VALUES(status),
-                close_reason = VALUES(close_reason),
-                closed_at_ms = VALUES(closed_at_ms),
+                status = IF(dungeon_runs.status = 'closed' AND VALUES(status) = 'open', dungeon_runs.status, VALUES(status)),
+                close_reason = IF(dungeon_runs.status = 'closed' AND VALUES(status) = 'open', dungeon_runs.close_reason, VALUES(close_reason)),
+                closed_at_ms = IF(dungeon_runs.status = 'closed' AND VALUES(status) = 'open', dungeon_runs.closed_at_ms, VALUES(closed_at_ms)),
                 created_at_ms = VALUES(created_at_ms),
                 reminder_counter = VALUES(reminder_counter),
                 reminders_enabled = VALUES(reminders_enabled),
@@ -727,10 +760,7 @@ class DungeonRecruitment {
             }
             this.writeJsonStore([], JSON_SOURCES.MYSQL_FALLBACK, false);
         } catch (err) {
-            const warning = this.storageMode === 'mysql'
-                ? '[WW LOG] MySQL Dungeon storage failed. Falling back to JSON even though STORAGE_MODE=mysql:'
-                : '[WW LOG] MySQL Dungeon storage unavailable. Falling back to JSON:';
-            console.warn(warning, err.code || err.message);
+            this.noteMysqlFailure(err);
             this.writeJsonStore(this.mergeFallbackRuns(extraRun), JSON_SOURCES.MYSQL_FALLBACK, true);
         }
     }
@@ -755,7 +785,7 @@ class DungeonRecruitment {
 
         this.storageSyncInterval = setInterval(() => {
             this.syncFallbackRuns().catch(err => {
-                console.warn('[WW LOG] Dungeon fallback sync failed:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
         }, STORAGE_SYNC_INTERVAL_MS);
 
@@ -1494,12 +1524,33 @@ class DungeonRecruitment {
         }
 
         try {
-            await channel.send({
-                content,
-                embeds: [this.buildCloseOverviewEmbed(run)],
-                files: [createFooterLogoAttachment()],
-                allowedMentions: { users: uniqueUserIds }
-            });
+            let existingCloseMessage = null;
+            try {
+                existingCloseMessage = await findRecentBotMessage(channel, {
+                    botUserId: client.user?.id,
+                    needles: [
+                        `<@${run.partyLeaderId}>`,
+                        formatDiscordTime(run.startTime),
+                        reason === 'full' ? 'Recruitment for' : 'recruitment deadline'
+                    ]
+                });
+            } catch (err) {
+                console.warn(
+                    `[WW LOG] Could not check recent Dungeon close messages for run ${run.id}: `
+                    + `${err.code || err.message}`
+                );
+            }
+
+            if (existingCloseMessage) {
+                console.log(`[WW LOG] Recovered close notification for Dungeon run ${run.id}; duplicate send skipped.`);
+            } else {
+                await channel.send({
+                    content,
+                    embeds: [this.buildCloseOverviewEmbed(run)],
+                    files: [createFooterLogoAttachment()],
+                    allowedMentions: { users: uniqueUserIds }
+                });
+            }
         } finally {
             this.activeRuns.delete(runId);
             this.saveRuns(run);

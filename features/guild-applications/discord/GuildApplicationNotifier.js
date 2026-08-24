@@ -3,6 +3,7 @@
 // Posts complete applications for Officers, then creates and cross-links the Court House poll.
 const path = require('path');
 const { EmbedBuilder } = require('discord.js');
+const { findRecentBotMessage } = require('../../../utils/discordMessageHistory.js');
 const { TOPIC_URL } = require('../constants.js');
 const {
     extractNarrativeDetails,
@@ -234,9 +235,43 @@ class GuildApplicationNotifier {
         return channel.messages.fetch(messageId).catch(() => null);
     }
 
+    async findRecoveredMessage(channel, needles, label, postId) {
+        try {
+            const message = await findRecentBotMessage(channel, {
+                botUserId: this.client.user?.id,
+                needles
+            });
+            if (message) {
+                console.log(`[WW LOG] Recovered ${label} for Guild Application forum post ${postId || 'unknown'}; duplicate send skipped.`);
+            }
+            return message;
+        } catch (error) {
+            console.warn(
+                `[WW LOG] Could not check recent Discord messages for Guild Application ${postId || 'unknown'} ${label}: `
+                + `${error.code || error.message}`
+            );
+            return null;
+        }
+    }
+
     async notify(record, options = {}) {
         const officerChannel = await this.getTextChannel(this.officerChannelId, 'Officer');
         let officerMessage = await this.fetchExistingMessage(officerChannel, record.officerMessageId);
+        if (!officerMessage) {
+            officerMessage = await this.findRecoveredMessage(
+                officerChannel,
+                [record.postUrl, 'a new application to join White Walkers'],
+                'Officer alert',
+                record.postId
+            );
+            if (officerMessage) {
+                record.officerMessageId = officerMessage.id;
+                record.officerMessageUrl = officerMessage.url
+                    || messageUrl(this.guildId, officerChannel.id, officerMessage.id);
+                record.notificationStatus = 'officer_sent';
+                if (options.onOfficerMessage) await options.onOfficerMessage(record);
+            }
+        }
 
         if (!officerMessage) {
             const visualPayload = options.useRawApplicationFallback
@@ -263,6 +298,14 @@ class GuildApplicationNotifier {
         const courtChannel = await this.getTextChannel(this.courtChannelId, 'Court House');
         let pollMessage = await this.fetchExistingMessage(courtChannel, record.pollMessageId);
         try {
+            if (!pollMessage) {
+                pollMessage = await this.findRecoveredMessage(
+                    courtChannel,
+                    [record.postUrl, `Guild Application from **${record.ign}:**`],
+                    'Court House poll',
+                    record.postId
+                );
+            }
             if (!pollMessage) {
                 pollMessage = await courtChannel.send({
                     content: this.courtContent(record, record.officerMessageUrl),

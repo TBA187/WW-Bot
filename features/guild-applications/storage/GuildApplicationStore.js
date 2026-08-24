@@ -81,6 +81,57 @@ function isVoteReminderCandidate(record, now = new Date()) {
     return !record.voteReminder12hCheckedAt;
 }
 
+const TERMINAL_NOTIFICATION_STATUSES = new Set([
+    'not_required',
+    'notified',
+    'notified_no_poll',
+    'notified_poll_failed',
+    'non_application_alert_sent'
+]);
+
+function notificationProgress(record = {}) {
+    if (TERMINAL_NOTIFICATION_STATUSES.has(record.notificationStatus) || record.notifiedAt) return 4;
+    if (record.pollMessageId || record.pollMessageUrl) return 3;
+    if (record.notificationStatus === 'officer_sent' || record.officerMessageId || record.officerMessageUrl) return 2;
+    return 1;
+}
+
+function mergeReminderState(target, incoming, existing, checkedField, messageField) {
+    const incomingTime = Date.parse(incoming?.[checkedField] || '');
+    const existingTime = Date.parse(existing?.[checkedField] || '');
+    const useExisting = Number.isFinite(existingTime)
+        && (!Number.isFinite(incomingTime) || existingTime >= incomingTime);
+    const primary = useExisting ? existing : incoming;
+    const secondary = useExisting ? incoming : existing;
+    target[checkedField] = primary?.[checkedField] || secondary?.[checkedField] || null;
+    target[messageField] = primary?.[messageField] || secondary?.[messageField] || null;
+}
+
+function mergeDeliveryState(incoming = {}, existing = {}) {
+    const useExisting = notificationProgress(existing) >= notificationProgress(incoming);
+    const primary = useExisting ? existing : incoming;
+    const secondary = useExisting ? incoming : existing;
+    const merged = { ...existing, ...incoming };
+
+    merged.notificationStatus = primary.notificationStatus || secondary.notificationStatus || 'not_required';
+    for (const field of [
+        'officerMessageId',
+        'officerMessageUrl',
+        'pollMessageId',
+        'pollMessageUrl',
+        'pollCreatedAt',
+        'notifiedAt'
+    ]) {
+        merged[field] = primary[field] || secondary[field] || null;
+    }
+    merged.lastError = notificationProgress(primary) >= 4
+        ? null
+        : (primary.lastError || secondary.lastError || null);
+    mergeReminderState(merged, incoming, existing, 'voteReminder12hCheckedAt', 'voteReminder12hMessageId');
+    mergeReminderState(merged, incoming, existing, 'voteReminder18hCheckedAt', 'voteReminder18hMessageId');
+    return merged;
+}
+
 class GuildApplicationStore {
     constructor(options = {}) {
         this.db = options.db;
@@ -334,13 +385,32 @@ class GuildApplicationStore {
         });
     }
 
+    async mysqlRecordsByPostId(postIds) {
+        const ids = [...new Set((postIds || []).map(String).filter(Boolean))];
+        const records = new Map();
+        for (let index = 0; index < ids.length; index += 500) {
+            const chunk = ids.slice(index, index + 500);
+            const [rows] = await this.db.query(
+                `SELECT * FROM guild_applications WHERE post_id IN (${chunk.map(() => '?').join(', ')})`,
+                chunk
+            );
+            for (const row of rows) records.set(String(row.post_id), this.rowToRecord(row));
+        }
+        return records;
+    }
+
     noteMysqlFailure(error) {
+        if (this.db?.isDatabaseUnavailableError && !this.db.isDatabaseUnavailableError(error)) {
+            console.error('[WW LOG] Unexpected MySQL Guild Application storage error:', error);
+            return;
+        }
         if (this.mysqlOutage) return;
         this.mysqlOutage = true;
         const prefix = this.storageMode === 'mysql'
             ? '[WW LOG] MySQL Guild Application storage failed in STORAGE_MODE=mysql. Using JSON fallback:'
             : '[WW LOG] MySQL Guild Application storage unavailable. Using JSON fallback:';
-        console.warn(prefix, error?.code || error?.message || error);
+        const errorCode = this.db?.getErrorCode?.(error) || error?.causeCode || error?.code || error?.message || error;
+        console.warn(prefix, errorCode);
     }
 
     noteMysqlRestored() {
@@ -443,7 +513,11 @@ class GuildApplicationStore {
         if (data.source !== JSON_SOURCES.MYSQL_FALLBACK || !data.pendingSync || !data.records.length) return false;
         if (!this.canUseMysql()) throw new Error('MySQL is not configured for Guild Application synchronization.');
 
-        const records = data.records.map(record => ({ ...record, storageOrigin: JSON_SOURCES.MYSQL_FALLBACK }));
+        const existingById = await this.mysqlRecordsByPostId(data.records.map(record => record.postId));
+        const records = data.records.map(record => ({
+            ...mergeDeliveryState(record, existingById.get(String(record.postId))),
+            storageOrigin: JSON_SOURCES.MYSQL_FALLBACK
+        }));
         await this.upsertMysqlRecords(records);
         data.records = [];
         data.pendingSync = false;
@@ -782,6 +856,7 @@ module.exports = {
     GuildApplicationStore,
     fromSqlDate,
     isVoteReminderCandidate,
+    mergeDeliveryState,
     normalizeUserKey,
     normalizeImageUrl,
     isDecorativeImageUrl,

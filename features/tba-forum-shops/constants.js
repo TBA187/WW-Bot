@@ -4,7 +4,7 @@
 const path = require('path');
 
 module.exports = Object.freeze({
-    DATA_VERSION: 1,
+    DATA_VERSION: 2,
     DEFAULT_DATA_FILE: path.join(process.cwd(), 'data', 'tba_forum_shops.json'),
     EMBED_COLOR: 0x1bb4c5,
     SHOP_EMBED_COLORS: Object.freeze({

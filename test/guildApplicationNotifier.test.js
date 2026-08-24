@@ -127,6 +127,54 @@ test('still alerts Officers but skips the poll when IGN is unreliable', async ()
     assert.equal(updated.notificationStatus, 'notified_no_poll');
 });
 
+test('recovers already-sent application and poll messages after a crash without sending duplicates', async () => {
+    const sent = [];
+    const postUrl = 'https://example.com/forum/#findComment-101';
+    const officer = fakeChannel('officer-channel', sent);
+    const court = fakeChannel('court-channel', sent);
+    const officerMessage = fakeMessage('existing-officer', officer);
+    officerMessage.author = { id: 'bot-id' };
+    officerMessage.url = 'https://discord.com/existing-officer';
+    officerMessage.content = `a new application to join White Walkers ${postUrl}`;
+    const pollMessage = fakeMessage('existing-poll', court);
+    pollMessage.author = { id: 'bot-id' };
+    pollMessage.url = 'https://discord.com/existing-poll';
+    pollMessage.content = `Guild Application from **ApplicantIGN:** ${postUrl}`;
+    officer.messages.fetch = async input => typeof input === 'string' ? null : new Map([[officerMessage.id, officerMessage]]);
+    court.messages.fetch = async input => typeof input === 'string' ? null : new Map([[pollMessage.id, pollMessage]]);
+    const channels = new Map([[officer.id, officer], [court.id, court]]);
+    const notifier = new GuildApplicationNotifier({
+        client: {
+            user: { id: 'bot-id' },
+            channels: { cache: channels, fetch: async id => channels.get(id) }
+        },
+        guildId: 'guild',
+        officerChannelID: officer.id,
+        courtHouseChannelID: court.id,
+        officerRoleID: 'officer-role'
+    });
+    let officerSaved = 0;
+    let pollSaved = 0;
+
+    const updated = await notifier.notify({
+        postId: '101',
+        postUrl,
+        ign: 'ApplicantIGN',
+        ignConfidence: 0.98,
+        imageUrls: []
+    }, {
+        onOfficerMessage: async () => { officerSaved += 1; },
+        onPollMessage: async () => { pollSaved += 1; }
+    });
+
+    assert.equal(sent.length, 0);
+    assert.equal(officerSaved, 1);
+    assert.equal(pollSaved, 1);
+    assert.equal(updated.officerMessageId, 'existing-officer');
+    assert.equal(updated.pollMessageId, 'existing-poll');
+    assert.equal(updated.notificationStatus, 'notified');
+});
+
 test('low-extraction fallback shows one raw Guild Application field', async () => {
     const sent = [];
     const officer = fakeChannel('officer-channel', sent);

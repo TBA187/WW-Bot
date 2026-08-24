@@ -36,7 +36,11 @@ function createTbaForumShopMonitor(options = {}) {
             fetch: options.fetch
         })
     }));
-    const store = options.store || new TbaForumShopStore({ dataFile: options.dataFile });
+    const store = options.store || new TbaForumShopStore({
+        db: options.db,
+        storageMode: options.storageMode,
+        dataFile: options.dataFile
+    });
     const notifier = options.notifier || new TbaForumShopNotifier({
         client: options.client,
         ownerID: config.ownerID,

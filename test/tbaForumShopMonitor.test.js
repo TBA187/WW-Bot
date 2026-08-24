@@ -38,7 +38,7 @@ test('first scan is silent, new customer posts send DMs, and Tba7 posts are skip
         }
     };
     const store = new TbaForumShopStore({ dataFile: tempFile() });
-    store.initialize([shop]);
+    await store.initialize([shop]);
     const monitor = new TbaForumShopMonitor({
         shops: [shop],
         store,
@@ -56,7 +56,7 @@ test('first scan is silent, new customer posts send DMs, and Tba7 posts are skip
     posts.push(post(102, 'TBA7'));
     await monitor.runOnce();
     assert.deepEqual(notifications, [['forumShop', '101']]);
-    assert.equal(store.getShop('forumShop').lastSeenPostId, '102');
+    assert.equal((await store.getShop('forumShop')).lastSeenPostId, '102');
 });
 
 test('disabled shop notifications create the JSON file without fetching the forum', async () => {
@@ -102,7 +102,7 @@ test('monitor catches up on every page added while the bot was offline', async (
         }
     };
     const store = new TbaForumShopStore({ dataFile: tempFile() });
-    store.initialize([shop]);
+    await store.initialize([shop]);
     const monitor = new TbaForumShopMonitor({
         shops: [shop],
         store,
@@ -117,8 +117,8 @@ test('monitor catches up on every page added while the bot was offline', async (
     await monitor.runOnce();
 
     assert.deepEqual(notifications, ['101', '102']);
-    assert.equal(store.getShop('dungeonShop').lastSeenPostId, '102');
-    assert.equal(store.getShop('dungeonShop').lastPage, 3);
+    assert.equal((await store.getShop('dungeonShop')).lastSeenPostId, '102');
+    assert.equal((await store.getShop('dungeonShop')).lastPage, 3);
 });
 
 test('monitor finds the saved post again when the forum page size changes', async () => {
@@ -150,7 +150,7 @@ test('monitor finds the saved post again when the forum page size changes', asyn
         }
     };
     const store = new TbaForumShopStore({ dataFile: tempFile() });
-    store.initialize([shop]);
+    await store.initialize([shop]);
     const monitor = new TbaForumShopMonitor({
         shops: [shop],
         store,
@@ -163,8 +163,8 @@ test('monitor finds the saved post again when the forum page size changes', asyn
     await monitor.runOnce();
 
     assert.deepEqual(notifications, ['301', '302']);
-    assert.equal(store.getShop('forumShop').lastSeenPostId, '302');
-    assert.equal(store.getShop('forumShop').lastPage, 2);
+    assert.equal((await store.getShop('forumShop')).lastSeenPostId, '302');
+    assert.equal((await store.getShop('forumShop')).lastPage, 2);
 });
 
 test('an unreadable page leaves the saved checkpoint unchanged', async () => {
@@ -184,7 +184,7 @@ test('an unreadable page leaves the saved checkpoint unchanged', async () => {
         }
     };
     const store = new TbaForumShopStore({ dataFile: tempFile() });
-    store.initialize([shop]);
+    await store.initialize([shop]);
     const monitor = new TbaForumShopMonitor({
         shops: [shop],
         store,
@@ -197,8 +197,8 @@ test('an unreadable page leaves the saved checkpoint unchanged', async () => {
     posts.push(post(101, 'Buyer'));
     await monitor.runOnce();
 
-    assert.equal(store.getShop('forumShop').lastSeenPostId, '100');
-    assert.equal(store.getShop('forumShop').lastPage, 1);
+    assert.equal((await store.getShop('forumShop')).lastSeenPostId, '100');
+    assert.equal((await store.getShop('forumShop')).lastPage, 1);
 });
 
 test('failed DMs leave the post pending for the next scan', async () => {
@@ -215,7 +215,7 @@ test('failed DMs leave the post pending for the next scan', async () => {
         }
     };
     const store = new TbaForumShopStore({ dataFile: tempFile() });
-    store.initialize([shop]);
+    await store.initialize([shop]);
     const monitor = new TbaForumShopMonitor({
         shops: [shop],
         store,
@@ -231,11 +231,11 @@ test('failed DMs leave the post pending for the next scan', async () => {
     await monitor.runOnce();
     posts.push(post(101, 'Buyer'));
     await monitor.runOnce();
-    assert.equal(store.getShop('forumShop').lastSeenPostId, '100');
+    assert.equal((await store.getShop('forumShop')).lastSeenPostId, '100');
 
     await monitor.runOnce();
     assert.equal(attempts, 2);
-    assert.equal(store.getShop('forumShop').lastSeenPostId, '101');
+    assert.equal((await store.getShop('forumShop')).lastSeenPostId, '101');
 });
 
 test('each shop backs off independently after a forum failure', async () => {
@@ -257,7 +257,7 @@ test('each shop backs off independently after a forum failure', async () => {
         return { page: 1, lastPage: 1, posts: [post(100, 'Tba7')] };
     });
     const store = new TbaForumShopStore({ dataFile: tempFile() });
-    store.initialize([forumShop, dungeonShop]);
+    await store.initialize([forumShop, dungeonShop]);
     const monitor = new TbaForumShopMonitor({
         shops: [forumShop, dungeonShop],
         store,

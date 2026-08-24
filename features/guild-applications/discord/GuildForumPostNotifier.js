@@ -15,6 +15,7 @@ const {
     formatSubmittedDate,
     logoFile
 } = require('./GuildApplicationNotifier.js');
+const { findRecentBotMessage } = require('../../../utils/discordMessageHistory.js');
 const { TOPIC_URL } = require('../constants.js');
 
 const NOT_AVAILABLE = '*N/A*';
@@ -97,6 +98,26 @@ class GuildForumPostNotifier {
     async notify(record) {
         if (!this.ownerId) throw new Error('Owner ID is not configured for forum post alerts.');
         const officerChannel = await this.getOfficerChannel();
+        try {
+            const existing = await findRecentBotMessage(officerChannel, {
+                botUserId: this.client.user?.id,
+                needles: [record.postUrl, 'classified as a valid guild application']
+            });
+            if (existing) {
+                console.log(`[WW LOG] Recovered non-application alert for forum post ${record.postId}; duplicate send skipped.`);
+                record.notificationStatus = 'non_application_alert_sent';
+                record.notifiedAt = record.notifiedAt || existing.createdAt?.toISOString?.() || new Date().toISOString();
+                record.officerMessageId = existing.id;
+                record.officerMessageUrl = existing.url || null;
+                record.lastError = null;
+                return { record, message: existing };
+            }
+        } catch (error) {
+            console.warn(
+                `[WW LOG] Could not check recent Officer messages for duplicate forum post ${record.postId || 'unknown'}: `
+                + `${error.code || error.message}`
+            );
+        }
         const message = await officerChannel.send({
             content: this.content(record),
             embeds: [this.embed(record)],
@@ -106,6 +127,8 @@ class GuildForumPostNotifier {
         });
         record.notificationStatus = 'non_application_alert_sent';
         record.notifiedAt = new Date().toISOString();
+        record.officerMessageId = message.id;
+        record.officerMessageUrl = message.url || null;
         record.lastError = null;
         return { record, message };
     }

@@ -1,5 +1,5 @@
 // ======================================
-// /test to retrieve member Discord Info
+// /test to retrieve member Discord Info (filename avoids Node test discovery)
 // ======================================
 const { SlashCommandBuilder, MessageFlags, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 

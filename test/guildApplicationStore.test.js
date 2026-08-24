@@ -5,7 +5,10 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { GuildApplicationStore } = require('../features/guild-applications/storage/GuildApplicationStore.js');
+const {
+    GuildApplicationStore,
+    mergeDeliveryState
+} = require('../features/guild-applications/storage/GuildApplicationStore.js');
 
 function tempFile() {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-guild-applications-'));
@@ -165,6 +168,47 @@ test('successful live synchronization clears fallback records but preserves chec
     assert.equal(data.initialized, true);
     assert.equal(data.checkpoint.lastPage, 11);
     assert.equal(data.checkpoint.lastPostId, '300');
+});
+
+test('fallback synchronization cannot regress a delivered application to pending', () => {
+    const merged = mergeDeliveryState(
+        { ...record('350'), notificationStatus: 'pending' },
+        {
+            ...record('350'),
+            notificationStatus: 'notified',
+            officerMessageId: 'officer-message',
+            officerMessageUrl: 'https://discord.com/officer-message',
+            pollMessageId: 'poll-message',
+            pollMessageUrl: 'https://discord.com/poll-message',
+            pollCreatedAt: '2026-07-13T12:05:00.000Z',
+            notifiedAt: '2026-07-13T12:06:00.000Z'
+        }
+    );
+
+    assert.equal(merged.notificationStatus, 'notified');
+    assert.equal(merged.officerMessageId, 'officer-message');
+    assert.equal(merged.pollMessageId, 'poll-message');
+    assert.equal(merged.notifiedAt, '2026-07-13T12:06:00.000Z');
+});
+
+test('fallback synchronization keeps the newest vote-reminder checkpoint independently', () => {
+    const merged = mergeDeliveryState(
+        {
+            ...record('375'),
+            notificationStatus: 'notified',
+            voteReminder12hCheckedAt: '2026-07-13T12:00:00.000Z',
+            voteReminder12hMessageId: 'fallback-reminder'
+        },
+        {
+            ...record('375'),
+            notificationStatus: 'notified',
+            voteReminder12hCheckedAt: '2026-07-13T12:05:00.000Z',
+            voteReminder12hMessageId: 'mysql-reminder'
+        }
+    );
+
+    assert.equal(merged.voteReminder12hCheckedAt, '2026-07-13T12:05:00.000Z');
+    assert.equal(merged.voteReminder12hMessageId, 'mysql-reminder');
 });
 
 test('json storage returns only active 12-hour and 18-hour vote reminder candidates', async () => {

@@ -387,6 +387,23 @@ function giveawayNeedsRecoveryCache(giveaway, now = new Date()) {
     return Boolean(endedAt && endedAt.getTime() >= now.getTime() - GIVEAWAY_RECOVERY_WINDOW_MS);
 }
 
+function mergeGiveawaySyncState(localGiveaway, mysqlGiveaway) {
+    if (!mysqlGiveaway) return clone(localGiveaway);
+    if (!localGiveaway) return clone(mysqlGiveaway);
+
+    const rank = status => {
+        if (status === GIVEAWAY_DELETED) return 2;
+        if (status === GIVEAWAY_ENDED) return 1;
+        return 0;
+    };
+    const localRank = rank(normalizeStatus(localGiveaway.status));
+    const mysqlRank = rank(normalizeStatus(mysqlGiveaway.status));
+
+    // Once MySQL has a final draw/deletion, a stale active fallback must never reopen it.
+    if (mysqlRank > localRank || (mysqlRank > 0 && mysqlRank === localRank)) return clone(mysqlGiveaway);
+    return clone(localGiveaway);
+}
+
 class GiveawayStore {
     constructor({ db, storageMode = process.env.STORAGE_MODE, dataFile = DEFAULT_DATA_FILE } = {}) {
         this.db = db;
@@ -402,6 +419,7 @@ class GiveawayStore {
         this.queue = Promise.resolve();
         this.queueDepth = 0;
         this.syncPromise = null;
+        this.mysqlOutage = false;
     }
 
     getJsonSource() {
@@ -414,6 +432,37 @@ class GiveawayStore {
 
     canUseMysql() {
         return this.storageMode !== 'json' && this.db && this.hasMysqlConfig();
+    }
+
+    noteMysqlFailure(err) {
+        if (this.db?.isDatabaseUnavailableError && !this.db.isDatabaseUnavailableError(err)) {
+            console.error('[WW LOG] Unexpected MySQL giveaway storage error:', err);
+            return;
+        }
+        if (this.mysqlOutage) return;
+        this.mysqlOutage = true;
+        const errorCode = this.db?.getErrorCode?.(err) || err?.causeCode || err?.code || err?.message || err;
+        console.warn(
+            `[WW LOG] MySQL giveaway storage unavailable (${errorCode}). ` +
+            'Using the local recovery cache; writes will queue in JSON for synchronization.'
+        );
+    }
+
+    noteMysqlRestored() {
+        if (!this.mysqlOutage) return;
+        this.mysqlOutage = false;
+        console.log('[WW LOG] MySQL giveaway storage restored; pending JSON data will synchronize automatically.');
+    }
+
+    async mysqlQuery(sql, params = []) {
+        try {
+            const result = await this.db.query(sql, params);
+            this.noteMysqlRestored();
+            return result;
+        } catch (err) {
+            this.noteMysqlFailure(err);
+            throw err;
+        }
     }
 
     enqueue(task) {
@@ -444,10 +493,10 @@ class GiveawayStore {
         this.local.source = JSON_SOURCES.MYSQL_FALLBACK;
         if (this.canUseMysql()) {
             await this.syncPending().catch(err => {
-                console.warn('[WW LOG] Giveaway fallback sync unavailable at startup:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
             await this.warmRecoveryCache().catch(err => {
-                console.warn('[WW LOG] Giveaway cache warmup unavailable at startup:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
         }
         this.writeJsonStore();
@@ -568,7 +617,7 @@ class GiveawayStore {
                 this.clearPending('pendingSyncGiveawayIds', giveawayId);
                 return this.localSaveGiveaway(giveawayId, saved, false);
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway save unavailable. Using JSON fallback:', err.code || err.message);
+                this.noteMysqlFailure(err);
                 return this.localSaveGiveaway(giveawayId, saved, true);
             }
         });
@@ -591,7 +640,7 @@ class GiveawayStore {
             this.clearPending('pendingSyncGiveawayIds', giveawayId);
             return this.localSaveGiveaway(giveawayId, saved, false);
         } catch (err) {
-            console.warn('[WW LOG] MySQL giveaway update unavailable. Using JSON fallback:', err.code || err.message);
+            this.noteMysqlFailure(err);
             return this.localSaveGiveaway(giveawayId, saved, true);
         }
     }
@@ -614,7 +663,7 @@ class GiveawayStore {
                 if (giveaway) this.cacheGiveaway(giveaway);
                 return giveaway;
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway read unavailable. Using local cache:', err.code || err.message);
+                this.noteMysqlFailure(err);
             }
         }
 
@@ -635,7 +684,7 @@ class GiveawayStore {
                 if (result[1]) this.cacheGiveaway(result[1]);
                 return result;
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway lookup unavailable. Using local cache:', err.code || err.message);
+                this.noteMysqlFailure(err);
             }
         }
 
@@ -655,7 +704,7 @@ class GiveawayStore {
                 giveaways.forEach(giveaway => this.cacheGiveaway(giveaway));
                 loadedFromMysql = true;
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway list unavailable. Using local cache:', err.code || err.message);
+                this.noteMysqlFailure(err);
             }
         }
 
@@ -689,7 +738,7 @@ class GiveawayStore {
                 this.clearPending('pendingSyncEntryIds', entryKey(giveawayId, userId));
                 return this.localSaveEntry(giveawayId, userId, saved, false);
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway entry save unavailable. Using JSON fallback:', err.code || err.message);
+                this.noteMysqlFailure(err);
                 return this.localSaveEntry(giveawayId, userId, saved, true);
             }
         });
@@ -709,7 +758,7 @@ class GiveawayStore {
                 if (entry) this.cacheEntry(entry);
                 return entry;
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway entry read unavailable. Using local cache:', err.code || err.message);
+                this.noteMysqlFailure(err);
             }
         }
 
@@ -727,7 +776,7 @@ class GiveawayStore {
                 entries.forEach(entry => this.cacheEntry(entry));
                 loadedFromMysql = true;
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway entries unavailable. Using local cache:', err.code || err.message);
+                this.noteMysqlFailure(err);
             }
         }
 
@@ -753,7 +802,7 @@ class GiveawayStore {
                 this.clearPending('pendingSyncDrawIds', drawId);
                 return this.localSaveDraw(drawId, saved, false);
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway draw save unavailable. Using JSON fallback:', err.code || err.message);
+                this.noteMysqlFailure(err);
                 return this.localSaveDraw(drawId, saved, true);
             }
         });
@@ -769,7 +818,7 @@ class GiveawayStore {
                 draws.forEach(draw => this.cacheDraw(draw));
                 loadedFromMysql = true;
             } catch (err) {
-                console.warn('[WW LOG] MySQL giveaway draws unavailable. Using fallback:', err.code || err.message);
+                this.noteMysqlFailure(err);
             }
         }
         if (!loadedFromMysql) {
@@ -824,9 +873,11 @@ class GiveawayStore {
         this.local.source = JSON_SOURCES.MYSQL_FALLBACK;
 
         for (const giveawayId of [...(this.local.pendingSyncGiveawayIds || [])]) {
-            const giveaway = this.local.giveaways[giveawayId];
-            if (!giveaway) continue;
+            const localGiveaway = this.local.giveaways[giveawayId];
+            if (!localGiveaway) continue;
+            const giveaway = mergeGiveawaySyncState(localGiveaway, await this.mysqlGetGiveaway(giveawayId));
             await this.mysqlSaveGiveaway(giveawayId, giveaway);
+            this.local.giveaways[giveawayId] = clone(giveaway);
             this.cacheGiveaway(giveaway);
             this.clearPending('pendingSyncGiveawayIds', giveawayId);
         }
@@ -864,7 +915,12 @@ class GiveawayStore {
         // Pending fallback writes take priority over older MySQL data during a recovery.
         for (const giveawayId of pendingGiveawayIds) {
             const giveaway = this.local.giveaways[giveawayId];
-            if (giveaway) nextGiveaways.set(giveawayId, clone(giveaway));
+            if (giveaway) {
+                nextGiveaways.set(
+                    giveawayId,
+                    mergeGiveawaySyncState(giveaway, nextGiveaways.get(giveawayId))
+                );
+            }
         }
 
         const recoveryIds = new Set();
@@ -920,7 +976,7 @@ class GiveawayStore {
     }
 
     async mysqlSaveGiveaway(giveawayId, giveaway) {
-        await this.db.query(`
+        await this.mysqlQuery(`
             INSERT INTO giveaways (
                 giveaway_id, guild_id, channel_id, message_id, name, prize,
                 host_text, host_user_id, created_by_id, created_by_name,
@@ -976,12 +1032,12 @@ class GiveawayStore {
     }
 
     async mysqlGetGiveaway(giveawayId) {
-        const [rows] = await this.db.query('SELECT giveaway_json FROM giveaways WHERE giveaway_id = ?', [giveawayId]);
+        const [rows] = await this.mysqlQuery('SELECT giveaway_json FROM giveaways WHERE giveaway_id = ?', [giveawayId]);
         return rows[0] ? fromJson(rows[0].giveaway_json, null) : null;
     }
 
     async mysqlGetByMessageId(messageId) {
-        const [rows] = await this.db.query('SELECT giveaway_id, giveaway_json FROM giveaways WHERE message_id = ? LIMIT 1', [messageId]);
+        const [rows] = await this.mysqlQuery('SELECT giveaway_id, giveaway_json FROM giveaways WHERE message_id = ? LIMIT 1', [messageId]);
         return rows[0] ? [rows[0].giveaway_id, fromJson(rows[0].giveaway_json, null)] : [null, null];
     }
 
@@ -993,12 +1049,12 @@ class GiveawayStore {
             params.push(normalizeStatus(status));
         }
         sql += ' ORDER BY starts_at DESC, created_at DESC';
-        const [rows] = await this.db.query(sql, params);
+        const [rows] = await this.mysqlQuery(sql, params);
         return rows.map(row => fromJson(row.giveaway_json, {}));
     }
 
     async mysqlSaveEntry(giveawayId, userId, entry) {
-        await this.db.query(`
+        await this.mysqlQuery(`
             INSERT INTO giveaway_entries (
                 giveaway_id, user_id, user_name, joined_at, left_at, entry_json
             )
@@ -1019,7 +1075,7 @@ class GiveawayStore {
     }
 
     async mysqlGetEntry(giveawayId, userId) {
-        const [rows] = await this.db.query(
+        const [rows] = await this.mysqlQuery(
             'SELECT entry_json FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?',
             [giveawayId, String(userId)]
         );
@@ -1030,12 +1086,12 @@ class GiveawayStore {
         const sql = activeOnly
             ? 'SELECT entry_json FROM giveaway_entries WHERE giveaway_id = ? AND left_at IS NULL ORDER BY joined_at ASC'
             : 'SELECT entry_json FROM giveaway_entries WHERE giveaway_id = ? ORDER BY joined_at ASC';
-        const [rows] = await this.db.query(sql, [giveawayId]);
+        const [rows] = await this.mysqlQuery(sql, [giveawayId]);
         return rows.map(row => fromJson(row.entry_json, {}));
     }
 
     async mysqlSaveDraw(drawId, draw) {
-        await this.db.query(`
+        await this.mysqlQuery(`
             INSERT INTO giveaway_draws (
                 draw_id, giveaway_id, draw_type, drawn_by_id, drawn_at,
                 eligible_count, winner_user_ids, draw_json
@@ -1062,7 +1118,7 @@ class GiveawayStore {
     }
 
     async mysqlListDraws(giveawayId) {
-        const [rows] = await this.db.query(
+        const [rows] = await this.mysqlQuery(
             'SELECT draw_json FROM giveaway_draws WHERE giveaway_id = ? ORDER BY drawn_at ASC',
             [giveawayId]
         );
@@ -1990,6 +2046,7 @@ module.exports = {
     giveawayHasEnded,
     handleGiveawayButton,
     makeGiveawayId,
+    mergeGiveawaySyncState,
     normalizeGiveawayDescription,
     parseColor,
     parseGiveawayEndTime,

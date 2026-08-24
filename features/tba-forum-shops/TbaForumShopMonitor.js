@@ -52,7 +52,7 @@ class TbaForumShopMonitor {
         if (this.started) return;
         this.started = true;
         try {
-            this.store.initialize(this.shops);
+            await this.store.initialize(this.shops);
             if (!this.enabled) return;
             if (this.shops.length !== 2) throw new Error('Both TBA PRO Forum shop URLs must be configured.');
 
@@ -177,7 +177,7 @@ class TbaForumShopMonitor {
         }
         const latest = uniquePosts(pages).at(-1);
         if (!latest) throw new TbaForumRequestError(`No forum posts were found while baselining ${shop.name}.`);
-        this.store.updateShop(shop.key, {
+        await this.store.updateShop(shop.key, {
             initialized: true,
             lastSeenPostId: latest?.postId || null,
             lastPage
@@ -186,7 +186,7 @@ class TbaForumShopMonitor {
     }
 
     async scanShop(shop) {
-        const state = this.store.getShop(shop.key);
+        const state = await this.store.getShop(shop.key);
         const firstPage = await shop.forumClient.fetchPage(1);
         const lastPage = Math.max(1, Number(firstPage.lastPage) || 1);
 
@@ -204,14 +204,14 @@ class TbaForumShopMonitor {
                 const downloadedImages = await shop.forumClient.downloadPostImages(post);
                 await this.notifier.notify(shop, post, downloadedImages);
             }
-            this.store.updateShop(shop.key, {
+            await this.store.updateShop(shop.key, {
                 lastSeenPostId: post.postId,
                 lastPage
             });
         }
 
         if (!unseen.length && Number(state.lastPage) !== lastPage) {
-            this.store.updateShop(shop.key, { lastPage });
+            await this.store.updateShop(shop.key, { lastPage });
         }
     }
 }

@@ -77,6 +77,7 @@ class PvpKingStorage {
         this.storageQueue = Promise.resolve();
         this.pendingWrite = Promise.resolve();
         this.state = this.createEmptyState();
+        this.mysqlOutage = false;
     }
 
     createEmptyState() {
@@ -104,6 +105,48 @@ class PvpKingStorage {
 
     canUseMysqlTransactions() {
         return this.canUseMysql() && typeof this.db.getConnection === 'function';
+    }
+
+    noteMysqlFailure(err) {
+        if (
+            this.db?.isDatabaseUnavailableError &&
+            err?.code !== 'PVP_DATABASE_UNAVAILABLE' &&
+            !this.db.isDatabaseUnavailableError(err)
+        ) {
+            console.error('[WW LOG] Unexpected MySQL PvP King storage error:', err);
+            return;
+        }
+        if (this.mysqlOutage) return;
+        this.mysqlOutage = true;
+        const errorCode = this.db?.getErrorCode?.(err) || err?.causeCode || err?.cause?.code || err?.code || err?.message || err;
+        console.warn(
+            `[WW LOG] MySQL PvP King storage unavailable (${errorCode}). ` +
+            'Using the synchronized JSON snapshot; writes will queue for recovery.'
+        );
+    }
+
+    noteMysqlRestored() {
+        if (!this.mysqlOutage) return;
+        this.mysqlOutage = false;
+        console.log('[WW LOG] MySQL PvP King storage restored; pending JSON operations will synchronize automatically.');
+    }
+
+    async mysqlQuery(sql, params = [], retries) {
+        try {
+            const result = await this.db.query(sql, params, retries);
+            this.noteMysqlRestored();
+            return result;
+        } catch (err) {
+            if (err.code !== 'PVP_STALE_REVERSE') this.noteMysqlFailure(err);
+            throw err;
+        }
+    }
+
+    loadMysqlFallbackSnapshot() {
+        const store = this.readJsonStore();
+        if (store.source !== JSON_SOURCES.MYSQL_FALLBACK) return false;
+        this.state = this.hydrateState(store.state);
+        return true;
     }
 
     ensureJsonStore() {
@@ -184,9 +227,9 @@ class PvpKingStorage {
     writeJsonStore(source = this.getJsonSource(), pendingSync = false, options = {}) {
         try {
             fs.mkdirSync(path.dirname(this.dataFile), { recursive: true });
-            const state = source === JSON_SOURCES.MYSQL_FALLBACK && !pendingSync
-                ? this.createEmptySerializedState()
-                : this.serializeState();
+            // Keep a read-only mirror even when MySQL is fully synchronized. The
+            // operations array (not the snapshot rows) determines what must replay.
+            const state = this.serializeState();
             return writeJsonIfChanged(this.dataFile, this.tempFile, {
                 version: STORAGE_VERSION,
                 source,
@@ -198,17 +241,6 @@ class PvpKingStorage {
             if (options.throwOnError) throw err;
             return false;
         }
-    }
-
-    createEmptySerializedState() {
-        return {
-            stats: [],
-            cooldowns: [],
-            history: [],
-            nextCooldownId: 1,
-            nextHistoryId: 1,
-            operations: []
-        };
     }
 
     writeJsonStoreOrThrow(source = this.getJsonSource(), pendingSync = false) {
@@ -291,7 +323,7 @@ class PvpKingStorage {
                 }
                 return true;
             } catch (err) {
-                console.warn('[WW LOG] Failed to load PvP King MySQL storage. Using JSON fallback if available:', err.code || err.message);
+                this.noteMysqlFailure(err);
             }
         }
 
@@ -303,11 +335,19 @@ class PvpKingStorage {
     }
 
     async loadMysqlState() {
-        const [[statsRows], [cooldownRows], [historyRows]] = await Promise.all([
-            this.db.query('SELECT user_id, king_name, total_wins, total_crown_losses, current_streak, longest_streak, first_crowned, crowned_at FROM pvp_king_stats'),
-            this.db.query('SELECT id, challenger_id, challenger_name, king_id, king_name, last_challenge, notify_on_expire FROM pvp_king_cooldowns'),
-            this.db.query('SELECT * FROM pvp_king_history ORDER BY id ASC')
-        ]);
+        let results;
+        try {
+            results = await Promise.all([
+                this.db.query('SELECT user_id, king_name, total_wins, total_crown_losses, current_streak, longest_streak, first_crowned, crowned_at FROM pvp_king_stats'),
+                this.db.query('SELECT id, challenger_id, challenger_name, king_id, king_name, last_challenge, notify_on_expire FROM pvp_king_cooldowns'),
+                this.db.query('SELECT * FROM pvp_king_history ORDER BY id ASC')
+            ]);
+            this.noteMysqlRestored();
+        } catch (err) {
+            this.noteMysqlFailure(err);
+            throw err;
+        }
+        const [[statsRows], [cooldownRows], [historyRows]] = results;
 
         this.state = this.hydrateState({
             stats: statsRows,
@@ -323,19 +363,24 @@ class PvpKingStorage {
             throw new PvpStorageUnavailableError(new Error('MySQL transactions are unavailable'));
         }
 
-        const connection = await this.db.getConnection();
+        let connection;
         try {
+            connection = await this.db.getConnection();
             await connection.beginTransaction();
             const result = await work(connection);
             await connection.commit();
+            this.noteMysqlRestored();
             return result;
         } catch (err) {
-            await connection.rollback().catch(rollbackErr => {
-                console.warn('[WW LOG] PvP King transaction rollback failed:', rollbackErr.code || rollbackErr.message);
-            });
+            if (err.code !== 'PVP_STALE_REVERSE') this.noteMysqlFailure(err);
+            if (connection) {
+                await connection.rollback().catch(rollbackErr => {
+                    console.warn('[WW LOG] PvP King transaction rollback failed:', rollbackErr.code || rollbackErr.message);
+                });
+            }
             throw err;
         } finally {
-            connection.release();
+            connection?.release();
         }
     }
 
@@ -348,7 +393,7 @@ class PvpKingStorage {
 
         this.syncInterval = setInterval(() => {
             this.syncFallbackOperations().catch(err => {
-                console.warn('[WW LOG] PvP King fallback sync failed:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
         }, this.syncIntervalMs);
 
@@ -407,7 +452,7 @@ class PvpKingStorage {
 
         const query = (sql, params = []) => connection
             ? this.transactionQuery(connection, sql, params)
-            : this.db.query(sql, params);
+            : this.mysqlQuery(sql, params);
 
         switch (op.type) {
             case 'upsertCooldown':
@@ -531,7 +576,7 @@ class PvpKingStorage {
         const isPvpQuery = normalized.includes('pvp_king_stats') || normalized.includes('pvp_king_history') || normalized.includes('pvp_king_cooldowns');
 
         if (!isPvpQuery) {
-            return this.db.query(sql, params, retries);
+            return this.mysqlQuery(sql, params, retries);
         }
 
         if (!action) {
@@ -540,15 +585,15 @@ class PvpKingStorage {
                     throw new Error(`Unsupported PvP King JSON write: ${normalized}`);
                 }
 
-                return this.db.query(sql, params, retries);
+                return this.mysqlQuery(sql, params, retries);
             }
 
             if (this.storageMode === 'json') return this.runLocalSelect(normalized, params);
             try {
-                return await this.db.query(sql, params, retries);
+                return await this.mysqlQuery(sql, params, retries);
             } catch (err) {
-                console.warn('[WW LOG] Unsupported PvP King SQL fell back to local snapshot:', err.code || err.message);
-                return this.runLocalSelect(normalized, params);
+                if (this.loadMysqlFallbackSnapshot()) return this.runLocalSelect(normalized, params);
+                throw new PvpStorageUnavailableError(err);
             }
         }
 
@@ -563,8 +608,9 @@ class PvpKingStorage {
             }
 
             try {
-                return await this.db.query(sql, params, retries);
+                return await this.mysqlQuery(sql, params, retries);
             } catch (err) {
+                if (this.loadMysqlFallbackSnapshot()) return this.runLocalSelect(normalized, params);
                 throw new PvpStorageUnavailableError(err);
             }
         }
@@ -588,7 +634,7 @@ class PvpKingStorage {
             await this.syncFallbackOperations();
             return 'mysql';
         } catch (err) {
-            console.warn('[WW LOG] PvP King fallback sync unavailable. Reading local fallback state:', err.code || err.message);
+            this.noteMysqlFailure(err);
             const latestStore = this.readJsonStore();
             this.state = this.hydrateState(latestStore.state);
             return 'local';
@@ -602,14 +648,14 @@ class PvpKingStorage {
 
         try {
             await this.syncFallbackOperationsNow().catch(err => {
-                console.warn('[WW LOG] PvP King fallback sync failed before write. Continuing with JSON fallback if needed:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
 
             if (!this.canUseMysql()) {
                 throw new PvpStorageUnavailableError();
             }
 
-            const result = await this.db.query(sql, params, retries);
+            const result = await this.mysqlQuery(sql, params, retries);
             const localOp = op.type === 'insertHistory'
                 ? { ...op, id: result?.[0]?.insertId, sync_event_id: null }
                 : op;
@@ -617,10 +663,7 @@ class PvpKingStorage {
             this.writeJsonStore(JSON_SOURCES.MYSQL_FALLBACK, false);
             return result;
         } catch (err) {
-            const warning = this.storageMode === 'mysql'
-                ? '[WW LOG] MySQL PvP King storage failed. Falling back to JSON even though STORAGE_MODE=mysql:'
-                : '[WW LOG] MySQL PvP King storage unavailable. Falling back to JSON:';
-            console.warn(warning, err.code || err.message);
+            this.noteMysqlFailure(err);
             return this.applyOperationWithJsonPersistence(op, JSON_SOURCES.MYSQL_FALLBACK, true);
         }
     }
@@ -660,7 +703,7 @@ class PvpKingStorage {
 
         try {
             await this.syncFallbackOperationsNow().catch(err => {
-                console.warn('[WW LOG] PvP King fallback sync failed before crown event. Continuing with JSON fallback if needed:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
 
             if (!this.canUseMysqlTransactions()) {
@@ -672,10 +715,7 @@ class PvpKingStorage {
             this.writeJsonStore(JSON_SOURCES.MYSQL_FALLBACK, false);
             return result;
         } catch (err) {
-            const warning = this.storageMode === 'mysql'
-                ? '[WW LOG] MySQL PvP crown transaction failed. Falling back to JSON even though STORAGE_MODE=mysql:'
-                : '[WW LOG] MySQL PvP crown transaction unavailable. Falling back to JSON:';
-            console.warn(warning, err.code || err.message);
+            this.noteMysqlFailure(err);
             return this.applyOperationWithJsonPersistence(op, JSON_SOURCES.MYSQL_FALLBACK, true);
         }
     }
@@ -698,7 +738,7 @@ class PvpKingStorage {
 
         try {
             await this.syncFallbackOperationsNow().catch(err => {
-                console.warn('[WW LOG] PvP King fallback sync failed before reverse event. Continuing with JSON fallback if needed:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
 
             if (!this.canUseMysqlTransactions()) {
@@ -712,10 +752,7 @@ class PvpKingStorage {
         } catch (err) {
             if (err.code === 'PVP_STALE_REVERSE') throw err;
 
-            const warning = this.storageMode === 'mysql'
-                ? '[WW LOG] MySQL PvP reverse transaction failed. Falling back to JSON even though STORAGE_MODE=mysql:'
-                : '[WW LOG] MySQL PvP reverse transaction unavailable. Falling back to JSON:';
-            console.warn(warning, err.code || err.message);
+            this.noteMysqlFailure(err);
             return this.applyOperationWithJsonPersistence(op, JSON_SOURCES.MYSQL_FALLBACK, true);
         }
     }

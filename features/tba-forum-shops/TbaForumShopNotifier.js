@@ -67,11 +67,45 @@ function splitQuotedMessage(value, limit = 1024) {
     return chunks;
 }
 
+function messageContainsPostUrl(message, postUrl) {
+    const needle = String(postUrl || '').trim();
+    if (!needle) return false;
+    const embedText = (message?.embeds || [])
+        .map(embed => JSON.stringify(embed?.data || embed || {}))
+        .join('\n');
+    return `${message?.content || ''}\n${embedText}`.includes(needle);
+}
+
 class TbaForumShopNotifier {
     constructor(options = {}) {
         this.client = options.client;
         this.ownerId = String(options.ownerID || options.ownerId || '');
         this.botTimezone = options.botTimezone || 'Etc/UTC';
+    }
+
+    async getOwner() {
+        const owner = this.client.users.cache.get(this.ownerId) || await this.client.users.fetch(this.ownerId);
+        if (!owner || typeof owner.send !== 'function') throw new Error(`Discord user ${this.ownerId} is unavailable.`);
+        return owner;
+    }
+
+    async findExistingNotification(owner, post) {
+        try {
+            const channel = owner.dmChannel || await owner.createDM?.();
+            if (!channel?.messages?.fetch) return null;
+            const messages = await channel.messages.fetch({ limit: 100 });
+            const botUserId = String(this.client.user?.id || '');
+            return [...messages.values()].find(message => (
+                (!botUserId || String(message.author?.id || '') === botUserId)
+                && messageContainsPostUrl(message, post.postUrl)
+            )) || null;
+        } catch (error) {
+            console.warn(
+                `[WW LOG] Could not check recent DMs for duplicate ${post.postId || 'unknown'}; ` +
+                `the shared checkpoint will remain the primary guard: ${error.code || error.message}`
+            );
+            return null;
+        }
     }
 
     buildPayload(shop, post, downloadedImages = []) {
@@ -150,8 +184,12 @@ class TbaForumShopNotifier {
     async notify(shop, post, downloadedImages = []) {
         if (String(post.forumUsername || '').trim().toLowerCase() === IGNORED_FORUM_USERNAME) return null;
         if (!this.ownerId) throw new Error('ownerID is not configured for TBA forum shop notifications.');
-        const owner = this.client.users.cache.get(this.ownerId) || await this.client.users.fetch(this.ownerId);
-        if (!owner || typeof owner.send !== 'function') throw new Error(`Discord user ${this.ownerId} is unavailable.`);
+        const owner = await this.getOwner();
+        const existing = await this.findExistingNotification(owner, post);
+        if (existing) {
+            console.log(`[WW LOG] Skipped duplicate ${shop.name} DM for forum post ${post.postId}.`);
+            return existing;
+        }
         const message = await owner.send(this.buildPayload(shop, post, downloadedImages));
         await this.sendRemainingMessageContent(owner, post.bodyText);
         await this.sendAdditionalImages(owner, downloadedImages);
@@ -164,5 +202,6 @@ module.exports = {
     IMAGE_BATCH_LIMIT,
     formatForumDate,
     splitMessage,
-    splitQuotedMessage
+    splitQuotedMessage,
+    messageContainsPostUrl
 };

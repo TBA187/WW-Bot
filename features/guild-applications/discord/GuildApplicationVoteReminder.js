@@ -7,6 +7,7 @@ const {
     VOTE_REMINDER_18H_MS,
     VOTE_REMINDER_INTERVAL_MS
 } = require('../constants.js');
+const { findRecentBotMessage } = require('../../../utils/discordMessageHistory.js');
 
 class GuildApplicationVoteReminder {
     constructor(options = {}) {
@@ -133,10 +134,29 @@ class GuildApplicationVoteReminder {
         }
 
         if (officerVotes < requiredVotes) {
-            const reminder = await courtChannel.send({
-                content: this.reminderContent(record, stage.hours),
-                allowedMentions: { parse: [], roles: [this.officerRoleId] }
-            });
+            let reminder = null;
+            try {
+                reminder = await findRecentBotMessage(courtChannel, {
+                    botUserId: this.client.user?.id,
+                    needles: [record.pollMessageUrl, `It has been **${stage.hours} hours**`]
+                });
+            } catch (error) {
+                console.warn(
+                    `[WW LOG] Could not check recent vote reminders for Guild Application ${record.postId}: `
+                    + `${error.code || error.message}`
+                );
+            }
+            if (reminder) {
+                console.log(
+                    `[WW LOG] Recovered ${stage.hours}-hour vote reminder for Guild Application ${record.postId}; `
+                    + 'duplicate send skipped.'
+                );
+            } else {
+                reminder = await courtChannel.send({
+                    content: this.reminderContent(record, stage.hours),
+                    allowedMentions: { parse: [], roles: [this.officerRoleId] }
+                });
+            }
             record[stage.messageField] = reminder.id;
         }
 

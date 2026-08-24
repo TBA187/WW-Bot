@@ -375,7 +375,7 @@ test('recordCrownEvent commits dependent MySQL writes in one transaction', async
     assert.equal(fakeDb.cooldowns.find(row => row.challenger_id === 'old').king_id, 'new');
 }));
 
-test('successful MySQL storage leaves fallback JSON empty', async () => withDbEnv(async () => {
+test('successful MySQL storage keeps a clean recovery snapshot without pending operations', async () => withDbEnv(async () => {
     const file = tempDataFile();
     const fakeDb = new FakeDb();
     const storage = new PvpKingStorage({ db: fakeDb, storageMode: 'auto', dataFile: file });
@@ -390,9 +390,10 @@ test('successful MySQL storage leaves fallback JSON empty', async () => withDbEn
     const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(stored.source, 'mysql_fallback');
     assert.equal(stored.pendingSync, false);
-    assert.deepEqual(stored.state.stats, []);
-    assert.deepEqual(stored.state.cooldowns, []);
-    assert.deepEqual(stored.state.history, []);
+    assert.equal(stored.state.stats.length, 1);
+    assert.equal(stored.state.stats[0].user_id, 'new');
+    assert.equal(stored.state.history.length, 1);
+    assert.equal(stored.state.history[0].king_id, 'new');
     assert.deepEqual(stored.state.operations, []);
 }));
 
@@ -460,6 +461,30 @@ test('pending fallback reads use local state when sync cannot reach MySQL', asyn
     const stats = await storage.getStats('local');
 
     assert.equal(stats.king_name, 'Local King');
+}));
+
+test('clean MySQL snapshot serves cooldown reads during a later database outage', async () => withDbEnv(async () => {
+    const file = tempDataFile();
+    const fakeDb = new FakeDb();
+    fakeDb.cooldowns.push({
+        id: 1,
+        challenger_id: 'challenger',
+        challenger_name: 'Challenger',
+        king_id: 'king',
+        king_name: 'King',
+        last_challenge: '2026-01-01 00:00:00',
+        notify_on_expire: 1
+    });
+    const storage = new PvpKingStorage({ db: fakeDb, storageMode: 'auto', dataFile: file });
+
+    await storage.restore();
+    fakeDb.failReads = true;
+
+    const expired = await storage.findExpiredNotifiableCooldowns();
+
+    assert.equal(expired.length, 1);
+    assert.equal(expired[0].challenger_id, 'challenger');
+    assert.equal(expired[0].king_id, 'king');
 }));
 
 test('getHistoryEventCounts returns crown and defense totals', async () => {

@@ -72,6 +72,7 @@ class NotificationStore {
         this.subscriptionsCache = new Map();
         this.syncPromise = null;
         this.syncLoop = null;
+        this.mysqlOutage = false;
     }
 
     getJsonSource() {
@@ -80,6 +81,37 @@ class NotificationStore {
 
     canUseMysql() {
         return this.storageMode !== 'json' && Boolean(this.db?.hasRequiredConfig);
+    }
+
+    noteMysqlFailure(err) {
+        if (this.db?.isDatabaseUnavailableError && !this.db.isDatabaseUnavailableError(err)) {
+            console.error('[PRO NOTIFICATIONS] Unexpected MySQL storage error:', err);
+            return;
+        }
+        if (this.mysqlOutage) return;
+        this.mysqlOutage = true;
+        const errorCode = this.db?.getErrorCode?.(err) || err?.causeCode || err?.code || err?.message || err;
+        console.warn(
+            `[PRO NOTIFICATIONS] MySQL storage unavailable (${errorCode}). ` +
+            'Using JSON; pending settings and subscriptions will retry automatically.'
+        );
+    }
+
+    noteMysqlRestored() {
+        if (!this.mysqlOutage) return;
+        this.mysqlOutage = false;
+        console.log('[PRO NOTIFICATIONS] MySQL storage restored; pending JSON data is synchronizing.');
+    }
+
+    async mysqlQuery(sql, params = []) {
+        try {
+            const result = await this.db.query(sql, params);
+            this.noteMysqlRestored();
+            return result;
+        } catch (err) {
+            this.noteMysqlFailure(err);
+            throw err;
+        }
     }
 
     readJsonStore() {
@@ -288,7 +320,7 @@ class NotificationStore {
             this.writeJsonStore();
             return true;
         } catch (err) {
-            console.warn('[PRO NOTIFICATIONS] MySQL notification storage unavailable. Using JSON fallback:', err.code || err.message);
+            this.noteMysqlFailure(err);
             if (!hadSettings) this.markAllSettingsPending();
             this.local.source = 'mysql_fallback';
             this.writeJsonStore();
@@ -329,7 +361,7 @@ class NotificationStore {
 
         this.syncLoop = setInterval(() => {
             this.syncPending().catch(err => {
-                console.warn('[PRO NOTIFICATIONS] Pending JSON sync failed:', err.code || err.message);
+                this.noteMysqlFailure(err);
             });
         }, SYNC_INTERVAL_MS);
         this.syncLoop.unref?.();
@@ -383,7 +415,7 @@ class NotificationStore {
         try {
             await this.syncPending();
         } catch (err) {
-            console.warn('[PRO NOTIFICATIONS] MySQL setting save unavailable. JSON will retry later:', err.code || err.message);
+            this.noteMysqlFailure(err);
         }
 
         return clone(saved);
@@ -433,14 +465,14 @@ class NotificationStore {
         try {
             await this.syncPending();
         } catch (err) {
-            console.warn('[PRO NOTIFICATIONS] MySQL subscription save unavailable. JSON will retry later:', err.code || err.message);
+            this.noteMysqlFailure(err);
         }
 
         return this.getUserSubscriptionKeys(id);
     }
 
     async mysqlListSettings() {
-        const [rows] = await this.db.query(`
+        const [rows] = await this.mysqlQuery(`
             SELECT guild_id, notification_key, enabled, created_at, updated_at
             FROM guild_notification_settings
             WHERE guild_id = ?
@@ -449,7 +481,7 @@ class NotificationStore {
     }
 
     async mysqlListSubscriptions() {
-        const [rows] = await this.db.query(`
+        const [rows] = await this.mysqlQuery(`
             SELECT guild_id, notification_key, user_id, enabled, created_at, updated_at
             FROM user_notification_subscriptions
             WHERE guild_id = ?
@@ -458,7 +490,7 @@ class NotificationStore {
     }
 
     async mysqlSaveSetting(setting) {
-        await this.db.query(`
+        await this.mysqlQuery(`
             INSERT INTO guild_notification_settings (
                 guild_id, notification_key, enabled, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?)
@@ -475,7 +507,7 @@ class NotificationStore {
     }
 
     async mysqlSaveSubscription(subscription) {
-        await this.db.query(`
+        await this.mysqlQuery(`
             INSERT INTO user_notification_subscriptions (
                 guild_id, notification_key, user_id, enabled, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?)

@@ -14,7 +14,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test"
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "allowScripts": {
+    "tesseract.js": false
   },
   "keywords": [],
   "author": "",

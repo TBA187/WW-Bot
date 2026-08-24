@@ -154,3 +154,50 @@ test('shop notifier never sends a DM for the ignored Tba7 author', async () => {
     assert.equal(result, null);
     assert.equal(sends, 0);
 });
+
+test('shop notifier skips a forum post already present in the owner DM history', async () => {
+    let sends = 0;
+    const postUrl = 'https://example.com/forum-shop/#findComment-500';
+    const existing = {
+        id: 'existing-dm',
+        author: { id: 'bot-user' },
+        content: '',
+        embeds: [{ data: { description: `**Message Link:** [Click Here](<${postUrl}>)` } }]
+    };
+    const owner = {
+        async createDM() {
+            return {
+                messages: {
+                    async fetch() { return new Map([[existing.id, existing]]); }
+                }
+            };
+        },
+        async send() {
+            sends++;
+            return { id: 'new-dm' };
+        }
+    };
+    const notifier = new TbaForumShopNotifier({
+        client: {
+            user: { id: 'bot-user' },
+            users: { cache: new Map([['owner', owner]]) }
+        },
+        ownerID: 'owner'
+    });
+
+    const result = await notifier.notify({
+        key: 'forumShop',
+        name: 'PRO Forum Shop',
+        emoji: '🛒',
+        topicUrl: 'https://example.com/forum-shop/'
+    }, {
+        postId: '500',
+        forumUsername: 'Buyer',
+        postUrl,
+        postedAt: '2026-07-14T12:00:00.000Z',
+        bodyText: 'Interested'
+    });
+
+    assert.equal(result, existing);
+    assert.equal(sends, 0);
+});

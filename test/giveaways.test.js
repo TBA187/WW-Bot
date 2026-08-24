@@ -10,7 +10,8 @@ const {
     createGiveawayStore,
     endGiveaway,
     giveawayEndedWithinRerollWindow,
-    handleGiveawayButton
+    handleGiveawayButton,
+    mergeGiveawaySyncState
 } = require('../events/giveaways.js');
 
 function tempDataFile() {
@@ -143,6 +144,28 @@ test('a stale Join button cannot add an entry after the giveaway has ended', asy
 
     assert.equal(savedEntries, 0);
     assert.deepEqual(replies, ['This giveaway is no longer active.']);
+});
+
+test('a stale active JSON fallback cannot reopen an ended MySQL giveaway', () => {
+    const local = giveaway({ status: GIVEAWAY_ACTIVE });
+    const remote = giveaway({
+        status: GIVEAWAY_ENDED,
+        ended_at: '2026-08-18T01:00:00.000Z',
+        winner_user_ids: ['user-1']
+    });
+
+    assert.deepEqual(mergeGiveawaySyncState(local, remote), remote);
+});
+
+test('a terminal fallback update can still close an active MySQL giveaway', () => {
+    const local = giveaway({
+        status: GIVEAWAY_ENDED,
+        ended_at: '2026-08-18T01:00:00.000Z',
+        winner_user_ids: ['user-2']
+    });
+    const remote = giveaway({ status: GIVEAWAY_ACTIVE });
+
+    assert.deepEqual(mergeGiveawaySyncState(local, remote), local);
 });
 
 test('a failed slash-command response never falls back to replying to the giveaway message', async () => {

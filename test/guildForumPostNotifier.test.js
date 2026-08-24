@@ -63,6 +63,38 @@ test('mentions only the owner for a newly observed non-application forum post', 
     assert.equal(result.record.notificationStatus, 'non_application_alert_sent');
 });
 
+test('recovers an existing non-application alert instead of sending it twice', async () => {
+    let sends = 0;
+    const postUrl = 'https://example.com/forum/#findComment-101';
+    const existing = {
+        id: 'existing-alert',
+        url: 'https://discord.com/existing-alert',
+        author: { id: 'bot-id' },
+        content: `**not** classified as a valid guild application ${postUrl}`,
+        embeds: []
+    };
+    const officerChannel = {
+        id: 'officer-channel',
+        isTextBased: () => true,
+        messages: { fetch: async () => new Map([[existing.id, existing]]) },
+        async send() { sends += 1; }
+    };
+    const notifier = new GuildForumPostNotifier({
+        client: {
+            user: { id: 'bot-id' },
+            channels: { cache: new Map([[officerChannel.id, officerChannel]]), fetch: async () => officerChannel }
+        },
+        officerChannelID: officerChannel.id,
+        ownerID: 'owner-id'
+    });
+
+    const result = await notifier.notify({ postId: '101', postUrl });
+
+    assert.equal(sends, 0);
+    assert.equal(result.record.notificationStatus, 'non_application_alert_sent');
+    assert.equal(result.record.officerMessageId, 'existing-alert');
+});
+
 test('feedback button is restricted to the configured owner', async () => {
     const replies = [];
     const interaction = {

@@ -4,7 +4,7 @@ WW-Bot is the White Walkers Discord bot. It handles XP tracking, level rewards, 
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 24 LTS recommended (Node.js 22 LTS minimum)
 - MySQL or MariaDB for production storage
 - A Discord bot token with the required gateway intents enabled
 - `Manage Roles`, `Send Messages`, `Embed Links`, `Attach Files`, and command permissions in the target server
@@ -19,8 +19,10 @@ npm install
 Start the bot:
 
 ```bash
-node index.js
+npm start
 ```
+
+`npm start` currently runs `node index.js`. MySQL-backed single-instance protection stops a second updated copy from logging in at the same time, preventing duplicate event logs, reminders, and notifications during host handoffs.
 
 Run checks and tests:
 
@@ -42,11 +44,21 @@ Runtime secrets live in `.env`. The most important values are:
 - `DB_PORT`
 - `STORAGE_MODE`
 
+Optional database resilience tuning values are:
+
+- `DB_CONNECT_TIMEOUT_MS` (default `10000`)
+- `DB_KEEPALIVE_DELAY_MS` (default `30000`)
+- `DB_RETRY_COOLDOWN_MS` (default `5000`)
+- `DB_RETRY_MAX_COOLDOWN_MS` (default `60000`)
+- `DB_STATUS_LOG_INTERVAL_MS` (default `300000`)
+
 `STORAGE_MODE` accepts:
 
 - `auto`: use MySQL when available, fallback to local JSON during outages, then sync back.
 - `mysql`: prefer MySQL, fallback to JSON when MySQL is down.
 - `json`: only use local JSON files. This is useful for local testing and does not sync to MySQL.
+
+In `auto` or `mysql` mode, transient connection failures open a shared retry circuit so concurrent features do not flood MySQL or the console. The bot logs the first failure, periodic outage status, each affected feature fallback, and recovery. Persistent writes queue in JSON and synchronize when MySQL returns.
 
 Server IDs and feature IDs live in `config.json`, including:
 
@@ -73,6 +85,7 @@ Ready-to-run SQL files are grouped by feature in `sql/`:
 - `sql/create_pvp_king_tables.sql`
 - `sql/create_xp_level_tables.sql`
 - `sql/create_guild_applications_table.sql`
+- `sql/create_bot_runtime_tables.sql`
 
 ## Runtime Data
 
@@ -84,7 +97,7 @@ Local runtime state is stored in `data/` and ignored by Git.
 - `data/guild_settings.json`: mirror of guild settings, kept populated so XP/logging settings still load during a database outage.
 - `data/notifications.json`: notification settings and member subscriptions, used during a MySQL outage and synchronized when MySQL returns.
 - `data/guild_applications.json`: forum scan checkpoint and temporary application records during a MySQL outage. In `json` mode it is the permanent local store.
-- `data/tba_forum_shops.json`: lightweight JSON-only checkpoints for the two TBA shop topics. It never synchronizes with MySQL.
+- `data/tba_forum_shops.json`: local recovery mirror for the two TBA shop checkpoints. In `auto` and `mysql` modes, checkpoints are shared through MySQL so switching hosts cannot replay an already processed forum post.
 
 The fallback files are not meant to be manually edited while the bot is running!
 
@@ -136,10 +149,11 @@ TBA forum shop notifications:
 - sends `ownerID` a DM containing the author, complete message content, timestamp, direct forum-post link, and every image from each new reply
 - places the first image in the embed and sends additional images immediately afterward in batches of ten
 - catches up on every reply posted while the bot was offline, including new pages and forum page-size changes
+- shares its latest processed post through MySQL and checks recent owner DMs by forum-post URL before sending, preventing replay when switching machines
 - uses exponential backoff for forum outages and rate limits, and retries failures without advancing the saved post checkpoint
 - adds a warning and keeps the original forum link when some post details or images cannot be fetched
 - ignores replies posted by the forum username `tba7`, using a case-insensitive comparison
-- stores only page and post checkpoints in `data/tba_forum_shops.json`; this feature never uses MySQL
+- mirrors its small page/post checkpoint in `data/tba_forum_shops.json` for MySQL outages
 
 Preview a random strong historical application without posting it:
 

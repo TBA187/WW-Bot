@@ -4,6 +4,7 @@
 
 const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const { refreshGuildMembers } = require('../commands/pvp-king/utils/pvpHelper.js');
+const { messageSearchText } = require('../utils/discordMessageHistory.js');
 
 const COOLDOWN_CHECK_INTERVAL_MS = 60000;
 const PVP_COOLDOWN_MS = 48 * 60 * 60 * 1000;
@@ -28,12 +29,32 @@ function shouldNotifyExpiredCooldown(row, nowMs = Date.now()) {
     return nowMs - expiryMs <= MAX_MISSED_NOTIFICATION_AGE_MS;
 }
 
+async function recentlyNotifiedCooldownUsers(channel, userIds, botUserId, nowMs = Date.now()) {
+    const notified = new Set();
+    if (!channel?.messages?.fetch || !userIds?.length) return notified;
+    const messages = await channel.messages.fetch({ limit: 100 });
+    if (!messages || typeof messages.values !== 'function') return notified;
+
+    for (const message of messages.values()) {
+        if (botUserId && String(message.author?.id || '') !== String(botUserId)) continue;
+        const createdMs = Number(message.createdTimestamp || message.createdAt?.getTime?.());
+        if (!Number.isFinite(createdMs) || nowMs - createdMs > MAX_MISSED_NOTIFICATION_AGE_MS) continue;
+        const text = messageSearchText(message);
+        if (!text.includes('PvP Cooldown Expired!')) continue;
+        for (const userId of userIds) {
+            if (text.includes(`<@${userId}>`)) notified.add(String(userId));
+        }
+    }
+    return notified;
+}
+
 module.exports = {
     name: 'cooldownTask',
     execute(client, config) {
         const db = config.pvpKingStorage || config.db;
         const { pvpKingChannelID, pvpKingRoleID, guildId } = config;
         let isRunning = false;
+        let storageUnavailable = false;
 
         const runCooldownCheck = async () => {
             if (isRunning) return;
@@ -41,6 +62,10 @@ module.exports = {
 
             try {
                 const expired = await db.findExpiredNotifiableCooldowns();
+                if (storageUnavailable) {
+                    storageUnavailable = false;
+                    console.log('[WW LOG] PvP cooldown notification storage restored; scheduled checks resumed.');
+                }
 
                 if (expired.length === 0) return;
 
@@ -57,9 +82,29 @@ module.exports = {
 
                 const usersToPing = [];
                 const idsToReset = [];
+                let alreadyNotified = new Set();
+                try {
+                    alreadyNotified = await recentlyNotifiedCooldownUsers(
+                        pvpChannel,
+                        expired.map(row => String(row.challenger_id)),
+                        client.user?.id
+                    );
+                    if (alreadyNotified.size) {
+                        console.log(
+                            `[WW LOG] Recovered ${alreadyNotified.size} recent PvP cooldown notification(s); duplicate ping skipped.`
+                        );
+                    }
+                } catch (error) {
+                    console.warn(
+                        '[WW LOG] Could not check recent PvP cooldown messages for duplicates; database state remains the primary guard:',
+                        error.code || error.message
+                    );
+                }
 
                 for (const row of expired) {
-                    if (row.king_id === currentKing.id && shouldNotifyExpiredCooldown(row)) {
+                    if (row.king_id === currentKing.id
+                        && shouldNotifyExpiredCooldown(row)
+                        && !alreadyNotified.has(String(row.challenger_id))) {
                         usersToPing.push(`<@${row.challenger_id}>`);
                     }
 
@@ -91,7 +136,17 @@ module.exports = {
                     await db.resetCooldownsByIds(idsToReset);
                 }
             } catch (err) {
-                console.error('[WW LOG] Cooldown Task Error:', err.code || err.message);
+                if (err.code === 'PVP_DATABASE_UNAVAILABLE' || err.code === 'DATABASE_UNAVAILABLE') {
+                    if (!storageUnavailable) {
+                        storageUnavailable = true;
+                        console.warn(
+                            '[WW LOG] PvP cooldown notification check paused because neither MySQL nor a usable JSON snapshot is available. ' +
+                            'The task will retry every minute.'
+                        );
+                    }
+                } else {
+                    console.error('[WW LOG] Cooldown Task Error:', err);
+                }
             } finally {
                 isRunning = false;
             }
@@ -104,3 +159,4 @@ module.exports = {
 };
 
 module.exports.shouldNotifyExpiredCooldown = shouldNotifyExpiredCooldown;
+module.exports.recentlyNotifiedCooldownUsers = recentlyNotifiedCooldownUsers;

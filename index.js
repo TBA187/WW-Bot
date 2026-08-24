@@ -1,7 +1,8 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const appConfig = require('./config.json');
 process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
+const { BotInstanceLease } = require('./db/BotInstanceLease.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
 const NotificationStore = require('./features/pro-notifications/NotificationStore.js');
@@ -32,6 +33,7 @@ const path = require("path");
 const GUILD_SETTINGS_FILE = path.join(__dirname, 'data', 'guild_settings.json');
 const GUILD_SETTINGS_TEMP_FILE = `${GUILD_SETTINGS_FILE}.tmp`;
 const GUILD_SETTINGS_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+let guildSettingsMysqlOutage = false;
 
 const token = process.env.TOKEN;
 const clientId = process.env.CLIENT_ID;
@@ -53,6 +55,10 @@ const client = new Client({
         GatewayIntentBits.GuildVoiceStates
     ],
     partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction]
+});
+const botInstanceLease = new BotInstanceLease({
+    db,
+    leaseKey: `white-walker-bot:${clientId}:${guildId}`
 });
 
 // Map with DB Guild Settings where Key = guild_id, Value = { xp_enabled: false, ... }
@@ -183,11 +189,28 @@ async function syncPendingGuildSettingsMirror() {
     return true;
 }
 
-function loadGuildSettingsFromMirror() {
+function loadGuildSettingsFromMirror({ quiet = false } = {}) {
     const mirror = readGuildSettingsMirror();
     cacheGuildSettingsRows(mirror.settings);
-    console.warn(`[WW LOG] Loaded ${guildSettingsCache.size} guild setting(s) from JSON mirror.`);
+    if (!quiet) {
+        console.warn(`[WW LOG] Loaded ${guildSettingsCache.size} guild setting(s) from JSON mirror.`);
+    }
     return mirror;
+}
+
+function noteGuildSettingsMysqlFailure(err) {
+    if (guildSettingsMysqlOutage) return;
+    guildSettingsMysqlOutage = true;
+    console.warn(
+        `[WW LOG] Guild settings MySQL unavailable (${db.getErrorCode?.(err) || err.code || err.message}). ` +
+        'Using the JSON mirror; the five-minute sync loop remains active.'
+    );
+}
+
+function noteGuildSettingsMysqlRestored() {
+    if (!guildSettingsMysqlOutage) return;
+    guildSettingsMysqlOutage = false;
+    console.log('[WW LOG] Guild settings MySQL restored; the JSON mirror is synchronized.');
 }
 
 function saveGuildSettingToMirror(row, { pendingSync = false } = {}) {
@@ -224,6 +247,7 @@ async function syncDBSettings({ quiet = false } = {}) {
         // Get the newest guild settings from the Database
         const [rows] = await db.query('SELECT guild_id, guild_name, xp_enabled, xp_date_enabled, logging_enabled, updated_at FROM guild_settings');
         const settings = rows.map(normalizeGuildSettingsRow);
+        noteGuildSettingsMysqlRestored();
 
         if (!settings.length) {
             console.log('[WW LOG] ⚠️ No rows found in guild_settings table.');
@@ -238,8 +262,12 @@ async function syncDBSettings({ quiet = false } = {}) {
         }
         return true;
     } catch (err) {
-        console.error('[WW LOG] ❌ Failed to sync settings:', err);
-        loadGuildSettingsFromMirror();
+        if (db.isDatabaseUnavailableError?.(err)) {
+            noteGuildSettingsMysqlFailure(err);
+        } else {
+            console.error('[WW LOG] ❌ Failed to sync settings:', err);
+        }
+        loadGuildSettingsFromMirror({ quiet: true });
         return false;
     }
 }
@@ -278,7 +306,7 @@ const notificationStore = new NotificationStore({
     definitions: NOTIFICATION_DEFINITIONS
 });
 const guildApplicationMonitor = createGuildApplicationMonitor({ client, db, config: appConfig });
-const tbaForumShopMonitor = createTbaForumShopMonitor({ client, config: appConfig });
+const tbaForumShopMonitor = createTbaForumShopMonitor({ client, db, config: appConfig });
 
 // Build config object (Parameters to send to command classes)
 const commandConfig = {
@@ -318,6 +346,24 @@ async function bootstrap() {
         // Wait for DB Connection
         console.log('[WW LOG] Establishing database connection...');
         const dbReady = await db.initPromise;
+
+        const lease = await botInstanceLease.acquire();
+        if (!lease.acquired) {
+            const error = new Error(
+                'Another White Walker Bot process is already active. Stop it before starting this copy.'
+            );
+            error.code = 'BOT_INSTANCE_ALREADY_ACTIVE';
+            throw error;
+        }
+        if (lease.enforced) {
+            console.log('[WW LOG] Acquired the single-instance bot lease.');
+        }
+        // If MySQL was unavailable, the heartbeat keeps trying. When it recovers,
+        // exactly one process wins the lease and every duplicate disconnects.
+        botInstanceLease.start(async () => {
+            client.destroy();
+            process.exitCode = 1;
+        });
 
         // INITIAL SETTINGS LOAD: Load settings before events start firing.
         if (!dbReady) {
@@ -372,7 +418,7 @@ async function bootstrap() {
                 Routes.applicationGuildCommands(clientId, guildId),
                 { body: commandsForDiscord }
             );
-            console.log('[WW LOG] ✅ Global slash commands registered to Discord');
+            console.log('[WW LOG] ✅ Guild slash commands registered to Discord');
         } catch (err) {
             console.error('[WW LOG] ❌ ERROR: Command registration failed:', err);
             throw err;
@@ -473,7 +519,12 @@ async function bootstrap() {
         await client.login(token);
 
     } catch (err) {
-        console.error('[WW LOG] 🚨 Startup Failed:', err);
+        if (err?.code === 'BOT_INSTANCE_ALREADY_ACTIVE') {
+            console.error(`[WW LOG] 🚨 Startup stopped: ${err.message}`);
+        } else {
+            console.error('[WW LOG] 🚨 Startup Failed:', err);
+        }
+        await botInstanceLease.release().catch(() => {});
         process.exit(1);
     }
 }
@@ -481,6 +532,22 @@ async function bootstrap() {
 // Global Safety Listeners (prevents crashes)
 client.on('error', err => console.error('Discord client error:', err));
 process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
+
+let shutdownStarted = false;
+async function shutdown(signal) {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    console.log(`[WW LOG] ${signal} received. Shutting down cleanly...`);
+    guildApplicationMonitor.stop?.();
+    tbaForumShopMonitor.stop?.();
+    client.destroy();
+    await botInstanceLease.release();
+    await db.end?.().catch(() => {});
+    process.exit(0);
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 // Client Ready
 client.once(Events.ClientReady, async () => {

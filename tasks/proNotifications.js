@@ -4,8 +4,8 @@ const WEEK_MS = 7 * DAY_MS;
 const CONTEST_REMINDER_BEFORE_MS = 30 * MINUTE_MS;
 
 // JavaScript month numbers start at 0, so 7 means August.
-// The anchor is Saturday, 22 August 2026 at 00:00 UTC.
-const ANCHOR_SATURDAY_UTC_MS = Date.UTC(2026, 7, 22, 0, 0, 0, 0);
+// The corrected alternating anchor is Saturday, 29 August 2026 at 00:00 UTC.
+const ANCHOR_SATURDAY_UTC_MS = Date.UTC(2026, 7, 29, 0, 0, 0, 0);
 
 const CONTESTS = {
     BCC: {
@@ -179,9 +179,9 @@ function scheduleNextNotification({
 // 09:30 and 21:30 UTC/GMT
 //
 // Alternating anchor:
-// Saturday, 22 August 2026
-// 10:00 UTC = FCC
-// 22:00 UTC = BCC
+// Saturday, 29 August 2026
+// 10:00 UTC = BCC
+// 22:00 UTC = FCC
 //
 // The order reverses each following Saturday.
 // ============================================================
@@ -189,9 +189,9 @@ function scheduleNextNotification({
 /**
  * Determines which contest runs in a Saturday time slot.
  *
- * Anchor Saturday, 22 August 2026:
- * 10:00 UTC -> FCC
- * 22:00 UTC -> BCC
+ * Anchor Saturday, 29 August 2026:
+ * 10:00 UTC -> BCC
+ * 22:00 UTC -> FCC
  *
  * The order reverses every following Saturday.
  */
@@ -203,10 +203,10 @@ function getContestKey(saturdayStartUtc, eventHourUtc) {
     const usesAnchorOrder = positiveModulo(weeksFromAnchor, 2) === 0;
 
     if (eventHourUtc === 10) {
-        return usesAnchorOrder ? 'FCC' : 'BCC';
+        return usesAnchorOrder ? 'BCC' : 'FCC';
     }
 
-    return usesAnchorOrder ? 'BCC' : 'FCC';
+    return usesAnchorOrder ? 'FCC' : 'BCC';
 }
 
 /**
