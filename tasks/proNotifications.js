@@ -3,8 +3,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const CONTEST_REMINDER_BEFORE_MS = 30 * MINUTE_MS;
 
-// JavaScript month numbers start at 0, so 7 means August.
-// The corrected alternating anchor is Saturday, 29 August 2026 at 00:00 UTC.
+// Base anchor for the alternating FCC/BCC contests (Saturday, 29 August 2026 at 00:00 UTC)
 const ANCHOR_SATURDAY_UTC_MS = Date.UTC(2026, 7, 29, 0, 0, 0, 0);
 
 const CONTESTS = {
@@ -202,11 +201,12 @@ function getContestKey(saturdayStartUtc, eventHourUtc) {
 
     const usesAnchorOrder = positiveModulo(weeksFromAnchor, 2) === 0;
 
+    // Anchor week (August 29) starts with FCC at 10:00 UTC.
     if (eventHourUtc === 10) {
-        return usesAnchorOrder ? 'BCC' : 'FCC';
+        return usesAnchorOrder ? 'FCC' : 'BCC';
     }
 
-    return usesAnchorOrder ? 'FCC' : 'BCC';
+    return usesAnchorOrder ? 'BCC' : 'FCC';
 }
 
 /**
