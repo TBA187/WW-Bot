@@ -146,6 +146,7 @@ class GuildApplicationStore {
         this.queue = Promise.resolve();
         this.syncInterval = null;
         this.mysqlOutage = false;
+        this.localStorageOutage = false;
     }
 
     source() {
@@ -173,8 +174,8 @@ class GuildApplicationStore {
     }
 
     readData() {
-        this.ensureFile();
         try {
+            this.ensureFile();
             const parsed = JSON.parse(fs.readFileSync(this.dataFile, 'utf8'));
             const source = parsed.source === JSON_SOURCES.JSON_ONLY || parsed.source === JSON_SOURCES.MYSQL_FALLBACK
                 ? parsed.source
@@ -189,21 +190,32 @@ class GuildApplicationStore {
                 records
             };
         } catch (error) {
-            console.error('[WW LOG] Failed to read Guild Application JSON storage:', error);
-            return this.emptyData();
+            // An unreadable fallback may contain unsynchronized applications.
+            // Never replace it with an empty snapshot.
+            error.guildApplicationStorage = true;
+            throw error;
         }
     }
 
     writeData(data) {
-        fs.mkdirSync(path.dirname(this.dataFile), { recursive: true });
-        return writeJsonIfChanged(this.dataFile, this.tempFile, {
-            version: STORAGE_VERSION,
-            source: data.source || this.source(),
-            pendingSync: data.pendingSync === true,
-            initialized: data.initialized === true,
-            checkpoint: data.checkpoint || null,
-            records: Array.isArray(data.records) ? data.records : []
-        });
+        try {
+            const changed = writeJsonIfChanged(this.dataFile, this.tempFile, {
+                version: STORAGE_VERSION,
+                source: data.source || this.source(),
+                pendingSync: data.pendingSync === true,
+                initialized: data.initialized === true,
+                checkpoint: data.checkpoint || null,
+                records: Array.isArray(data.records) ? data.records : []
+            });
+            if (this.localStorageOutage && changed) {
+                this.localStorageOutage = false;
+                console.log('[WW LOG] Guild Application local JSON storage restored.');
+            }
+            return changed;
+        } catch (error) {
+            error.guildApplicationStorage = true;
+            throw error;
+        }
     }
 
     enqueue(task) {
@@ -419,6 +431,16 @@ class GuildApplicationStore {
         console.log('[WW LOG] MySQL Guild Application storage restored; JSON fallback is synchronized.');
     }
 
+    noteLocalStorageFailure(error) {
+        if (this.localStorageOutage) return;
+        this.localStorageOutage = true;
+        if (error.code === 'ENOSPC' || error.code === 'EDQUOT') {
+            console.error(`[WW LOG] Guild Application local JSON storage cannot write (${error.code}). Check container quota, free space, and inodes; any previous complete file is preserved. Retries continue.`);
+        } else {
+            console.error('[WW LOG] Guild Application local JSON storage failed; processing will retry:', error);
+        }
+    }
+
     mergeRecords(data, records, { pendingSync }) {
         const byId = new Map(data.records.map(record => [String(record.postId), this.normalizeRecord(record)]));
         for (const record of records) byId.set(String(record.postId), this.normalizeRecord(record));
@@ -564,6 +586,7 @@ class GuildApplicationStore {
             this.noteMysqlRestored();
             return { storageOrigin: 'mysql', records: saved };
         } catch (error) {
+            if (error.guildApplicationStorage) throw error;
             this.noteMysqlFailure(error);
             const saved = normalized.map(record => ({ ...record, storageOrigin: JSON_SOURCES.MYSQL_FALLBACK }));
             const data = this.updateCheckpointFromRecords(
@@ -600,7 +623,10 @@ class GuildApplicationStore {
             this.writeData(fresh);
         }
         if (this.storageMode !== 'json') {
-            await this.syncFallback().catch(error => this.noteMysqlFailure(error));
+            await this.syncFallback().catch(error => {
+                if (error.guildApplicationStorage) throw error;
+                this.noteMysqlFailure(error);
+            });
         }
         return this.isInitialized();
     }
@@ -617,6 +643,7 @@ class GuildApplicationStore {
             await this.hydrateCheckpointFromMysql();
             return true;
         } catch (error) {
+            if (error.guildApplicationStorage) throw error;
             this.noteMysqlFailure(error);
             return false;
         }
@@ -695,6 +722,7 @@ class GuildApplicationStore {
             }
             this.noteMysqlRestored();
         } catch (error) {
+            if (error.guildApplicationStorage) throw error;
             this.noteMysqlFailure(error);
             for (const id of ids) {
                 if (checkpointId && numericPostId(id) <= checkpointId) known.add(id);
@@ -730,6 +758,7 @@ class GuildApplicationStore {
             if (!mysql) return local;
             return new Date(local.postedAt) > new Date(mysql.postedAt) ? local : mysql;
         } catch (error) {
+            if (error.guildApplicationStorage) throw error;
             this.noteMysqlFailure(error);
             return local;
         }
@@ -770,6 +799,7 @@ class GuildApplicationStore {
             local.forEach(record => byId.set(String(record.postId), record));
             return [...byId.values()];
         } catch (error) {
+            if (error.guildApplicationStorage) throw error;
             this.noteMysqlFailure(error);
             return local;
         }
@@ -798,6 +828,7 @@ class GuildApplicationStore {
             local.forEach(record => byId.set(String(record.postId), record));
             return [...byId.values()];
         } catch (error) {
+            if (error.guildApplicationStorage) throw error;
             this.noteMysqlFailure(error);
             return local;
         }
@@ -833,6 +864,7 @@ class GuildApplicationStore {
             this.noteMysqlRestored();
             return [...byId.values()].filter(record => isVoteReminderCandidate(record, now));
         } catch (error) {
+            if (error.guildApplicationStorage) throw error;
             this.noteMysqlFailure(error);
             return local;
         }
@@ -841,7 +873,10 @@ class GuildApplicationStore {
     startSyncLoop() {
         if (this.storageMode === 'json' || this.syncInterval) return;
         this.syncInterval = setInterval(() => {
-            this.syncFallback().catch(error => this.noteMysqlFailure(error));
+            this.syncFallback().catch(error => {
+                if (error.guildApplicationStorage) this.noteLocalStorageFailure(error);
+                else this.noteMysqlFailure(error);
+            });
         }, this.syncIntervalMs);
         this.syncInterval.unref?.();
     }

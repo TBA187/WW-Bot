@@ -177,23 +177,12 @@ function scheduleNextNotification({
 // Reminder times every Saturday:
 // 09:30 and 21:30 UTC/GMT
 //
-// Alternating anchor:
-// Saturday, 29 August 2026
-// 10:00 UTC = BCC
-// 22:00 UTC = FCC
+// Alternating anchor - Saturday, 29 August 2026:
+// 10:00 UTC = FCC
+// 22:00 UTC = BCC
 //
 // The order reverses each following Saturday.
 // ============================================================
-
-/**
- * Determines which contest runs in a Saturday time slot.
- *
- * Anchor Saturday, 29 August 2026:
- * 10:00 UTC -> BCC
- * 22:00 UTC -> FCC
- *
- * The order reverses every following Saturday.
- */
 function getContestKey(saturdayStartUtc, eventHourUtc) {
     const weeksFromAnchor = Math.round(
         (saturdayStartUtc - ANCHOR_SATURDAY_UTC_MS) / WEEK_MS

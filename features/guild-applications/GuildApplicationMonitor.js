@@ -130,6 +130,7 @@ class GuildApplicationMonitor {
             return true;
         } catch (error) {
             if (error instanceof ForumRequestError) this.forumFailed(error);
+            else if (error.guildApplicationStorage) this.store.noteLocalStorageFailure(error);
             else console.error('[WW LOG] Guild Application monitor cycle failed:', error);
             return false;
         } finally {

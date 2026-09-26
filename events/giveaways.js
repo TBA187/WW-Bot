@@ -38,7 +38,9 @@ const JSON_SOURCES = {
 const DEFAULT_DATA_FILE = path.join(process.cwd(), 'data', 'giveaways.json');
 const LOGO_PATH = path.join(process.cwd(), 'images', 'ww_logo.png');
 const LOGO_ATTACHMENT_URL = 'attachment://ww_logo.png';
-const LOOP_INTERVAL_MS = 60 * 1000;
+const GIVEAWAY_RECOVERY_SWEEP_MS = 60 * 60 * 1000;
+const GIVEAWAY_MIN_RETRY_MS = 60 * 1000;
+const GIVEAWAY_END_LEASE_SECONDS = 300;
 
 const RELATIVE_TIME_RE = /(\d+)\s*(d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)/gi;
 const COLOR_NAMES = {
@@ -454,9 +456,10 @@ class GiveawayStore {
         console.log('[WW LOG] MySQL giveaway storage restored; pending JSON data will synchronize automatically.');
     }
 
-    async mysqlQuery(sql, params = []) {
+    async mysqlQuery(sql, params = [], retries = 1) {
         try {
-            const result = await this.db.query(sql, params);
+            // Reads and fixed-ID upserts can be repeated once. Claims cannot.
+            const result = await this.db.query(sql, params, retries);
             this.noteMysqlRestored();
             return result;
         } catch (err) {
@@ -623,15 +626,15 @@ class GiveawayStore {
         });
     }
 
-    async updateGiveaway(giveawayId, fields) {
+    async updateGiveaway(giveawayId, fields, { requireMysql = false } = {}) {
         return this.enqueue(async () => {
-            const giveaway = await this.getGiveawayUnlocked(giveawayId);
+            const giveaway = await this.getGiveawayUnlocked(giveawayId, { requireMysql });
             if (!giveaway) return null;
-            return this.saveGiveawayUnlocked(giveawayId, { ...giveaway, ...fields });
+            return this.saveGiveawayUnlocked(giveawayId, { ...giveaway, ...fields }, { requireMysql });
         });
     }
 
-    async saveGiveawayUnlocked(giveawayId, giveaway) {
+    async saveGiveawayUnlocked(giveawayId, giveaway, { requireMysql = false } = {}) {
         const saved = { ...clone(giveaway), giveaway_id: giveawayId };
         if (this.storageMode === 'json') return this.localSaveGiveaway(giveawayId, saved, false);
         try {
@@ -640,18 +643,20 @@ class GiveawayStore {
             this.clearPending('pendingSyncGiveawayIds', giveawayId);
             return this.localSaveGiveaway(giveawayId, saved, false);
         } catch (err) {
+            if (requireMysql) throw err;
             this.noteMysqlFailure(err);
             return this.localSaveGiveaway(giveawayId, saved, true);
         }
     }
 
-    async getGiveaway(giveawayId) {
-        return this.getGiveawayUnlocked(giveawayId);
+    async getGiveaway(giveawayId, { requireMysql = false } = {}) {
+        return this.getGiveawayUnlocked(giveawayId, { requireMysql });
     }
 
-    async getGiveawayUnlocked(giveawayId) {
+    async getGiveawayUnlocked(giveawayId, { requireMysql = false } = {}) {
+        if (requireMysql && !this.canUseMysql()) throw new Error('MySQL is required to finish a shared giveaway draw.');
         const local = this.local.giveaways[giveawayId];
-        if (local && (this.storageMode === 'json' || (this.local.pendingSyncGiveawayIds || []).includes(giveawayId))) {
+        if (!requireMysql && local && (this.storageMode === 'json' || (this.local.pendingSyncGiveawayIds || []).includes(giveawayId))) {
             this.cacheGiveaway(local);
             return clone(local);
         }
@@ -663,10 +668,12 @@ class GiveawayStore {
                 if (giveaway) this.cacheGiveaway(giveaway);
                 return giveaway;
             } catch (err) {
+                if (requireMysql) throw err;
                 this.noteMysqlFailure(err);
             }
         }
 
+        if (requireMysql) return null;
         const cached = this.cache.giveaways.get(String(giveawayId));
         return cached ? clone(cached) : (local ? clone(local) : null);
     }
@@ -721,11 +728,76 @@ class GiveawayStore {
     }
 
     async listDueGiveaways(now = new Date()) {
-        const giveaways = await this.listGiveaways(GIVEAWAY_ACTIVE);
+        let giveaways;
+        if (this.canUseMysql()) {
+            try {
+                await this.syncPending();
+                const [rows] = await this.mysqlQuery(`
+                    SELECT giveaway_json FROM giveaways
+                    WHERE status = ? AND ends_at <= UTC_TIMESTAMP(6)
+                      AND (end_lease_expires_at IS NULL OR end_lease_expires_at <= UTC_TIMESTAMP(6))
+                    ORDER BY ends_at ASC
+                `, [GIVEAWAY_ACTIVE]);
+                giveaways = mergeById('giveaway_id', rows.map(row => fromJson(row.giveaway_json, {})), this.pendingGiveaways());
+            } catch (err) {
+                this.noteMysqlFailure(err);
+            }
+        }
+        if (!giveaways) giveaways = await this.listGiveaways(GIVEAWAY_ACTIVE);
         return giveaways.filter(giveaway => {
             const endsAt = parseDate(giveaway.ends_at);
-            return endsAt && endsAt <= now;
+            return giveaway.status === GIVEAWAY_ACTIVE && endsAt && endsAt <= now;
         }).sort((a, b) => parseDate(a.ends_at) - parseDate(b.ends_at));
+    }
+
+    async nextDueAt() {
+        if (this.canUseMysql()) {
+            try {
+                await this.syncPending();
+                const [rows] = await this.mysqlQuery(`
+                    SELECT DATE_FORMAT(MIN(CASE
+                        WHEN ends_at <= UTC_TIMESTAMP(6) AND end_lease_expires_at > UTC_TIMESTAMP(6)
+                        THEN end_lease_expires_at ELSE ends_at END), '%Y-%m-%dT%H:%i:%s.%fZ') AS due_at
+                    FROM giveaways WHERE status = ?
+                `, [GIVEAWAY_ACTIVE]);
+                const dates = [parseDate(rows[0]?.due_at), ...this.pendingGiveaways()
+                    .filter(giveaway => giveaway.status === GIVEAWAY_ACTIVE)
+                    .map(giveaway => parseDate(giveaway.ends_at))].filter(Boolean);
+                return dates.length ? new Date(Math.min(...dates.map(date => date.getTime()))) : null;
+            } catch (err) {
+                this.noteMysqlFailure(err);
+            }
+        }
+        const active = await this.listGiveaways(GIVEAWAY_ACTIVE);
+        const dates = active.map(giveaway => parseDate(giveaway.ends_at)).filter(Boolean);
+        return dates.length ? new Date(Math.min(...dates.map(date => date.getTime()))) : null;
+    }
+
+    async claimEnd(giveawayId, { allowEarly = false } = {}) {
+        if (!this.canUseMysql()) {
+            const giveaway = await this.getGiveaway(giveawayId);
+            if (!giveaway || giveaway.status !== GIVEAWAY_ACTIVE || (!allowEarly && !giveawayHasEnded(giveaway))) return null;
+            return { shared: false, token: null };
+        }
+        await this.syncPending();
+        const token = crypto.randomBytes(16).toString('hex');
+        const [result] = await this.mysqlQuery(`
+            UPDATE giveaways
+            SET end_lease_token = ?,
+                end_lease_expires_at = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ${GIVEAWAY_END_LEASE_SECONDS} SECOND)
+            WHERE giveaway_id = ? AND status = ?
+              ${allowEarly ? '' : 'AND ends_at <= UTC_TIMESTAMP(6)'}
+              AND (end_lease_expires_at IS NULL OR end_lease_expires_at <= UTC_TIMESTAMP(6))
+        `, [token, giveawayId, GIVEAWAY_ACTIVE], 0);
+        return result.affectedRows === 1 ? { shared: true, token } : null;
+    }
+
+    async releaseEndClaim(giveawayId, claim) {
+        if (!claim?.shared || !claim.token) return;
+        await this.mysqlQuery(`
+            UPDATE giveaways SET end_lease_token = NULL, end_lease_expires_at = NULL
+            WHERE giveaway_id = ? AND end_lease_token = ?
+        `, [giveawayId, claim.token], 1);
     }
 
     async saveEntry(giveawayId, userId, entry) {
@@ -766,7 +838,8 @@ class GiveawayStore {
         return cached ? clone(cached) : (local ? clone(local) : null);
     }
 
-    async listEntries(giveawayId, { activeOnly = false } = {}) {
+    async listEntries(giveawayId, { activeOnly = false, requireMysql = false } = {}) {
+        if (requireMysql && !this.canUseMysql()) throw new Error('MySQL is required to finish a shared giveaway draw.');
         let entries = [];
         let loadedFromMysql = false;
         if (this.storageMode !== 'json' && this.canUseMysql()) {
@@ -776,6 +849,7 @@ class GiveawayStore {
                 entries.forEach(entry => this.cacheEntry(entry));
                 loadedFromMysql = true;
             } catch (err) {
+                if (requireMysql) throw err;
                 this.noteMysqlFailure(err);
             }
         }
@@ -787,12 +861,12 @@ class GiveawayStore {
                 [...(this.cache.entries.get(String(giveawayId))?.values() || [])]
             );
         }
-        entries = mergeById('user_id', entries, this.pendingEntriesForGiveaway(giveawayId));
+        if (!requireMysql) entries = mergeById('user_id', entries, this.pendingEntriesForGiveaway(giveawayId));
         if (activeOnly) entries = activeEntries(entries);
         return entries.sort((a, b) => String(a.joined_at || '').localeCompare(String(b.joined_at || '')));
     }
 
-    async saveDraw(drawId, draw) {
+    async saveDraw(drawId, draw, { requireMysql = false } = {}) {
         return this.enqueue(async () => {
             const saved = { ...clone(draw), draw_id: drawId };
             if (this.storageMode === 'json') return this.localSaveDraw(drawId, saved, false);
@@ -802,13 +876,15 @@ class GiveawayStore {
                 this.clearPending('pendingSyncDrawIds', drawId);
                 return this.localSaveDraw(drawId, saved, false);
             } catch (err) {
+                if (requireMysql) throw err;
                 this.noteMysqlFailure(err);
                 return this.localSaveDraw(drawId, saved, true);
             }
         });
     }
 
-    async listDraws(giveawayId) {
+    async listDraws(giveawayId, { requireMysql = false } = {}) {
+        if (requireMysql && !this.canUseMysql()) throw new Error('MySQL is required to finish a shared giveaway draw.');
         let draws = [];
         let loadedFromMysql = false;
         if (this.storageMode !== 'json' && this.canUseMysql()) {
@@ -818,6 +894,7 @@ class GiveawayStore {
                 draws.forEach(draw => this.cacheDraw(draw));
                 loadedFromMysql = true;
             } catch (err) {
+                if (requireMysql) throw err;
                 this.noteMysqlFailure(err);
             }
         }
@@ -828,7 +905,7 @@ class GiveawayStore {
                 [...(this.cache.draws.get(String(giveawayId))?.values() || [])]
             );
         }
-        draws = mergeById('draw_id', draws, this.pendingDrawsForGiveaway(giveawayId));
+        if (!requireMysql) draws = mergeById('draw_id', draws, this.pendingDrawsForGiveaway(giveawayId));
         return draws.sort((a, b) => String(a.drawn_at || '').localeCompare(String(b.drawn_at || '')));
     }
 
@@ -1259,20 +1336,6 @@ function applyGiveawayFooter(embed) {
     return embed;
 }
 
-async function sendGiveawayMessage(channel, giveaway, config) {
-    const entries = await config.giveawayStore.listEntries(giveaway.giveaway_id, { activeOnly: true });
-    const embed = buildGiveawayEmbed(giveaway, { participantCount: entries.length });
-    const file = logoFile();
-    const payload = {
-        content: giveawayMessageContent(giveaway),
-        embeds: [embed],
-        components: buildGiveawayComponents(giveaway),
-        allowedMentions: { parse: [], roles: normalizeRoleIds(giveaway.ping_role_ids) }
-    };
-    if (file) payload.files = [file];
-    return channel.send(payload);
-}
-
 async function replyWithGiveawayMessage(interaction, giveaway, config) {
     const entries = await config.giveawayStore.listEntries(giveaway.giveaway_id, { activeOnly: true });
     const embed = buildGiveawayEmbed(giveaway, { participantCount: entries.length });
@@ -1391,7 +1454,7 @@ function withGiveawayLock(giveawayId, task) {
 }
 
 async function endGiveaway(client, config, giveaway, { actor = null, drawType, winnerCount = null, announceInteraction = null } = {}) {
-    return withGiveawayLock(giveaway.giveaway_id, () => endGiveawayLocked(
+    return withGiveawayLock(giveaway.giveaway_id, () => claimAndEndGiveawayLocked(
         client,
         config,
         giveaway,
@@ -1399,12 +1462,43 @@ async function endGiveaway(client, config, giveaway, { actor = null, drawType, w
     ));
 }
 
-async function endGiveawayLocked(client, config, giveaway, { actor = null, drawType, winnerCount = null, announceInteraction = null } = {}) {
+async function claimAndEndGiveawayLocked(client, config, giveaway, options = {}) {
+    if (options.drawType !== 'end' || !config.giveawayStore.claimEnd) {
+        return endGiveawayLocked(client, config, giveaway, options);
+    }
     const giveawayId = String(giveaway.giveaway_id);
-    const current = await config.giveawayStore.getGiveaway(giveawayId);
+    const claim = await config.giveawayStore.claimEnd(giveawayId, { allowEarly: Boolean(options.actor) });
+    if (!claim) {
+        const current = await config.giveawayStore.getGiveaway(giveawayId);
+        return [current || giveaway, (current?.winner_user_ids || []).map(String)];
+    }
+    let completed = false;
+    let writeAttempted = false;
+    try {
+        const result = await endGiveawayLocked(client, config, giveaway, {
+            ...options,
+            requireMysql: Boolean(claim.shared),
+            onWriteStart: () => { writeAttempted = true; }
+        });
+        completed = true;
+        wakeGiveawayLoop(client);
+        return result;
+    } finally {
+        // A failed read is safe to release; an uncertain draw write keeps the claim until expiry.
+        if (completed || !writeAttempted) {
+            await config.giveawayStore.releaseEndClaim(giveawayId, claim).catch(err => {
+                console.warn(`[WW LOG] Could not release giveaway end claim ${giveawayId}: ${err.code || err.message}`);
+            });
+        }
+    }
+}
+
+async function endGiveawayLocked(client, config, giveaway, { actor = null, drawType, winnerCount = null, announceInteraction = null, requireMysql = false, onWriteStart = null } = {}) {
+    const giveawayId = String(giveaway.giveaway_id);
+    const current = await config.giveawayStore.getGiveaway(giveawayId, { requireMysql });
     if (!current) return [giveaway, []];
 
-    const existingDraws = await config.giveawayStore.listDraws(giveawayId);
+    const existingDraws = await config.giveawayStore.listDraws(giveawayId, { requireMysql });
     if (drawType === 'end') {
         const previousEndDraw = [...existingDraws].reverse().find(draw => draw.draw_type === 'end');
         if (current.status !== GIVEAWAY_ACTIVE) {
@@ -1415,11 +1509,14 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
         if (previousEndDraw) {
             const winnerIds = (previousEndDraw.winner_user_ids || []).map(String);
             const endedAt = previousEndDraw.drawn_at || utcNowIso();
-            const recovered = await config.giveawayStore.updateGiveaway(giveawayId, {
+            onWriteStart?.();
+            const savedRecovery = await config.giveawayStore.updateGiveaway(giveawayId, {
                 status: GIVEAWAY_ENDED,
                 ended_at: endedAt,
                 winner_user_ids: winnerIds
-            }) || {
+            }, { requireMysql });
+            if (requireMysql && !savedRecovery) throw new Error(`Giveaway ${giveawayId} disappeared before its end was saved.`);
+            const recovered = savedRecovery || {
                 ...current,
                 status: GIVEAWAY_ENDED,
                 ended_at: endedAt,
@@ -1433,7 +1530,7 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
         return [current, (current.winner_user_ids || []).map(String)];
     }
 
-    const entries = await config.giveawayStore.listEntries(giveawayId, { activeOnly: true });
+    const entries = await config.giveawayStore.listEntries(giveawayId, { activeOnly: true, requireMysql });
     const count = winnerCount || Number(current.winners_total || 1);
     const excluded = new Set();
     if (drawType === 'reroll') {
@@ -1457,7 +1554,8 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
         eligible_count: activeEntries(entries).length,
         winner_user_ids: winnerIds
     };
-    await config.giveawayStore.saveDraw(drawId, draw);
+    onWriteStart?.();
+    await config.giveawayStore.saveDraw(drawId, draw, { requireMysql });
 
     const updates = { winner_user_ids: winnerIds };
     if (drawType === 'end') {
@@ -1467,7 +1565,9 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
         updates.last_rerolled_at = now;
     }
 
-    const updated = await config.giveawayStore.updateGiveaway(giveawayId, updates) || { ...current, ...updates };
+    const savedUpdate = await config.giveawayStore.updateGiveaway(giveawayId, updates, { requireMysql });
+    if (requireMysql && !savedUpdate) throw new Error(`Giveaway ${giveawayId} disappeared before its end was saved.`);
+    const updated = savedUpdate || { ...current, ...updates };
     await refreshGiveawayMessage(client, config, updated, { disabled: true });
     await announceGiveawayDraw(client, updated, winnerIds, { drawType, interaction: announceInteraction });
     return [updated, winnerIds];
@@ -1538,10 +1638,10 @@ function giveawayActionEmbed(giveaway, { joined }) {
 }
 
 async function sendGiveawayActionFeedback(interaction, embed) {
-    const payload = { embeds: [embed], flags: MessageFlags.Ephemeral };
+    const payload = { embeds: [embed] };
     const file = logoFile();
     if (file) payload.files = [file];
-    await interaction.followUp(payload);
+    await interaction.editReply(payload);
 }
 
 async function handleGiveawayButton(interaction, config) {
@@ -1570,7 +1670,15 @@ async function handleJoinLeave(interaction, config) {
         return;
     }
 
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    } catch (err) {
+        if (Number(err?.code || err?.rawError?.code) === 10062) {
+            console.info('[WW LOG] Giveaway entry click expired before Discord acknowledged it; the user can click again.');
+            return;
+        }
+        throw err;
+    }
     const [giveawayId] = await config.giveawayStore.getByMessageId(interaction.message.id);
     if (!giveawayId) {
         await interaction.editReply('That giveaway could not be found.');
@@ -1588,7 +1696,12 @@ async function handleJoinLeave(interaction, config) {
         if (!giveaway || giveaway.status !== GIVEAWAY_ACTIVE) return { type: 'inactive' };
 
         if (giveawayHasEnded(giveaway)) {
-            await endGiveawayLocked(interaction.client, config, giveaway, { actor: null, drawType: 'end' });
+            try {
+                await claimAndEndGiveawayLocked(interaction.client, config, giveaway, { actor: null, drawType: 'end' });
+            } catch (err) {
+                if (!config.giveawayStore.db?.isDatabaseUnavailableError?.(err)) throw err;
+                return { type: 'storage_unavailable' };
+            }
             return { type: 'ended' };
         }
 
@@ -1624,6 +1737,10 @@ async function handleJoinLeave(interaction, config) {
     }
     if (result.type === 'ended') {
         await interaction.editReply('This giveaway has ended.');
+        return;
+    }
+    if (result.type === 'storage_unavailable') {
+        await interaction.editReply('Giveaway storage is temporarily unavailable. Please try again shortly.');
         return;
     }
     if (result.type === 'missing_role') {
@@ -1996,9 +2113,24 @@ function drawSummary(action, giveaway, winnerIds, guild = null) {
 
 function startGiveawayLoop(client, config) {
     if (client.giveawayLoop) return;
+    let timer = null;
+    let running = false;
+    let stopped = false;
+    let wakeRequested = false;
+    const schedule = delayMs => {
+        if (stopped) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+            timer = null;
+            void runDueGiveaways();
+        }, delayMs);
+        timer.unref?.();
+    };
     const runDueGiveaways = async () => {
-        if (client.giveawayLoopRunning) return;
-        client.giveawayLoopRunning = true;
+        if (stopped) return;
+        if (running) { wakeRequested = true; return; }
+        running = true;
+        let delayMs = GIVEAWAY_RECOVERY_SWEEP_MS;
         try {
             await config.giveawayStore.syncPending?.();
             const dueGiveaways = await config.giveawayStore.listDueGiveaways(new Date());
@@ -2009,22 +2141,46 @@ function startGiveawayLoop(client, config) {
                         await endGiveaway(client, config, current, { actor: null, drawType: 'end' });
                     }
                 } catch (err) {
-                    console.error(`[WW LOG] Could not end giveaway ${giveaway.giveaway_id || 'unknown'}:`, err);
+                    if (!config.giveawayStore.db?.isDatabaseUnavailableError?.(err)) {
+                        console.error(`[WW LOG] Could not end giveaway ${giveaway.giveaway_id || 'unknown'}:`, err);
+                    }
                 }
                 if (index + 1 < dueGiveaways.length) await wait(GIVEAWAY_END_PACING_MS);
             }
+            const nextDueAt = await config.giveawayStore.nextDueAt();
+            if (nextDueAt) {
+                const untilDueMs = parseDate(nextDueAt).getTime() - Date.now();
+                delayMs = Math.min(
+                    untilDueMs <= 0 ? GIVEAWAY_MIN_RETRY_MS : untilDueMs,
+                    GIVEAWAY_RECOVERY_SWEEP_MS
+                );
+            }
         } catch (err) {
-            console.error('[WW LOG] Giveaway loop failed:', err);
+            console.error('[WW LOG] Giveaway scheduler failed:', err);
+            delayMs = GIVEAWAY_MIN_RETRY_MS;
         } finally {
-            client.giveawayLoopRunning = false;
+            running = false;
+            schedule(wakeRequested ? 0 : delayMs);
+            wakeRequested = false;
         }
     };
-
-    client.giveawayLoop = setInterval(() => {
-        void runDueGiveaways();
-    }, LOOP_INTERVAL_MS);
-    client.giveawayLoop.unref?.();
+    client.giveawayLoop = {
+        wake() {
+            if (running) wakeRequested = true;
+            else schedule(0);
+        },
+        stop() {
+            stopped = true;
+            if (timer) clearTimeout(timer);
+            timer = null;
+            client.giveawayLoop = null;
+        }
+    };
     void runDueGiveaways();
+}
+
+function wakeGiveawayLoop(client) {
+    client?.giveawayLoop?.wake?.();
 }
 
 module.exports = {
@@ -2051,12 +2207,12 @@ module.exports = {
     parseColor,
     parseGiveawayEndTime,
     resolveRoleIds,
-    sendGiveawayMessage,
     replyWithGiveawayMessage,
     sendEmbedFollowUp,
     sendParticipantEmbeds,
     shouldRestrictGiveawayChannel,
     startGiveawayLoop,
+    wakeGiveawayLoop,
     utcNowIso,
     validateWinnerCount,
     deleteGiveawayMessage,

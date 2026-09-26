@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS giveaways (
   status VARCHAR(32) NOT NULL DEFAULT 'active',
   starts_at DATETIME(6) NOT NULL,
   ends_at DATETIME(6) NOT NULL,
+  end_lease_token VARCHAR(64) DEFAULT NULL,
+  end_lease_expires_at DATETIME(6) DEFAULT NULL,
   ended_at DATETIME(6) DEFAULT NULL,
   deleted_at DATETIME(6) DEFAULT NULL,
   color_hex VARCHAR(7) NOT NULL DEFAULT '#39FF14',

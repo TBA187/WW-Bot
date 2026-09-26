@@ -4,7 +4,7 @@ process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
 const { BotInstanceLease } = require('./db/BotInstanceLease.js');
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
-const { createGiveawayStore, startGiveawayLoop } = require('./events/giveaways.js');
+const { createGiveawayStore, handleGiveawayButton, startGiveawayLoop } = require('./events/giveaways.js');
 const NotificationStore = require('./features/pro-notifications/NotificationStore.js');
 const { NOTIFICATION_DEFINITIONS } = require('./features/pro-notifications/notificationCatalog.js');
 const {
@@ -349,8 +349,11 @@ async function bootstrap() {
 
         const lease = await botInstanceLease.acquire();
         if (!lease.acquired) {
+            const retryAfter = lease.remainingSeconds > 0
+                ? ` Retry in about ${lease.remainingSeconds} second(s) if the previous bot has stopped.`
+                : ' Retry shortly if the previous bot has stopped.';
             const error = new Error(
-                'Another White Walker Bot process is already active. Stop it before starting this copy.'
+                `The bot lease is still held by another process.${retryAfter}`
             );
             error.code = 'BOT_INSTANCE_ALREADY_ACTIVE';
             throw error;
@@ -540,6 +543,7 @@ async function shutdown(signal) {
     console.log(`[WW LOG] ${signal} received. Shutting down cleanly...`);
     guildApplicationMonitor.stop?.();
     tbaForumShopMonitor.stop?.();
+    client.giveawayLoop?.stop?.();
     client.destroy();
     await botInstanceLease.release();
     await db.end?.().catch(() => {});
@@ -644,6 +648,10 @@ client.on('interactionCreate', async interaction => {
 
         // Button Handling
         if (interaction.isButton()) {
+            // Acknowledge giveaway buttons before walking unrelated command handlers.
+            if (interaction.customId?.startsWith('ww_giveaway:')) {
+                if (await handleGiveawayButton(interaction, commandConfig)) return true;
+            }
             if (await handleGuildForumFeedbackButton(interaction, { ownerID: appConfig.ownerID })) return true;
 
             for (const command of new Set(commandMap.values())) {
@@ -693,6 +701,10 @@ client.on('interactionCreate', async interaction => {
             return;
         }
     } catch (err) {
+        if (err.code === 10062) {
+            console.warn(`[WW LOG] Discord interaction expired before acknowledgement: ${interaction.customId || interaction.commandName || 'unknown'}`);
+            return;
+        }
         console.error('Interaction error:', err);
         // Autocomplete interactions don't have reply/editReply methods
         if (interaction.isAutocomplete()) {

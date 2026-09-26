@@ -17,7 +17,6 @@ const {
     giveawayChannelOnlyError,
     giveawayDisplayLabel,
     giveawayEndedWithinRerollWindow,
-    handleGiveawayButton,
     makeGiveawayId,
     normalizeGiveawayDescription,
     parseColor,
@@ -30,6 +29,7 @@ const {
     shouldRestrictGiveawayChannel,
     utcNowIso,
     validateWinnerCount,
+    wakeGiveawayLoop,
     withGiveawayLock
 } = require('../events/giveaways');
 
@@ -91,6 +91,15 @@ class Giveaways {
                         o.setName('thumbnail')
                             .setDescription('Image for Giveaway (appears at the top right of the embed). Leave empty for White Walkers logo.')
                             .setRequired(false)
+                    )
+                    .addStringOption(o =>
+                        o.setName('pin_giveaway')
+                            .setDescription('Pin the giveaway to the channel')
+                            .setRequired(false)
+                            .addChoices(
+                                { name: 'Yes', value: 'yes' },
+                                { name: 'No', value: 'no' }
+                            )
                     )
                     .addStringOption(o =>
                         o.setName('ping_roles')
@@ -293,6 +302,7 @@ class Giveaways {
         const name = interaction.options.getString('name');
         const host = interaction.options.getString('host');
         const thumbnail = interaction.options.getAttachment('thumbnail');
+        const pinGiveaway = (interaction.options.getString('pin_giveaway') || 'no') === 'yes';
         const now = utcNowIso();
         let giveaway = {
             giveaway_id: giveawayId,
@@ -318,6 +328,7 @@ class Giveaways {
             deleted_at: null,
             color_hex: colorHex,
             thumbnail_url: thumbnail?.url || null,
+            pin_giveaway: pinGiveaway,
             winner_user_ids: []
         };
 
@@ -328,12 +339,27 @@ class Giveaways {
             message = await replyWithGiveawayMessage(interaction, giveaway, this.config);
         } catch (err) {
             console.error('[WW LOG] Giveaway create message failed:', err);
+            await this.giveawayStore.updateGiveaway(giveawayId, {
+                status: GIVEAWAY_DELETED,
+                deleted_at: utcNowIso()
+            });
+            wakeGiveawayLoop(interaction.client);
             await interaction.editReply('Discord returned an error while creating the giveaway.').catch(() => { });
             return;
         }
 
         giveaway = await this.giveawayStore.updateGiveaway(giveawayId, { message_id: message.id });
-        await interaction.followUp({ content: `Giveaway created: ${message.url}`, flags: MessageFlags.Ephemeral });
+        wakeGiveawayLoop(interaction.client);
+        let pinNotice = '';
+        if (pinGiveaway) {
+            try {
+                await message.pin('Giveaway created with pin enabled');
+            } catch (err) {
+                console.warn(`[WW LOG] Could not pin giveaway ${giveawayId}: ${err.code || err.message}`);
+                pinNotice = '\nI could not pin the message. Check the bot’s Manage Messages permission.';
+            }
+        }
+        await interaction.followUp({ content: `Giveaway created: ${message.url}${pinNotice}`, flags: MessageFlags.Ephemeral });
     }
 
     async edit(interaction) {
@@ -392,6 +418,7 @@ class Giveaways {
             return this.giveawayStore.updateGiveaway(giveawayId, updates);
         });
         if (!updated) return interaction.editReply('That active giveaway could not be found.');
+        if (updates.ends_at) wakeGiveawayLoop(interaction.client);
         await refreshGiveawayMessage(interaction.client, this.config, updated);
         await interaction.editReply(`Updated **${giveawayDisplayLabel(updated, { guild: interaction.guild })}**.`);
     }
@@ -408,11 +435,18 @@ class Giveaways {
             return interaction.editReply('That active giveaway could not be found.');
         }
 
-        const [ended, winnerIds] = await endGiveaway(interaction.client, this.config, record, {
-            actor: interaction.user,
-            drawType: 'end',
-            announceInteraction: interaction
-        });
+        let ended;
+        let winnerIds;
+        try {
+            [ended, winnerIds] = await endGiveaway(interaction.client, this.config, record, {
+                actor: interaction.user,
+                drawType: 'end',
+                announceInteraction: interaction
+            });
+        } catch (err) {
+            if (!this.giveawayStore.db?.isDatabaseUnavailableError?.(err)) throw err;
+            return interaction.editReply('Giveaway storage is temporarily unavailable. Please try again shortly.');
+        }
 
         if (ended.status !== GIVEAWAY_ENDED) {
             return interaction.editReply('That active giveaway could not be found.');
@@ -444,6 +478,7 @@ class Giveaways {
             });
         });
         if (!updated) return interaction.editReply('That giveaway could not be found.');
+        wakeGiveawayLoop(interaction.client);
         await deleteGiveawayMessage(interaction.client, this.config, updated);
         await interaction.editReply(`Deleted **${giveawayDisplayLabel(updated, { guild: interaction.guild })}**.`);
     }
@@ -537,10 +572,6 @@ class Giveaways {
             return interaction.respond(await giveawayAutocomplete(interaction, this.config, { status: 'all' }));
         }
         return interaction.respond([]);
-    }
-
-    async handleButton(interaction) {
-        return handleGiveawayButton(interaction, this.config);
     }
 
     userDisplayName(user) {

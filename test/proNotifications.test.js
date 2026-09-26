@@ -31,20 +31,30 @@ test('BCC and FCC use the supplied alternating Saturday anchor', () => {
     const anchorSaturday = Date.UTC(2026, 7, 29, 0, 0, 0);
     const followingSaturday = Date.UTC(2026, 8, 5, 0, 0, 0);
 
-    assert.equal(getContestKey(anchorSaturday, 10), 'BCC');
-    assert.equal(getContestKey(anchorSaturday, 22), 'FCC');
-    assert.equal(getContestKey(followingSaturday, 10), 'FCC');
-    assert.equal(getContestKey(followingSaturday, 22), 'BCC');
+    assert.equal(getContestKey(anchorSaturday, 10), 'FCC');
+    assert.equal(getContestKey(anchorSaturday, 22), 'BCC');
+    assert.equal(getContestKey(followingSaturday, 10), 'BCC');
+    assert.equal(getContestKey(followingSaturday, 22), 'FCC');
+    const observedSaturday = Date.UTC(2026, 8, 26, 0, 0, 0);
+    assert.equal(getContestKey(observedSaturday, 10), 'FCC');
+    assert.equal(getContestKey(observedSaturday, 22), 'BCC');
 });
 
 test('Saturday contest reminders choose the next event without sending late', () => {
     const beforeFirstReminder = getNextContestSchedule(Date.UTC(2026, 7, 29, 9, 29, 0));
     const afterFirstReminder = getNextContestSchedule(Date.UTC(2026, 7, 29, 9, 30, 1));
 
-    assert.equal(beforeFirstReminder.contestKey, 'BCC');
+    assert.equal(beforeFirstReminder.contestKey, 'FCC');
     assert.equal(beforeFirstReminder.reminderTime, Date.UTC(2026, 7, 29, 9, 30, 0));
-    assert.equal(afterFirstReminder.contestKey, 'FCC');
+    assert.equal(afterFirstReminder.contestKey, 'BCC');
     assert.equal(afterFirstReminder.reminderTime, Date.UTC(2026, 7, 29, 21, 30, 0));
+
+    const beforeObservedBcc = getNextContestSchedule(Date.UTC(2026, 8, 26, 21, 29, 0));
+    assert.equal(beforeObservedBcc.contestKey, 'BCC');
+    assert.equal(beforeObservedBcc.reminderTime, Date.UTC(2026, 8, 26, 21, 30, 0));
+    const afterObservedBcc = getNextContestSchedule(Date.UTC(2026, 8, 26, 21, 30, 1));
+    assert.equal(afterObservedBcc.contestKey, 'BCC');
+    assert.equal(afterObservedBcc.reminderTime, Date.UTC(2026, 9, 3, 9, 30, 0));
 });
 
 test('BCC and FCC each expose their own next event time', () => {
@@ -52,8 +62,8 @@ test('BCC and FCC each expose their own next event time', () => {
     const nextBcc = getNextContestScheduleForContest('BCC', now);
     const nextFcc = getNextContestScheduleForContest('FCC', now);
 
-    assert.equal(nextBcc.eventStart, Date.UTC(2026, 7, 29, 10, 0, 0));
-    assert.equal(nextFcc.eventStart, Date.UTC(2026, 7, 29, 22, 0, 0));
+    assert.equal(nextBcc.eventStart, Date.UTC(2026, 7, 29, 22, 0, 0));
+    assert.equal(nextFcc.eventStart, Date.UTC(2026, 7, 29, 10, 0, 0));
 });
 
 test('reminders mention only subscribed users', async () => {

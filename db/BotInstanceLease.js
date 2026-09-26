@@ -2,8 +2,8 @@
 
 const crypto = require('crypto');
 
-const DEFAULT_LEASE_MS = 90 * 1000;
-const DEFAULT_HEARTBEAT_MS = 30 * 1000;
+const DEFAULT_LEASE_MS = 30 * 1000;
+const DEFAULT_HEARTBEAT_MS = 10 * 1000;
 
 function positiveNumber(value, fallback) {
     const number = Number(value);
@@ -79,7 +79,8 @@ class BotInstanceLease {
             connection = await this.db.getConnection();
             await connection.beginTransaction();
             const [rows] = await connection.query(`
-                SELECT owner_id, expires_at <= UTC_TIMESTAMP(3) AS expired
+                SELECT owner_id, expires_at <= UTC_TIMESTAMP(3) AS expired,
+                    GREATEST(0, TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(3), expires_at)) AS remaining_seconds
                 FROM bot_instance_leases
                 WHERE lease_key = ?
                 FOR UPDATE
@@ -91,7 +92,12 @@ class BotInstanceLease {
                 await connection.commit();
                 this.acquired = false;
                 this.enforced = true;
-                return { acquired: false, enforced: true, ownerId: String(current.owner_id) };
+                return {
+                    acquired: false,
+                    enforced: true,
+                    ownerId: String(current.owner_id),
+                    remainingSeconds: Number(current.remaining_seconds || 0)
+                };
             }
 
             await connection.query(`

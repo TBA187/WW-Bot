@@ -12,8 +12,19 @@ function writeTextIfChanged(filePath, tempFilePath, text) {
         if (err.code !== 'ENOENT') throw err;
     }
 
-    fs.writeFileSync(tempFilePath, text);
-    fs.renameSync(tempFilePath, filePath);
+    try {
+        fs.writeFileSync(tempFilePath, text);
+        fs.renameSync(tempFilePath, filePath);
+    } catch (error) {
+        // A full disk can leave a partial .tmp file. Keep the last complete
+        // snapshot intact and remove the partial file before the next retry.
+        try {
+            fs.unlinkSync(tempFilePath);
+        } catch {
+            // The original write failure is the actionable error.
+        }
+        throw error;
+    }
     return true;
 }
 

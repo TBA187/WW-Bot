@@ -150,6 +150,31 @@ test('successful primary writes are marked as MySQL rather than fallback data', 
     assert.equal(db.upserts[0].params[38], 'mysql');
 });
 
+test('a local write failure after a MySQL save is not misreported as a MySQL outage', async () => {
+    const db = new FakeDb();
+    const file = tempFile();
+    const store = new GuildApplicationStore({ db, storageMode: 'auto', dataFile: file, hasMysqlCredentials: true });
+    await store.initialize();
+    const before = fs.readFileSync(file, 'utf8');
+    // Force a real filesystem error at the temporary snapshot path.
+    store.tempFile = path.join(file, 'unwritable.tmp');
+
+    await assert.rejects(store.saveRecord(record('226')), error => error.guildApplicationStorage === true);
+
+    assert.equal(db.upserts.length, 1);
+    assert.equal(store.mysqlOutage, false);
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+});
+
+test('an unreadable fallback is not replaced with an empty snapshot', () => {
+    const file = tempFile();
+    fs.writeFileSync(file, '{"pendingSync":true,"records":[');
+    const store = new GuildApplicationStore({ storageMode: 'auto', dataFile: file });
+
+    assert.throws(() => store.readData(), SyntaxError);
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"pendingSync":true,"records":[');
+});
+
 test('successful live synchronization clears fallback records but preserves checkpoint', async () => {
     const db = new FakeDb();
     db.fail = true;

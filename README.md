@@ -23,6 +23,7 @@ npm start
 ```
 
 `npm start` currently runs `node index.js`. MySQL-backed single-instance protection stops a second updated copy from logging in at the same time, preventing duplicate event logs, reminders, and notifications during host handoffs.
+On a clean stop, the bot releases its lease immediately. If a process is killed before cleanup, the lease expires after at most 30 seconds from its last heartbeat; a running process renews it every 10 seconds. Startup reports the approximate remaining wait when a lease is held.
 
 Run checks and tests:
 
@@ -124,6 +125,11 @@ Giveaways:
 
 - creates and manages White Walkers giveaways
 - supports required roles, ping roles, participant lists, ending, deleting, rerolling, and automatic ending
+- `/giveaway create` can optionally pin the giveaway message in its channel; the default is No and pinning requires Manage Messages
+- schedules the next end time directly, wakes when a giveaway is created or its timing changes, and performs an hourly recovery sweep
+- uses a five-minute MySQL end claim to keep two hosts from drawing the same giveaway; the required columns are defined in `sql/create_giveaway_tables.sql`
+- retries transient MySQL reads, fixed-ID saves, and exact-token claim release once; claims run once
+- waits for MySQL recovery to finish an end draw when a shared claim or its durable save cannot be confirmed
 - admin management uses Leader/Admin/Officer roles; required role setup is Officer-only
 
 Guild applications:
