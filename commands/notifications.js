@@ -16,10 +16,6 @@ const {
 const SELECT_PREFIX = 'notifications:subscriptions:';
 const CONFIRM_PREFIX = 'notifications:confirm:';
 
-function statusLabel(enabled) {
-    return enabled ? 'Enabled' : 'Disabled';
-}
-
 function statusEmoji(enabled) {
     return enabled ? '✅' : '❌';
 }
@@ -89,7 +85,7 @@ function subscriptionsEmbed(states, selectedKeys, user) {
         .setTitle(`Guild Notification Pings for ${username}`)
         .setDescription(
             `${description}\n\n` +
-            'Choose which guild notifications should ping you from the dropdown menu below, then press the button to confirm.' +
+            'Choose which notifications should ping you from the dropdown menu below, then press the button to confirm.' +
             disabledNotice
         )
         .setFooter({
@@ -147,7 +143,7 @@ class Notifications {
         this.pendingSelections = new Map();
         this.data = new SlashCommandBuilder()
             .setName('notifications')
-            .setDescription('Choose which guild notifications should ping you.');
+            .setDescription('Choose which notifications should ping you.');
     }
 
     async buildReply(user, selectedKeys = null, panelId = 'current') {

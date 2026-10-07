@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 const botConfig = require('../config.json');
+const { SERVERS, selectionFeedback } = require('../features/pvp-scouting/ScoutServerSettings.js');
 
 
 // AUTO ROLES - INTERNAL CONFIG TYPES
@@ -337,7 +338,8 @@ const GUILD_ROLES_PANEL = autoRolePanelConfig({
         '-# - Select **Level / EV ✨** to be pinged for service requests.\n' +
         '-# - Select **Dex Service 🤝** to be pinged for service requests.\n' +
         '-# - Select **PRO Notifications 🔔** to receive notifications about useful game information, updates, and upcoming events.\n' +
-        '-# - Select **Stream 🔔** to be pinged when someone from the Guild streams. You can also ping this role when you go live.',
+        '-# - Select **Stream 🔔** to be pinged when someone from the Guild streams. You can also ping this role when you go live.\n' +
+        '-# - Select your **Server Roles**. <@1470242342383521943> will remember your **Server** choice and use it for future commands.',
     colorHex: '#02F3D7',
     imagePath: 'images/ww_logo.png',
     imageFilename: 'ww_logo.png',
@@ -388,11 +390,37 @@ const GUILD_ROLES_PANEL = autoRolePanelConfig({
             row: 0
         }),
         autoRoleChoiceConfig({
+            key: 'gold',
+            label: 'Gold',
+            roleId: botConfig.goldRoleID,
+            emojiName: SERVERS.gold.emoji.name,
+            emojiId: SERVERS.gold.emoji.id,
+            buttonStyle: ButtonStyle.Primary,
+            row: 1
+        }),
+        autoRoleChoiceConfig({
+            key: 'silver',
+            label: 'Silver',
+            roleId: botConfig.silverRoleID,
+            emojiName: SERVERS.silver.emoji.name,
+            emojiId: SERVERS.silver.emoji.id,
+            buttonStyle: ButtonStyle.Primary,
+            row: 1
+        }),
+        autoRoleChoiceConfig({
+            key: 'cross',
+            label: 'Cross Server',
+            roleId: null,
+            unicodeEmoji: SERVERS.cross.emoji,
+            buttonStyle: ButtonStyle.Primary,
+            row: 1
+        }),
+        autoRoleChoiceConfig({
             key: 'pro_notifications',
             label: 'PRO Notifications',
             roleId: '1537991574162640906',
             unicodeEmoji: '🔔',
-            buttonStyle: ButtonStyle.Primary,
+            buttonStyle: ButtonStyle.Secondary,
             row: 1
         }),
         autoRoleChoiceConfig({
@@ -400,7 +428,7 @@ const GUILD_ROLES_PANEL = autoRolePanelConfig({
             label: 'Stream',
             roleId: '1368716918420148314',
             unicodeEmoji: '🔔',
-            buttonStyle: ButtonStyle.Primary,
+            buttonStyle: ButtonStyle.Secondary,
             row: 1
         })
     ]
@@ -1869,7 +1897,27 @@ async function updateAutoRolePanel(message, panel) {
 }
 
 
-async function handleAutoRoleButton(interaction) {
+async function handleServerRoleButton(interaction, server, serverSettings) {
+    await deferHidden(interaction);
+
+    if (!serverSettings) {
+        await sendHiddenFeedback(interaction, 'Server settings are temporarily unavailable. Please try again later.');
+        return;
+    }
+
+    try {
+        const result = await serverSettings.select(interaction, server, { toggle: true });
+        await sendHiddenFeedback(interaction, selectionFeedback(result));
+    } catch (error) {
+        console.error('[WW LOG] Could not save a guild member server preference:', error);
+        await sendHiddenFeedback(interaction, error.message === 'No permission!'
+            ? 'No permission!'
+            : 'Could not save your server selection and role. Please try again.');
+    }
+}
+
+
+async function handleAutoRoleButton(interaction, serverSettings = null) {
     if (!interaction.customId.startsWith(`${CUSTOM_ID_PREFIX}:`)) return false;
 
     const [, , panelKey, componentType, ...args] = interaction.customId.split(':');
@@ -1895,6 +1943,11 @@ async function handleAutoRoleButton(interaction) {
             content: 'Auto-role choice not found! Please ask staff to repost this panel.',
             flags: MessageFlags.Ephemeral
         });
+        return true;
+    }
+
+    if (panel.key === 'guild_roles' && ['gold', 'silver', 'cross'].includes(choice.key)) {
+        await handleServerRoleButton(interaction, choice.key, serverSettings);
         return true;
     }
 

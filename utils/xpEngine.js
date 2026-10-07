@@ -3,7 +3,7 @@
 // ==========================
 const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const { getXpForNextLevel, getTotalXpForLevel, getLevelFromTotalXp } = require('./xpMath');
-const { fetchTrackById, fetchRewardsByIds, getXpTypeFromTrackInfo } = require('./xpDbHelper');
+const { fetchTrackById, fetchRewardsByIds, getXpTypeFromTrackInfo, reportXpDatabaseError } = require('./xpDbHelper');
 const xpSettings = require('../config/xpConfig');
 
 /**
@@ -257,7 +257,9 @@ async function processXp(userId, guild, channelId, member, xpGained, trackInfo, 
             }
         }
     } catch (err) {
-        console.error(`[XP ENGINE] 🚨 Error for ${userId} on track ${track}:`, err);
+        reportXpDatabaseError(commandConfig.db, err, {
+            context: `🚨 Error for ${userId} on track ${track}`, write: true, prefix: '[XP ENGINE]'
+        });
     }
 }
 

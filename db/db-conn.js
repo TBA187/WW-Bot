@@ -33,9 +33,22 @@ const TRANSIENT_DB_ERROR_CODES = new Set([
     'ER_CON_COUNT_ERROR'
 ]);
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const rawQuery = db.query.bind(db);
 const rawGetConnection = db.getConnection.bind(db);
+const rawEnd = db.end.bind(db);
+const shutdownController = new AbortController();
+const { abortableDelay, shutdownError } = require('../utils/abortable.js');
+db.isClosed = false;
+db.end = function endOnce() {
+    if (db.isClosed) return db.endPromise;
+    db.isClosed = true;
+    shutdownController.abort();
+    db.endPromise = rawEnd();
+    return db.endPromise;
+};
+function checkOpen() {
+    if (db.isClosed) throw shutdownError();
+}
 const health = new DatabaseHealthTracker({
     baseCooldownMs: Number(process.env.DB_RETRY_COOLDOWN_MS || 5000),
     maxCooldownMs: Number(process.env.DB_RETRY_MAX_COOLDOWN_MS || 60000),
@@ -81,6 +94,7 @@ function isDatabaseUnavailableError(err) {
 }
 
 async function ensureDatabaseAttemptAllowed() {
+    checkOpen();
     if (!health.isUnavailable()) return;
     if (!health.canAttempt()) throw health.unavailableError();
 
@@ -89,8 +103,10 @@ async function ensureDatabaseAttemptAllowed() {
             const attemptStartedAt = Date.now();
             try {
                 await rawQuery('SELECT 1 AS db_health_check');
+                checkOpen();
                 health.recordSuccess();
             } catch (err) {
+                checkOpen();
                 if (shouldRetryDbError(err)) {
                     health.recordFailure(err, { attemptStartedAt });
                     throw health.unavailableError();
@@ -110,12 +126,15 @@ db.query = async function queryWithRetry(sql, params, retries = 2) {
     let lastErr;
 
     for (let attempt = 0; attempt <= retries; attempt++) {
+        checkOpen();
         const attemptStartedAt = Date.now();
         try {
             const result = await rawQuery(sql, params);
+            checkOpen();
             health.recordSuccess();
             return result;
         } catch (err) {
+            checkOpen();
             lastErr = err;
 
             if (!shouldRetryDbError(err)) {
@@ -126,7 +145,7 @@ db.query = async function queryWithRetry(sql, params, retries = 2) {
             if (attempt === retries) throw err;
 
             const delayMs = getRetryDelayMs(err, attempt);
-            await sleep(delayMs);
+            await abortableDelay(delayMs, shutdownController.signal);
         }
     }
 
@@ -138,9 +157,14 @@ db.getConnection = async function getConnectionWithHealthTracking() {
     const attemptStartedAt = Date.now();
     try {
         const connection = await rawGetConnection();
+        if (db.isClosed) {
+            connection.release();
+            throw shutdownError();
+        }
         health.recordSuccess();
         return connection;
     } catch (err) {
+        checkOpen();
         if (shouldRetryDbError(err)) health.recordFailure(err, { attemptStartedAt });
         throw err;
     }
@@ -163,14 +187,17 @@ const connectWithRetry = async () => {
     let attempt = 0;
 
     while (true) {
+        if (db.isClosed) return false;
         attempt++;
 
         try {
             await rawQuery('SELECT 1 + 1 AS result;');
+            if (db.isClosed) return false;
             health.recordSuccess();
             console.log('[DB LOG] Successfully connected to MySQL!');
             return true;
         } catch (err) {
+            if (db.isClosed) return false;
             const errorCode = err.code || err.message;
 
             if (!shouldRetryDbError(err)) {
@@ -189,7 +216,12 @@ const connectWithRetry = async () => {
             }
 
             const delayMs = getStartupRetryDelayMs(err, attempt);
-            await sleep(delayMs);
+            try {
+                await abortableDelay(delayMs, shutdownController.signal);
+            } catch (error) {
+                if (db.isClosed) return false;
+                throw error;
+            }
         }
     }
 };

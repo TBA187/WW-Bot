@@ -2,7 +2,8 @@ require('dotenv').config({ quiet: true });
 const appConfig = require('./config.json');
 process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
 const db = require('./db/db-conn.js');
-const { BotInstanceLease } = require('./db/BotInstanceLease.js');
+const { StartupLifecycle, abortable } = require('./utils/abortable.js');
+const lifecycle = new StartupLifecycle();
 const PvpKingStorage = require('./commands/pvp-king/utils/pvpKingStorage.js');
 const { createGiveawayStore, handleGiveawayButton, startGiveawayLoop } = require('./events/giveaways.js');
 const NotificationStore = require('./features/pro-notifications/NotificationStore.js');
@@ -12,6 +13,11 @@ const {
     handleGuildForumFeedbackButton
 } = require('./features/guild-applications/index.js');
 const { createTbaForumShopMonitor } = require('./features/tba-forum-shops/index.js');
+const { ScoutServerRegistry } = require('./features/pvp-scouting/ScoutServerRegistry.js');
+const { ScoutRosterStore } = require('./features/pvp-scouting/ScoutRosterStore.js');
+const { ScoutServerSettings } = require('./features/pvp-scouting/ScoutServerSettings.js');
+const { ScoutAuditLogger } = require('./features/pvp-scouting/ScoutAuditLogger.js');
+const { DiscordDiagnosticLogger } = require('./utils/discordDiagnostics.js');
 const { writeJsonIfChanged } = require('./utils/jsonFile.js');
 const {
     Client,
@@ -24,7 +30,7 @@ const {
     MessageFlags
 } = require('discord.js');
 const {
-    botTimezone, guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, streamRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, historyThreadID, dungeonChannelID, dungeonRoleID, giveawayChannelID
+    botTimezone, guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, guildMemberRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, pvpScoutingGoldChannelID, pvpScoutingSilverChannelID, goldRoleID, silverRoleID, historyThreadID, dungeonChannelID, dungeonRoleID, giveawayChannelID
 } = appConfig;
 
 const fs = require("fs");
@@ -55,10 +61,6 @@ const client = new Client({
         GatewayIntentBits.GuildVoiceStates
     ],
     partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction]
-});
-const botInstanceLease = new BotInstanceLease({
-    db,
-    leaseKey: `white-walker-bot:${clientId}:${guildId}`
 });
 
 // Map with DB Guild Settings where Key = guild_id, Value = { xp_enabled: false, ... }
@@ -229,6 +231,7 @@ function saveGuildSettingToMirror(row, { pendingSync = false } = {}) {
  */
 // TO-DO: ADD API CALL: When a setting is changed from the website dashboard, run syncDBSettings()
 async function syncDBSettings({ quiet = false } = {}) {
+    if (lifecycle.stopping) return false;
     if (!canUseGuildSettingsMysql()) {
         loadGuildSettingsFromMirror();
         return false;
@@ -262,6 +265,7 @@ async function syncDBSettings({ quiet = false } = {}) {
         }
         return true;
     } catch (err) {
+        if (lifecycle.stopping) return false;
         if (db.isDatabaseUnavailableError?.(err)) {
             noteGuildSettingsMysqlFailure(err);
         } else {
@@ -307,11 +311,23 @@ const notificationStore = new NotificationStore({
 });
 const guildApplicationMonitor = createGuildApplicationMonitor({ client, db, config: appConfig });
 const tbaForumShopMonitor = createTbaForumShopMonitor({ client, db, config: appConfig });
+const scoutRosterStore = new ScoutRosterStore({ db, guildMemberRoleID });
+const scoutServerSettings = new ScoutServerSettings({ config: appConfig, store: scoutRosterStore });
+const scoutAuditLogger = new ScoutAuditLogger({ client, guildId, channelId: logChannelID, ownerId: ownerID });
+const botDiagnostics = new DiscordDiagnosticLogger({ consoleObject: console,
+    send: event => scoutAuditLogger.diagnostic(event),
+    secrets: Object.entries(process.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|API_KEY/iu.test(key)).map(([, value]) => value) });
+botDiagnostics.install();
+const scoutServers = new ScoutServerRegistry({ client, db, config: appConfig,
+    rosterStore: scoutRosterStore, auditLogger: scoutAuditLogger, diagnostics: botDiagnostics,
+    dataPath: path.join(__dirname, 'data') });
+const { store: pvpScoutStore, ingestor: pvpScoutIngestor } = scoutServers.get('gold');
 
 // Build config object (Parameters to send to command classes)
 const commandConfig = {
     client,
     db,
+    shutdownSignal: lifecycle.signal,
     botTimezone,
     guildId,
     welcomeChannelID,
@@ -319,6 +335,7 @@ const commandConfig = {
     leaderRoleID,
     adminRoleID,
     officerRoleID,
+    guildMemberRoleID,
     pvpKingRoleID,
     pvpWarriorRoleID,
     wwRoleID,
@@ -328,6 +345,12 @@ const commandConfig = {
     ignoreLogPrivateChannelCreate,
     blockedEditBotMsgChannels,
     pvpKingChannelID,
+    pvpScoutingGoldChannelID,
+    pvpScoutingSilverChannelID,
+    goldRoleID,
+    silverRoleID,
+    scoutServers,
+    scoutServerSettings,
     historyThreadID,
     dungeonChannelID,
     dungeonRoleID,
@@ -336,47 +359,60 @@ const commandConfig = {
     notificationStore,
     challengeTimeouts,
     pvpKingStorage,
+    pvpScoutStore,
+    scoutRosterStore,
+    guildMemberStore: scoutRosterStore,
+    pvpScoutIngestor,
     onCooldown,
     commandMap,
     guildSettingsCache
 };
 
+async function startupStep(label, work) {
+    lifecycle.check();
+    const startedAt = Date.now();
+    const waitingLog = setInterval(() => {
+        console.warn(`[WW LOG] Startup is still waiting for ${label} (${Math.floor((Date.now() - startedAt) / 1000)}s).`);
+    }, 15000);
+    waitingLog.unref?.();
+    try {
+        const result = await lifecycle.run(work);
+        console.log(`[WW LOG] Startup: ${label} loaded in ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
+        return result;
+    } finally {
+        clearInterval(waitingLog);
+    }
+}
+
 async function bootstrap() {
     try {
         // Wait for DB Connection
         console.log('[WW LOG] Establishing database connection...');
-        const dbReady = await db.initPromise;
-
-        const lease = await botInstanceLease.acquire();
-        if (!lease.acquired) {
-            const retryAfter = lease.remainingSeconds > 0
-                ? ` Retry in about ${lease.remainingSeconds} second(s) if the previous bot has stopped.`
-                : ' Retry shortly if the previous bot has stopped.';
-            const error = new Error(
-                `The bot lease is still held by another process.${retryAfter}`
-            );
-            error.code = 'BOT_INSTANCE_ALREADY_ACTIVE';
-            throw error;
-        }
-        if (lease.enforced) {
-            console.log('[WW LOG] Acquired the single-instance bot lease.');
-        }
-        // If MySQL was unavailable, the heartbeat keeps trying. When it recovers,
-        // exactly one process wins the lease and every duplicate disconnects.
-        botInstanceLease.start(async () => {
-            client.destroy();
-            process.exitCode = 1;
-        });
+        const dbReady = await lifecycle.run(() => db.initPromise);
 
         // INITIAL SETTINGS LOAD: Load settings before events start firing.
         if (!dbReady) {
             console.warn('[WW LOG] Database unavailable at startup. DB-backed features will retry when used.');
         }
-        await syncDBSettings();
+        await startupStep('guild settings', () => syncDBSettings());
 
-        await pvpKingStorage.restore();
-        await giveawayStore.restore();
-        await notificationStore.restore();
+        await startupStep('PvP King data', () => pvpKingStorage.restore());
+        await startupStep('giveaway data', () => giveawayStore.restore());
+        await startupStep('notification data', () => notificationStore.restore());
+        // A cold first run warms suggestions before commands become usable.
+        // Later restarts have the saved list immediately, even during an outage.
+        await lifecycle.preload(() => scoutServers.warmAutocomplete(), {
+            timeoutCode: 'AUTOCOMPLETE_PRELOAD_TIMEOUT',
+            onTimeout: error => console.log(`[WW LOG] Scout autocomplete will refresh in the background (${error.code}).`),
+            onError: error => console.warn('[WW LOG] Could not preload scout autocomplete; background refresh will retry:', error)
+        });
+        // Saved preferences are warm before interactions arrive; an outage
+        // still leaves commands able to acknowledge before their own lookup.
+        await lifecycle.preload(() => scoutServerSettings.hydratePreferences(guildId), {
+            timeoutCode: 'SERVER_PREFERENCE_PRELOAD_TIMEOUT',
+            onTimeout: error => console.log(`[WW LOG] Player server preferences will refresh when used (${error.code}).`),
+            onError: error => console.warn('[WW LOG] Could not preload player server preferences; lookups will retry:', error)
+        });
 
         // Load commands
         const commandsForDiscord = []; // JSON for the REST API
@@ -417,12 +453,13 @@ async function bootstrap() {
         const rest = new REST({ version: '10' }).setToken(token);
         try {
             console.log('[WW LOG] Registering Guild slash commands...');
-            await rest.put(
+            await lifecycle.run(() => rest.put(
                 Routes.applicationGuildCommands(clientId, guildId),
                 { body: commandsForDiscord }
-            );
+            ));
             console.log('[WW LOG] ✅ Guild slash commands registered to Discord');
         } catch (err) {
+            lifecycle.check();
             console.error('[WW LOG] ❌ ERROR: Command registration failed:', err);
             throw err;
         }
@@ -481,6 +518,13 @@ async function bootstrap() {
                     continue;
                 }
 
+                // Grouped event modules can register several related Discord events from one file.
+                if (typeof event.register === 'function') {
+                    event.register(client, commandConfig);
+                    console.log(`[WW LOG] Registered Event Group: ${basePath}${file}`);
+                    continue;
+                }
+
                 // Standard Event Handling
                 if (event.name && typeof event.execute === 'function') {
                     // MASTER SETTINGS LOGIC - Skip listening for events if disabled globally
@@ -488,6 +532,7 @@ async function bootstrap() {
                     // Add check for logging_enabled, etc.
 
                     const executeEvent = (...args) => {
+                        if (lifecycle.stopping) return;
                         if (isXPFile) {
                             const eventData = args[0];
                             // const gId = eventData?.guild?.id || eventData?.guildId;
@@ -519,35 +564,45 @@ async function bootstrap() {
             }
         }
 
-        await client.login(token);
+        await lifecycle.run(() => client.login(token));
 
     } catch (err) {
-        if (err?.code === 'BOT_INSTANCE_ALREADY_ACTIVE') {
-            console.error(`[WW LOG] 🚨 Startup stopped: ${err.message}`);
-        } else {
-            console.error('[WW LOG] 🚨 Startup Failed:', err);
-        }
-        await botInstanceLease.release().catch(() => {});
-        process.exit(1);
+        if (shutdownStarted) return;
+        console.error('[WW LOG] 🚨 Startup Failed:', err);
+        await shutdown('Startup failed', 1);
     }
 }
 
 // Global Safety Listeners (prevents crashes)
 client.on('error', err => console.error('Discord client error:', err));
 process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
+// Node already prints warnings to stderr. Send one structured copy to the staff log.
+process.on('warning', warning => botDiagnostics.capture('warn', ['Node runtime warning:', warning]));
 
 let shutdownStarted = false;
-async function shutdown(signal) {
+async function shutdown(signal, exitCode = 0) {
     if (shutdownStarted) return;
     shutdownStarted = true;
+    lifecycle.stop();
     console.log(`[WW LOG] ${signal} received. Shutting down cleanly...`);
-    guildApplicationMonitor.stop?.();
-    tbaForumShopMonitor.stop?.();
+    // Cancel timers before closing the database and Discord connection.
+    client.cooldownNotifier?.stop?.();
+    pvpKingStorage.stopSyncLoop();
+    notificationStore.stopSyncLoop();
+    clearInterval(client.guildSettingsSyncLoop);
     client.giveawayLoop?.stop?.();
+    require('./tasks/proNotifications.js').stop?.();
+    const cleanup = Promise.allSettled([
+        guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop()
+    ]);
+    botDiagnostics.stop();
     client.destroy();
-    await botInstanceLease.release();
-    await db.end?.().catch(() => {});
-    process.exit(0);
+    await abortable(scoutAuditLogger.flush(), { timeoutMs: 2000, timeoutCode: 'SCOUT_LOG_SHUTDOWN_TIMEOUT' }).catch(() => {});
+    await abortable(cleanup, { timeoutMs: 3000, timeoutCode: 'SHUTDOWN_CLEANUP_TIMEOUT' }).catch(() => {});
+    await abortable(db.end(), {
+        timeoutMs: 2000, timeoutCode: 'SHUTDOWN_POOL_TIMEOUT'
+    }).catch(() => {});
+    process.exit(exitCode);
 }
 
 process.once('SIGINT', () => shutdown('SIGINT'));
@@ -555,6 +610,8 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 // Client Ready
 client.once(Events.ClientReady, async () => {
+    if (lifecycle.stopping) return;
+    botDiagnostics.start();
     console.log(`[WW LOG] Logged in as ${client.user.tag}`);
 
     // TO-DO: ADD "Lazy Load" - Instead of checking all guilds at startup, check for the guild
@@ -597,6 +654,7 @@ client.once(Events.ClientReady, async () => {
     guildApplicationMonitor.start().catch(err => console.error('[WW LOG] Guild Application monitor failed to start:', err));
     // The two shop checks are staggered after the application monitor to avoid a burst of forum requests.
     tbaForumShopMonitor.start().catch(err => console.error('[WW LOG] TBA PRO Forum shop monitor failed to start:', err));
+    scoutServers.start().catch(err => console.error('[WW LOG] PvP scouting ingestion failed to start:', err));
     require('./events/userUpdatesLogger.js').primeUserProfileCache(commandConfig);
     const cooldownTask = require('./tasks/cooldownNotifier.js');
     cooldownTask.execute(client, commandConfig);
@@ -610,6 +668,7 @@ client.once(Events.ClientReady, async () => {
 
 // Auto-Config DB settings for New Servers the bot just joined
 client.on('guildCreate', async (guild) => {
+    if (lifecycle.stopping) return;
     console.log(`[WW LOG] New Guild joined: ${guild.name} (${guild.id})`);
     const defaultSetting = {
         guild_id: guild.id,
@@ -636,6 +695,8 @@ client.on('guildCreate', async (guild) => {
 
 // Discord Interactions
 client.on('interactionCreate', async interaction => {
+    if (lifecycle.stopping) return;
+    const receivedAge = Math.max(0, Date.now() - (interaction.createdTimestamp || Date.now()));
     try {
         // Autocomplete Handling
         if (interaction.isAutocomplete()) {
@@ -647,7 +708,32 @@ client.on('interactionCreate', async interaction => {
         }
 
         // Button Handling
+        if (interaction.customId?.startsWith('scout-sources:')) {
+            const manager = commandMap.get('scout-review')?.sourceManager || commandMap.get('scout-settings')?.sourceManager;
+            if (manager && await manager.handleInteraction(interaction)) return true;
+        }
         if (interaction.isButton()) {
+            if (interaction.customId?.startsWith('scout-stats:page:')) {
+                const stats = commandMap.get('scout-stats');
+                if (stats && await stats.handleButton(interaction)) return true;
+            }
+            if (interaction.customId?.startsWith('ww-settings:')) {
+                const settings = commandMap.get('ww-settings');
+                if (settings && await settings.handleButton(interaction)) return true;
+            }
+            if (interaction.customId?.startsWith('pvp-scout:')) {
+                const scout = commandMap.get('scout');
+                if (scout && await scout.handleButton(interaction)) return true;
+            }
+            if (interaction.customId?.startsWith('scout-settings:')) {
+                const settings = commandMap.get('scout-settings');
+                if (settings && await settings.handleButton(interaction)) return true;
+            }
+            // Review buttons need their acknowledgement before unrelated handlers do any work.
+            if (interaction.customId?.startsWith('pvp-scout-review:')) {
+                const review = commandMap.get('scout-review');
+                if (review && await review.handleButton(interaction)) return true;
+            }
             // Acknowledge giveaway buttons before walking unrelated command handlers.
             if (interaction.customId?.startsWith('ww_giveaway:')) {
                 if (await handleGiveawayButton(interaction, commandConfig)) return true;
@@ -663,7 +749,11 @@ client.on('interactionCreate', async interaction => {
         }
 
         // Select Menu Handling
-        if (interaction.isStringSelectMenu()) {
+        if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) {
+            if (interaction.customId?.startsWith('scout-settings:')) {
+                const settings = commandMap.get('scout-settings');
+                if (settings && await settings.handleSelect(interaction)) return true;
+            }
             for (const command of new Set(commandMap.values())) {
                 if (typeof command.handleSelect === 'function') {
                     const handled = await command.handleSelect(interaction);
@@ -674,6 +764,18 @@ client.on('interactionCreate', async interaction => {
 
         // Modal Handling
         if (interaction.isModalSubmit()) {
+            if (interaction.customId?.startsWith('pvp-scout:')) {
+                const scout = commandMap.get('scout');
+                if (scout && await scout.handleModal(interaction)) return true;
+            }
+            if (interaction.customId?.startsWith('scout-settings:')) {
+                const settings = commandMap.get('scout-settings');
+                if (settings && await settings.handleModal(interaction)) return true;
+            }
+            if (interaction.customId?.startsWith('pvp-scout-review:modal:')) {
+                const review = commandMap.get('scout-review');
+                if (review && await review.handleModal(interaction)) return true;
+            }
             for (const command of new Set(commandMap.values())) {
                 if (typeof command.handleModal === 'function') {
                     const handled = await command.handleModal(interaction);
@@ -701,11 +803,22 @@ client.on('interactionCreate', async interaction => {
             return;
         }
     } catch (err) {
-        if (err.code === 10062) {
-            console.warn(`[WW LOG] Discord interaction expired before acknowledgement: ${interaction.customId || interaction.commandName || 'unknown'}`);
+        const interactionErrorCode = Number(err?.code || err?.rawError?.code);
+        if (interactionErrorCode === 10062 || interactionErrorCode === 40060) {
+            const age = Date.now() - interaction.createdTimestamp;
+            const reason = interactionErrorCode === 10062 ? 'expired before acknowledgement' : 'was already acknowledged';
+            console.warn(`[WW LOG] Discord interaction ${reason}: ${interaction.customId || interaction.commandName || 'unknown'} (id ${interaction.id}, ${receivedAge} ms old on arrival, ${age} ms old after the API request).`);
             return;
         }
-        console.error('Interaction error:', err);
+        // Discord REST error objects contain the full interaction URL and token.
+        // Keep diagnostics without printing that token into console logs.
+        console.error('Interaction error:', {
+            command: interaction.customId || interaction.commandName || 'unknown',
+            interactionId: interaction.id,
+            code: err?.code || err?.rawError?.code || null,
+            message: err?.message || String(err),
+            stack: err?.stack || null
+        });
         // Autocomplete interactions don't have reply/editReply methods
         if (interaction.isAutocomplete()) {
             return;

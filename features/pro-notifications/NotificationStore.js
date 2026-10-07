@@ -5,8 +5,6 @@ const { writeJsonIfChanged } = require('../../utils/jsonFile.js');
 const STORAGE_VERSION = 1;
 const SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const VALID_STORAGE_MODES = new Set(['auto', 'mysql', 'json']);
-const LEGACY_SATURDAY_NOTIFICATION_KEY = 'saturday_contests';
-const SATURDAY_NOTIFICATION_KEYS = ['bug_catching_contest', 'fish_catching_contest'];
 
 function parseStorageMode(value) {
     const mode = String(value || 'auto').toLowerCase();
@@ -84,6 +82,7 @@ class NotificationStore {
     }
 
     noteMysqlFailure(err) {
+        if (this.db?.isClosed || err?.code === 'BOT_SHUTTING_DOWN') return;
         if (this.db?.isDatabaseUnavailableError && !this.db.isDatabaseUnavailableError(err)) {
             console.error('[PRO NOTIFICATIONS] Unexpected MySQL storage error:', err);
             return;
@@ -219,42 +218,6 @@ class NotificationStore {
         this.rebuildCache();
     }
 
-    migrateLegacySaturdayContests() {
-        const legacySetting = this.local.settings[LEGACY_SATURDAY_NOTIFICATION_KEY];
-        if (legacySetting) {
-            for (const notificationKey of SATURDAY_NOTIFICATION_KEYS) {
-                const definition = this.definitionsByKey.get(notificationKey);
-                if (!definition || this.local.settings[notificationKey]) continue;
-
-                this.local.settings[notificationKey] = this.normalizeSetting({
-                    ...legacySetting,
-                    notification_key: notificationKey
-                }, definition);
-                if (this.storageMode !== 'json') {
-                    this.markPending('pendingSettings', notificationKey);
-                }
-            }
-        }
-
-        for (const legacySubscription of Object.values(this.local.subscriptions)) {
-            if (legacySubscription?.notification_key !== LEGACY_SATURDAY_NOTIFICATION_KEY) continue;
-
-            for (const notificationKey of SATURDAY_NOTIFICATION_KEYS) {
-                if (!this.definitionsByKey.has(notificationKey)) continue;
-                const id = subscriptionId(notificationKey, legacySubscription.user_id);
-                if (this.local.subscriptions[id]) continue;
-
-                this.local.subscriptions[id] = this.normalizeSubscription({
-                    ...legacySubscription,
-                    notification_key: notificationKey
-                });
-                if (this.storageMode !== 'json') {
-                    this.markPending('pendingSubscriptions', id);
-                }
-            }
-        }
-    }
-
     markAllSettingsPending() {
         for (const definition of this.definitions) {
             this.markPending('pendingSettings', definition.key);
@@ -264,7 +227,6 @@ class NotificationStore {
     async restore() {
         this.local = this.readJsonStore();
         const hadSettings = Object.keys(this.local.settings).length > 0;
-        this.migrateLegacySaturdayContests();
         this.ensureDefaultSettings();
 
         if (this.storageMode === 'json') {
@@ -296,24 +258,16 @@ class NotificationStore {
 
             for (const row of settings) {
                 const definition = this.definitionsByKey.get(String(row.notification_key));
-                if (String(row.notification_key) === LEGACY_SATURDAY_NOTIFICATION_KEY) {
-                    this.local.settings[LEGACY_SATURDAY_NOTIFICATION_KEY] = row;
-                    continue;
-                }
                 if (!definition) continue;
                 this.local.settings[definition.key] = this.normalizeSetting(row, definition);
             }
 
             for (const row of subscriptions) {
-                if (
-                    String(row.notification_key) !== LEGACY_SATURDAY_NOTIFICATION_KEY &&
-                    !this.definitionsByKey.has(String(row.notification_key))
-                ) continue;
+                if (!this.definitionsByKey.has(String(row.notification_key))) continue;
                 const subscription = this.normalizeSubscription(row);
                 this.local.subscriptions[subscriptionId(subscription.notification_key, subscription.user_id)] = subscription;
             }
 
-            this.migrateLegacySaturdayContests();
             this.ensureDefaultSettings({ markPending: true });
             await this.syncPending();
             this.local.source = 'mysql_fallback';
@@ -365,6 +319,11 @@ class NotificationStore {
             });
         }, SYNC_INTERVAL_MS);
         this.syncLoop.unref?.();
+    }
+
+    stopSyncLoop() {
+        clearInterval(this.syncLoop);
+        this.syncLoop = null;
     }
 
     getSetting(notificationKey) {

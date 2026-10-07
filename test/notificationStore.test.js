@@ -123,27 +123,42 @@ test('notification store preserves changes in JSON while MySQL is unavailable an
     assert.equal(db.subscriptions.get('guild-1:fish_catching_contest:user-2').enabled, 1);
 });
 
-test('legacy Saturday contest settings and subscriptions carry over to both new contests', async () => {
+test('contest settings and subscriptions keep their independent values after restore', async () => {
     const file = tempDataFile();
     fs.writeFileSync(file, JSON.stringify({
         version: 1,
         source: 'json_only',
         pendingSync: false,
         settings: {
-            saturday_contests: {
+            bug_catching_contest: {
                 guild_id: 'guild-1',
-                notification_key: 'saturday_contests',
+                notification_key: 'bug_catching_contest',
                 enabled: 0,
+                created_at: '2026-08-18T00:30:00.000Z',
+                updated_at: '2026-08-18T00:30:00.000Z'
+            },
+            fish_catching_contest: {
+                guild_id: 'guild-1',
+                notification_key: 'fish_catching_contest',
+                enabled: 1,
                 created_at: '2026-08-18T00:30:00.000Z',
                 updated_at: '2026-08-18T00:30:00.000Z'
             }
         },
         subscriptions: {
-            'saturday_contests:user-3': {
+            'bug_catching_contest:user-3': {
                 guild_id: 'guild-1',
-                notification_key: 'saturday_contests',
+                notification_key: 'bug_catching_contest',
                 user_id: 'user-3',
                 enabled: 1,
+                created_at: '2026-08-18T00:30:00.000Z',
+                updated_at: '2026-08-18T00:30:00.000Z'
+            },
+            'fish_catching_contest:user-3': {
+                guild_id: 'guild-1',
+                notification_key: 'fish_catching_contest',
+                user_id: 'user-3',
+                enabled: 0,
                 created_at: '2026-08-18T00:30:00.000Z',
                 updated_at: '2026-08-18T00:30:00.000Z'
             }
@@ -159,9 +174,9 @@ test('legacy Saturday contest settings and subscriptions carry over to both new 
     await store.restore();
 
     assert.equal(store.getSetting('bug_catching_contest').enabled, false);
-    assert.equal(store.getSetting('fish_catching_contest').enabled, false);
-    assert.deepEqual(store.getUserSubscriptionKeys('user-3'), [
-        'bug_catching_contest',
-        'fish_catching_contest'
-    ]);
+    assert.equal(store.getSetting('fish_catching_contest').enabled, true);
+    assert.deepEqual(store.getUserSubscriptionKeys('user-3'), ['bug_catching_contest']);
+    const restored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(restored.subscriptions['fish_catching_contest:user-3'].enabled, false);
+    assert.equal(restored.pendingSync, false);
 });

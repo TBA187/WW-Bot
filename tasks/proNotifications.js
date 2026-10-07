@@ -23,6 +23,13 @@ const CONTEST_NOTIFICATION_KEYS = {
 };
 
 let started = false;
+const reminderTimers = new Set();
+
+function stop() {
+    started = false;
+    for (const timer of reminderTimers) clearTimeout(timer);
+    reminderTimers.clear();
+}
 
 function getNotificationConfig(config) {
     const channelId = config?.generalChannelID;
@@ -139,6 +146,7 @@ function scheduleNextNotification({
     logNextReminder,
     logFailure
 }) {
+    if (!started) return;
     const schedule = getNextSchedule();
     const delay = Math.max(0, schedule.reminderTime - Date.now());
 
@@ -147,6 +155,8 @@ function scheduleNextNotification({
     }
 
     const timer = setTimeout(async () => {
+        reminderTimers.delete(timer);
+        if (!started) return;
         try {
             await sendReminder(client, notificationConfig, notificationStore, schedule);
         } catch (err) {
@@ -163,6 +173,7 @@ function scheduleNextNotification({
             });
         }
     }, delay);
+    reminderTimers.add(timer);
 
     // The Discord client keeps Node.js running.
     timer.unref?.();
@@ -417,6 +428,7 @@ function execute(client, config, notificationStore) {
 
 module.exports = {
     execute,
+    stop,
     getContestKey,
     getNextAltoMareSchedule,
     getNextContestSchedule,

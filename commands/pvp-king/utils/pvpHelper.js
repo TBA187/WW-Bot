@@ -23,10 +23,11 @@ function memberHasAnyRole(member, roleIds) {
 async function stopIfOnCooldown(interaction, onCooldown, commandKey, seconds, message = '### ⏳ Slow down!') {
     if (!onCooldown(interaction.user.id, commandKey, seconds)) return false;
 
-    await interaction.reply({
-        content: message,
-        flags: MessageFlags.Ephemeral
-    });
+    if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: message });
+    } else {
+        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+    }
     return true;
 }
 
@@ -43,10 +44,12 @@ async function requireAnyRole(interaction, roleIds, message = '### ❌  No permi
 async function requirePvpChannel(interaction, channelId, commandName) {
     if (interaction.channelId === channelId) return true;
 
-    await interaction.reply({
-        content: `### ❌  The \`/${commandName}\` command can only be used in <#${channelId}>`,
-        flags: MessageFlags.Ephemeral
-    });
+    const content = `### ❌  The \`/${commandName}\` command can only be used in <#${channelId}>`;
+    if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content });
+    } else {
+        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    }
     return false;
 }
 

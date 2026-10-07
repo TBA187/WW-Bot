@@ -19,6 +19,7 @@ class AutoRoles {
     constructor(config) {
         this.name = 'auto_roles_send';
         this.adminRoleID = config.adminRoleID;
+        this.serverSettings = config.scoutServerSettings || null;
 
         this.data = [
             // =========================================================
@@ -239,7 +240,7 @@ class AutoRoles {
     }
 
     async handleButton(interaction) {
-        return handleAutoRoleButton(interaction);
+        return handleAutoRoleButton(interaction, this.serverSettings);
     }
 
     async handleSelect(interaction) {

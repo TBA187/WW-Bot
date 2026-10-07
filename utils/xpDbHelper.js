@@ -58,10 +58,41 @@ function mapTrackRow(row) {
 }
 
 const SPECIAL_TRACKS_CACHE_TTL_MS = Number(process.env.XP_TRACK_CACHE_TTL_MS || 60000);
+const OUTAGE_LOG_INTERVAL_MS = 5 * 60 * 1000;
+const outageWarnings = new WeakMap();
+let specialTracksRequest = null;
 let specialTracksCache = {
     expiresAt: 0,
     tracks: null
 };
+
+function reportXpDatabaseError(db, error, { context, write = false, fallback = '', prefix = '[XP DB HELPER]' }) {
+    const unavailable = error?.code === 'DATABASE_UNAVAILABLE' || error?.isCircuitOpen
+        || db?.isDatabaseUnavailableError?.(error);
+    if (!unavailable) {
+        console.error(`${prefix} ${context}:`, error);
+        return;
+    }
+
+    // The pool already reports the outage and recovery. Keep XP's fallback
+    // notices brief, with separate notices for reads and unsaved writes.
+    const outageStartedAt = db.health?.outageStartedAt ?? null;
+    let state = outageWarnings.get(db);
+    if (!state || state.outageStartedAt !== outageStartedAt) {
+        state = { outageStartedAt, loggedAt: new Map() };
+        outageWarnings.set(db, state);
+    }
+    const kind = write ? 'write' : 'read';
+    const now = Date.now();
+    const lastLog = state.loggedAt.get(kind);
+    if (lastLog !== undefined && now - lastLog < OUTAGE_LOG_INTERVAL_MS) return;
+    state.loggedAt.set(kind, now);
+    const code = db.getErrorCode?.(error) || error.causeCode || error.code || 'UNKNOWN';
+    const detail = write
+        ? 'XP/activity updates could not be completed; failed operations are not queued for replay.'
+        : fallback;
+    console.warn(`${prefix} ${context}: MySQL unavailable (${code}).${detail ? ` ${detail}` : ''}`);
+}
 
 /**
  * Fetch all special XP tracks from the database.
@@ -74,6 +105,18 @@ async function fetchSpecialTracks(db) {
         return specialTracksCache.tracks;
     }
 
+    // Message, reaction and command events can request the same refresh.
+    if (specialTracksRequest) return specialTracksRequest;
+    const request = loadSpecialTracks(db);
+    specialTracksRequest = request;
+    try {
+        return await request;
+    } finally {
+        if (specialTracksRequest === request) specialTracksRequest = null;
+    }
+}
+
+async function loadSpecialTracks(db) {
     try {
         const [rows] = await db.query(`
             SELECT id, name, role_ids, channel_ids, level_rewards,
@@ -84,15 +127,17 @@ async function fetchSpecialTracks(db) {
 
         const tracks = rows.map(mapTrackRow);
         specialTracksCache = {
-            expiresAt: now + SPECIAL_TRACKS_CACHE_TTL_MS,
+            expiresAt: Date.now() + SPECIAL_TRACKS_CACHE_TTL_MS,
             tracks
         };
 
         return tracks;
     } catch (err) {
-        console.error('[XP DB HELPER] Error fetching special tracks:', err);
+        reportXpDatabaseError(db, err, {
+            context: 'Error fetching special tracks',
+            fallback: specialTracksCache.tracks ? 'Using cached special XP tracks.' : 'No cached special XP tracks are available.'
+        });
         if (specialTracksCache.tracks) {
-            console.warn('[XP DB HELPER] Using cached special XP tracks after database error.');
             return specialTracksCache.tracks;
         }
 
@@ -119,7 +164,7 @@ async function fetchTrackById(db, trackId) {
         if (rows.length === 0) return null;
         return mapTrackRow(rows[0]);
     } catch (err) {
-        console.error(`[XP DB HELPER] Error fetching track ${trackId}:`, err);
+        reportXpDatabaseError(db, err, { context: `Error fetching track ${trackId}` });
         return null;
     }
 }
@@ -184,7 +229,7 @@ async function fetchXpTrackAutocompleteChoices(db, focusedValue) {
             value: row.id.toString()
         }));
     } catch (err) {
-        console.error('[XP DB HELPER] Autocomplete error:', err);
+        reportXpDatabaseError(db, err, { context: 'Autocomplete error' });
         return [];
     }
 }
@@ -222,7 +267,7 @@ async function recordRawActivity(db, userId, guildId, username, xpType, actionTy
 
         await db.query(query, [userId, guildId, username, safeXpType, statCount, statCount]);
     } catch (err) {
-        console.error(`[XP DB HELPER] Error recording raw ${actionType} activity:`, err);
+        reportXpDatabaseError(db, err, { context: `Error recording raw ${actionType} activity`, write: true });
     }
 }
 
@@ -251,7 +296,7 @@ async function fetchRewardsByIds(db, rewardIds) {
             roleId: row.role_id
         }));
     } catch (err) {
-        console.error('[XP DB HELPER] Error fetching rewards by IDs:', err);
+        reportXpDatabaseError(db, err, { context: 'Error fetching rewards by IDs' });
         return [];
     }
 }
@@ -263,5 +308,6 @@ module.exports = {
     resolveXpTrack,
     getXpTypeFromTrackInfo,
     fetchXpTrackAutocompleteChoices,
+    reportXpDatabaseError,
     recordRawActivity
 };

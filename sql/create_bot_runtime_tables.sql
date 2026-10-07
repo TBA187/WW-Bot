@@ -1,13 +1,3 @@
-CREATE TABLE IF NOT EXISTS `bot_instance_leases` (
-    `lease_key` VARCHAR(191) NOT NULL,
-    `owner_id` VARCHAR(191) NOT NULL,
-    `acquired_at` DATETIME(3) NOT NULL,
-    `heartbeat_at` DATETIME(3) NOT NULL,
-    `expires_at` DATETIME(3) NOT NULL,
-    PRIMARY KEY (`lease_key`),
-    KEY `idx_bot_instance_leases_expires_at` (`expires_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
 CREATE TABLE IF NOT EXISTS `tba_forum_shop_checkpoints` (
     `shop_key` VARCHAR(64) NOT NULL,
     `topic_url` VARCHAR(1000) NOT NULL,

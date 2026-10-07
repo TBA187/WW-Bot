@@ -108,6 +108,7 @@ class PvpKingStorage {
     }
 
     noteMysqlFailure(err) {
+        if (this.db?.isClosed || err?.code === 'BOT_SHUTTING_DOWN') return;
         if (
             this.db?.isDatabaseUnavailableError &&
             err?.code !== 'PVP_DATABASE_UNAVAILABLE' &&

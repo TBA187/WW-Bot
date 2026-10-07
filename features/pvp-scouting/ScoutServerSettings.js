@@ -1,0 +1,140 @@
+// Keeps game-server preferences and Discord server roles in step across settings panels.
+'use strict';
+
+const { PermissionFlagsBits } = require('discord.js');
+
+const SERVERS = Object.freeze({
+    gold: Object.freeze({ label: 'Gold', emoji: { id: '1555743525759356948', name: 'gold' },
+        markup: '<:gold:1555743525759356948>', roleKey: 'goldRoleID', color: 0xc9a227 }),
+    silver: Object.freeze({ label: 'Silver', emoji: { id: '1555743603567886478', name: 'silver' },
+        markup: '<:silver:1555743603567886478>', roleKey: 'silverRoleID', color: 0x9fc1ff }),
+    cross: Object.freeze({ label: 'Cross Server', emoji: '🔗', markup: '🔗', color: 0x7c5cfc })
+});
+const memberJobs = new Map();
+
+function canUseGuildSettings(interaction, config) {
+    if (!interaction.inGuild?.() || String(interaction.guildId || interaction.guild?.id || '') !== String(config.guildId || '')) return false;
+    const roles = interaction.member?.roles;
+    const permittedRoles = [config.guildMemberRoleID, config.officerRoleID, config.adminRoleID, config.leaderRoleID]
+        .filter(Boolean).map(String);
+    return permittedRoles.some(id => roles?.cache?.has(id) || (Array.isArray(roles) && roles.includes(id)))
+        || Boolean((interaction.memberPermissions || interaction.member?.permissions)?.has?.(PermissionFlagsBits.Administrator));
+}
+
+function selectionFeedback({ previous, selected }) {
+    if (!selected) return `### ${SERVERS[previous].markup} ${SERVERS[previous].label}${previous === 'cross' ? '' : ' Server'} was removed ❌\n\n`
+        + 'You currently don\'t have any **Servers** saved! Select a Server by pressing the **Gold**, **Silver**, or **Cross Server** buttons.';
+    if (!previous) return `### ${SERVERS[selected].markup} ${SERVERS[selected].label}${selected === 'cross' ? '' : ' Server'} selected ✅`;
+    return `### Server changed from **${SERVERS[previous].label}** to ${SERVERS[selected].markup} **${SERVERS[selected].label}**`;
+}
+
+class ScoutServerSettings {
+    constructor({ config, store }) {
+        this.config = config;
+        this.store = store;
+    }
+
+    canUse(interaction) { return canUseGuildSettings(interaction, this.config); }
+    getCachedServer(guildId, userId) { return this.store.getCachedSelectedServer?.(guildId, userId); }
+    getSelectedServer(guildId, userId) { return this.store.getSelectedServer(guildId, userId); }
+    hydratePreferences(guildId) { return this.store.hydrateSelectedServers(guildId); }
+
+    async select(interaction, server, { toggle = false } = {}) {
+        if (!SERVERS[server]) throw new Error('Select Gold, Silver, or Cross Server.');
+        if (!this.canUse(interaction)) throw new Error('No permission!');
+        const key = `${interaction.guildId || interaction.guild.id}:${interaction.user.id}`;
+        const prior = memberJobs.get(key) || Promise.resolve();
+        const job = prior.catch(() => {}).then(() => this.applySelection(interaction, server, toggle))
+            .finally(() => { if (memberJobs.get(key) === job) memberJobs.delete(key); });
+        memberJobs.set(key, job);
+        return job;
+    }
+
+    async prepareRoles(interaction) {
+        const guild = interaction.guild;
+        const roleIds = ['gold', 'silver'].map(server => String(this.config[SERVERS[server].roleKey] || ''));
+        if (roleIds.some(id => !id) || roleIds[0] === roleIds[1]) throw new Error('Gold and Silver server roles are not configured correctly.');
+        if (!guild?.members?.fetch || !guild?.roles?.fetch) throw new Error('Discord member roles are temporarily unavailable.');
+        // Fetch first, before holding a database row lock during the role change.
+        const [member, goldRole, silverRole, bot] = await Promise.all([
+            guild.members.fetch({ user: interaction.user.id, force: true }),
+            guild.roles.fetch(roleIds[0]), guild.roles.fetch(roleIds[1]),
+            guild.members.me ? Promise.resolve(guild.members.me) : guild.members.fetchMe()
+        ]);
+        if (!member || !member.roles?.add || !member.roles?.remove) throw new Error('Could not load your Discord member roles.');
+        if (!this.canUse({ guildId: interaction.guildId || guild.id, guild, inGuild: () => true, member,
+            memberPermissions: member.permissions || interaction.memberPermissions })) throw new Error('No permission!');
+        if (!bot?.permissions?.has(PermissionFlagsBits.ManageRoles)) throw new Error('The bot needs Manage Roles permission to select a server.');
+        const highest = bot.roles?.highest;
+        for (const role of [goldRole, silverRole]) {
+            if (!role || role.managed || !highest || highest.comparePositionTo(role) <= 0) {
+                throw new Error('Gold and Silver roles must be below the bot\'s highest role.');
+            }
+        }
+        return { guild, member, roleIds };
+    }
+
+    async applySelection(interaction, server, toggle) {
+        const prepared = await this.prepareRoles(interaction);
+        const guildId = String(interaction.guildId || interaction.guild.id);
+        const userId = String(interaction.user.id);
+        let previousServer = null;
+        let rolesStarted = false;
+        try {
+            return await this.store.setSelectedServer(guildId, prepared.member, server, {
+                toggle,
+                beforeCommit: async ({ previous, selected }) => {
+                    previousServer = previous;
+                    rolesStarted = true;
+                    await this.syncRoles(prepared, this.rolesFor(selected));
+                }
+            });
+        } catch (error) {
+            if (rolesStarted) {
+                // A lost commit response can leave the transaction outcome uncertain.
+                // Read the saved preference before deciding which roles to restore.
+                // The locked preference is a safer fallback than the original
+                // role set, which might not match the saved preference.
+                let expectedRoles = this.rolesFor(previousServer);
+                let preferenceKnown = false;
+                try {
+                    const saved = await this.store.getSelectedServer(guildId, userId, { fresh: true });
+                    expectedRoles = this.rolesFor(saved);
+                    preferenceKnown = true;
+                } catch (readError) {
+                    console.error(`[WW LOG] Could not verify server preference after a failed selection for ${userId}:`, readError);
+                }
+                try {
+                    await this.syncRoles(prepared, expectedRoles);
+                    if (!preferenceKnown) console.error(`[WW LOG] Server roles were restored for ${userId}, but MySQL could not confirm the saved server preference.`);
+                } catch (roleError) {
+                    console.error(`[WW LOG] Could not reconcile server roles after a failed selection for ${userId}:`, roleError);
+                    error.rolesUnresolved = true;
+                }
+            }
+            throw error;
+        }
+    }
+
+    rolesFor(selected) {
+        const servers = selected === 'cross' ? ['gold', 'silver'] : selected ? [selected] : [];
+        return new Set(servers.map(server => String(this.config[SERVERS[server].roleKey])));
+    }
+
+    async syncRoles(prepared, expectedRoles) {
+        let member = await prepared.guild.members.fetch({ user: prepared.member.id || prepared.member.user.id, force: true });
+        const reason = 'White Walker game-server preference';
+        // Singular role routes preserve unrelated roles and remove the old server first.
+        for (const id of prepared.roleIds) if (!expectedRoles.has(id) && member.roles.cache.has(id)) {
+            member = await member.roles.remove(id, reason);
+        }
+        for (const id of expectedRoles) if (!member.roles.cache.has(id)) member = await member.roles.add(id, reason);
+        member = await prepared.guild.members.fetch({ user: prepared.member.id || prepared.member.user.id, force: true });
+        if (prepared.roleIds.some(id => member.roles.cache.has(id) !== expectedRoles.has(id))) {
+            throw new Error('Discord could not confirm the selected server role. Please try again.');
+        }
+        prepared.member = member;
+    }
+}
+
+module.exports = { ScoutServerSettings, SERVERS, canUseGuildSettings, selectionFeedback };

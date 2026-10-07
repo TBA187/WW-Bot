@@ -1,6 +1,6 @@
 # WW-Bot
 
-WW-Bot is the White Walkers Discord bot. It handles XP tracking, level rewards, PvP King challenges, dungeon recruitment, giveaways, guild application and forum shop monitoring, auto-role panels, welcome messages, and server audit logging.
+WW-Bot is the White Walkers Discord bot. It handles PvP scouting, XP tracking, level rewards, PvP King challenges, dungeon recruitment, giveaways, event notifications, guild application and forum shop monitoring, auto-role panels, welcome messages, and server audit logging.
 
 ## Requirements
 
@@ -21,9 +21,6 @@ Start the bot:
 ```bash
 npm start
 ```
-
-`npm start` currently runs `node index.js`. MySQL-backed single-instance protection stops a second updated copy from logging in at the same time, preventing duplicate event logs, reminders, and notifications during host handoffs.
-On a clean stop, the bot releases its lease immediately. If a process is killed before cleanup, the lease expires after at most 30 seconds from its last heartbeat; a running process renews it every 10 seconds. Startup reports the approximate remaining wait when a lease is held.
 
 Run checks and tests:
 
@@ -74,6 +71,8 @@ Server IDs and feature IDs live in `config.json`, including:
 - `forumGuildApplicationIgnoredUsers` for forum usernames whose posts should never trigger application handling
 - `tbaProForumShop` and `tbaProDungeonShop` for the two PRO shop topics monitored for new replies
 - `tbaProForumNotifications`: use `1` to enable the shop DMs or `0` to disable them
+- `pvpScoutingGoldChannelID` and `pvpScoutingSilverChannelID` for the separate Gold and Silver scout channels
+- `goldRoleID` and `silverRoleID` for the roles assigned when members select their game server
 
 ## Database Setup
 
@@ -87,6 +86,7 @@ Ready-to-run SQL files are grouped by feature in `sql/`:
 - `sql/create_xp_level_tables.sql`
 - `sql/create_guild_applications_table.sql`
 - `sql/create_bot_runtime_tables.sql`
+- `sql/create_pvp_scout_tables.sql`
 
 ## Runtime Data
 
@@ -99,10 +99,21 @@ Local runtime state is stored in `data/` and ignored by Git.
 - `data/notifications.json`: notification settings and member subscriptions, used during a MySQL outage and synchronized when MySQL returns.
 - `data/guild_applications.json`: forum scan checkpoint and temporary application records during a MySQL outage. In `json` mode it is the permanent local store.
 - `data/tba_forum_shops.json`: local recovery mirror for the two TBA shop checkpoints. In `auto` and `mysql` modes, checkpoints are shared through MySQL so switching hosts cannot replay an already processed forum post.
+- `data/scout-autocomplete-cache.json`: saved opponent index, grouped report counts and latest report timestamps, ordered by newest scout. The bot loads it into memory at startup and uses that in-memory index throughout the run to return up to 25 suggestions, including typed searches. Autocomplete requests refresh stale entries from MySQL in the background after 60 seconds; report changes invalidate the cache sooner. Successful full-index refreshes update the file when its contents change. Older snapshots still load; missing dates appear after the normal refresh. Its `.tmp` file is used briefly while replacing the saved snapshot.
+- `data/scout-autocomplete-silver-cache.json`: the same autocomplete snapshot for Silver. Each archive keeps its own names and counts; neither cache changes saved reports or review decisions.
+- `data/tesseract-cache/`: reusable OCR language data downloaded when an OCR worker first needs it.
 
 The fallback files are not meant to be manually edited while the bot is running!
 
 ## Feature Overview
+
+Guild settings:
+
+- `/ww-settings` gives guild members a private server-selection panel and a shortcut to the existing `/notifications` menu.
+- The shared `guild_members` table stores Discord profiles, current/former membership history and one `selected_server` value (`gold`, `silver`, `cross`, or no selection).
+- Authorized settings users who have never held the guild-member role are stored with status `other`, so their settings do not create current/former-member scout warnings.
+- Other commands can read the saved preference through `guildMemberStore.getSelectedServer(guildId, discordId)`. Existing commands keep their current behavior until they explicitly use it.
+- `pvp_scout_backfill` is required for resumable initial history import and its completion marker. Normal offline catch-up uses the separate `pvp_scout_catchup` checkpoint.
 
 XP and ranks:
 
@@ -147,6 +158,24 @@ Guild applications:
 - stores all scanned forum posts and classifications in MySQL, with the same `STORAGE_MODE` JSON fallback behavior as other persistent systems
 
 Before enabling the monitor in production, run `sql/create_guild_applications_table.sql`. Tesseract language data is loaded only when OCR is actually needed; normal labelled applications do not start the OCR worker.
+
+PvP scouting:
+
+- `/scout in_game_name:<name>` opens an opponent's scout history with teams, PvP ratings, contributors, screenshots, notes, and links to the original reports.
+- Scout reports are automatically parsed from the configured scouting channels. Reports that cannot be confidently validated are sent to the officer review queue.
+- Same-author follow-up messages and screenshots can be grouped into the same report. Edits to unresolved scouts automatically retry validation.
+- `/scout-review` allows Leaders, Admins, and Officers to review, correct, approve, reject, or export reports that require manual review.
+- `/scout-settings` allows staff to search and manage published scout reports, sources, friendly players, and current/former guild members.
+- `/scout-stats` shows combined Gold/Silver report, opponent, rating, screenshot and contributor totals. Teams and contributors are counted per grouped report, including valid follow-ups. New lookups refresh after report changes; contributor navigation reuses the opened snapshot.
+- Gold and Silver scout histories are stored separately. **Cross Server** searches both archives without merging their underlying reports.
+- Users can save a preferred server with `/ww-settings`. A server can also be selected temporarily when using `/scout` without changing the saved preference.
+- Scout pages support Pokémon searches, detailed report views, sorting, autocomplete, screenshots, average/latest PvP ratings, and server switching.
+- Server dropdown counts use brief cached count queries instead of loading the other archive's complete reports. Saved report changes clear these counts immediately.
+- Matching current/former guild members and players on the Friendly List display a recommendation to arrange a draw using the in-game `/draw` command.
+- New messages, replies, edits, and deletions are tracked while the bot is online. Missed scout messages are recovered automatically after startup.
+- Staff corrections, review decisions, and administrative changes are stored in MySQL and preserved across archive refreshes.
+
+The bundled Pokémon species data is derived from [Pokémon Showdown's Pokédex data](https://github.com/smogon/pokemon-showdown/blob/a5df8274e85b0889bf2a9b3422a08b39732374fc/data/pokedex.ts). Its license notice is included in `features/pvp-scouting/POKEMON_SHOWDOWN_LICENSE.txt`.
 
 TBA forum shop notifications:
 

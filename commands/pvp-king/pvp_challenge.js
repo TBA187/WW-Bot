@@ -3,7 +3,7 @@
 // ----------------------
 const { SlashCommandBuilder, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const { getServerLogo, getServerBanner, pvpThumnbnail, pvpBannerImage, createPvpFooter, createPvpLogFooter } = require('./utils/pvpAssets.js');
-const { formatNowMinute, getLogChannel, requirePvpChannel, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');
+const { formatNowMinute, requirePvpChannel, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
 class PvpChallengeKing {
     constructor(config) {
@@ -23,11 +23,11 @@ class PvpChallengeKing {
     }
 
     async execute(interaction) {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
         if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
 
         if (!await requirePvpChannel(interaction, this.pvpKingChannelID, 'pvp_challenge')) return;
-
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         // Auto-clear stale lock (15 minutes - Discord Limitation)
         //if (activeChallenge && Date.now() - activeChallenge.startedAt > 900000) {

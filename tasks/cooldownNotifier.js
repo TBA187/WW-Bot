@@ -55,13 +55,24 @@ module.exports = {
         const { pvpKingChannelID, pvpKingRoleID, guildId } = config;
         let isRunning = false;
         let storageUnavailable = false;
+        let stopped = Boolean(config.shutdownSignal?.aborted);
+        let interval;
+        const stop = () => {
+            stopped = true;
+            clearInterval(interval);
+            config.shutdownSignal?.removeEventListener('abort', stop);
+        };
+        client.cooldownNotifier?.stop?.();
+        client.cooldownNotifier = { stop };
+        config.shutdownSignal?.addEventListener('abort', stop, { once: true });
 
         const runCooldownCheck = async () => {
-            if (isRunning) return;
+            if (stopped || isRunning) return;
             isRunning = true;
 
             try {
                 const expired = await db.findExpiredNotifiableCooldowns();
+                if (stopped) return;
                 if (storageUnavailable) {
                     storageUnavailable = false;
                     console.log('[WW LOG] PvP cooldown notification storage restored; scheduled checks resumed.');
@@ -78,6 +89,7 @@ module.exports = {
                 }
 
                 const currentKing = kingRole?.members.first();
+                if (stopped) return;
                 if (!pvpChannel || !currentKing) return;
 
                 const usersToPing = [];
@@ -95,6 +107,7 @@ module.exports = {
                         );
                     }
                 } catch (error) {
+                    if (stopped) return;
                     console.warn(
                         '[WW LOG] Could not check recent PvP cooldown messages for duplicates; database state remains the primary guard:',
                         error.code || error.message
@@ -110,6 +123,8 @@ module.exports = {
 
                     idsToReset.push(row.id);
                 }
+
+                if (stopped) return;
 
                 if (usersToPing.length > 0) {
                     const logoFile = new AttachmentBuilder('./images/ww_logo.png', { name: 'ww_logo.png' });
@@ -132,10 +147,11 @@ module.exports = {
                     });
                 }
 
-                if (idsToReset.length > 0) {
+                if (!stopped && idsToReset.length > 0) {
                     await db.resetCooldownsByIds(idsToReset);
                 }
             } catch (err) {
+                if (stopped) return;
                 if (err.code === 'PVP_DATABASE_UNAVAILABLE' || err.code === 'DATABASE_UNAVAILABLE') {
                     if (!storageUnavailable) {
                         storageUnavailable = true;
@@ -153,8 +169,10 @@ module.exports = {
         };
 
         runCooldownCheck();
-        const interval = setInterval(runCooldownCheck, COOLDOWN_CHECK_INTERVAL_MS);
+        if (stopped) return client.cooldownNotifier;
+        interval = setInterval(runCooldownCheck, COOLDOWN_CHECK_INTERVAL_MS);
         interval.unref?.();
+        return client.cooldownNotifier;
     }
 };
 
