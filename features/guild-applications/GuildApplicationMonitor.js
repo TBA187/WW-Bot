@@ -56,6 +56,7 @@ class GuildApplicationMonitor {
         this.notifier = options.notifier;
         this.nonApplicationNotifier = options.nonApplicationNotifier || null;
         this.voteReminder = options.voteReminder || null;
+        this.staffFilter = options.staffFilter || null;
         this.topicUrl = options.topicUrl || this.forum?.topicUrl || TOPIC_URL;
         this.topicId = topicIdFromUrl(this.topicUrl);
         this.reapplicationCooldownHours = cooldownHours(options.reapplicationCooldownHours);
@@ -119,6 +120,7 @@ class GuildApplicationMonitor {
     async runOnce() {
         if (this.running || Date.now() < this.nextAttemptAt) return false;
         this.running = true;
+        this.staffFilter?.beginScan();
         try {
             const initialized = await this.store.isInitialized();
             if (!initialized) await this.buildSilentBaseline();
@@ -269,6 +271,12 @@ class GuildApplicationMonitor {
 
     async createRecord(post, options) {
         const parsed = this.parser.parse(post);
+        const staff = await this.staffFilter?.matchAuthor(post.forumUsername);
+        if (staff) {
+            parsed.classification = CLASSIFICATIONS.IGNORED_AUTHOR;
+            parsed.confidence = 1;
+            parsed.reasons.push(`discord_staff_author:${staff.id}`);
+        }
         let downloadedForOcr = [];
         let ocrResult = { ign: parsed.fields.ign, source: parsed.ignSource, confidence: parsed.ignConfidence, output: null };
 
@@ -377,7 +385,20 @@ class GuildApplicationMonitor {
         newUrls.forEach(url => this.cleanedTemplateImageUrls.add(url));
     }
 
+    async suppressStaffNotification(record) {
+        const staff = await this.staffFilter?.matchAuthor(record.forumUsername);
+        if (!staff) return false;
+        record.classification = CLASSIFICATIONS.IGNORED_AUTHOR;
+        record.notificationStatus = 'not_required';
+        record.lastError = null;
+        const reason = `discord_staff_author:${staff.id}`;
+        record.parserReasons = [...new Set([...(record.parserReasons || []), reason])];
+        await this.store.saveRecord(record);
+        return true;
+    }
+
     async notifyStoredApplication(record, originalPost = null) {
+        if (await this.suppressStaffNotification(record)) return record;
         const post = originalPost || this.postFromRecord(record);
         const downloadedImages = await this.forum.downloadPostImages(post);
 
@@ -404,6 +425,7 @@ class GuildApplicationMonitor {
     }
 
     async notifyStoredNonApplication(record) {
+        if (await this.suppressStaffNotification(record)) return record;
         if (!this.nonApplicationNotifier) return record;
         try {
             const { record: updated } = await this.nonApplicationNotifier.notify(record);

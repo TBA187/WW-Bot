@@ -12,17 +12,16 @@ const {
     handleGuildForumFeedbackButton
 } = require('./discord/GuildForumPostNotifier.js');
 const { GuildApplicationVoteReminder } = require('./discord/GuildApplicationVoteReminder.js');
+const { GuildForumStaffFilter } = require('./discord/GuildForumStaffFilter.js');
 
 function createGuildApplicationMonitor(options = {}) {
     const config = options.config || {};
     const topicUrl = config.forumGuildApplicationPage;
-    const ignoredUsers = config.forumGuildApplicationIgnoredUsers;
     const forumClient = options.forumClient || new ProForumClient({
         fetch: options.fetch,
-        topicUrl,
-        ignoredUsers
+        topicUrl
     });
-    const parser = options.parser || new GuildApplicationParser({ ignoredUsers });
+    const parser = options.parser || new GuildApplicationParser();
     const ocr = options.ocr || new GuildApplicationOcr(options.ocrOptions);
     const store = options.store || new GuildApplicationStore({
         db: options.db,
@@ -64,6 +63,7 @@ function createGuildApplicationMonitor(options = {}) {
         notifier,
         nonApplicationNotifier,
         voteReminder,
+        staffFilter: options.staffFilter || new GuildForumStaffFilter({ client: options.client, config }),
         topicUrl,
         reapplicationCooldownHours: config.forumGuildApplicationCooldownHours,
         clock: options.clock,

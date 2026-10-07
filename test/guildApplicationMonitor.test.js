@@ -226,3 +226,64 @@ test('scanner keeps its checkpoint when a forum page cannot be read', async () =
     assert.equal(data.checkpoint.lastPostId, '1');
     assert.equal(data.checkpoint.lastPage, 1);
 });
+
+function staffFilter(ign) {
+    return { beginScan() {}, async matchAuthor(name) { return name.toLowerCase() === ign.toLowerCase() ? { id: 'officer' } : null; } };
+}
+
+test('new staff applications and non-applications are recorded silently while unmatched applicants notify', async () => {
+    const posts = [forumPost(1, 100, '2026-06-01T12:00:00.000Z')];
+    const notifications = [], nonApplications = [];
+    const monitor = makeMonitor(posts, notifications, tempFile(), nonApplications);
+    monitor.staffFilter = staffFilter('Vangogsan');
+    await monitor.runOnce();
+    posts.push({ ...forumPost(2, 163701, '2026-07-13T11:00:00.000Z'), forumUsername: 'Vangogsan' });
+    posts.push({ ...forumPost(3, 163701, '2026-07-13T11:01:00.000Z'), forumUsername: 'Vangogsan', bodyText: 'Welcome, have fun!', imageUrls: [] });
+    posts.push({ ...forumPost(4, 200, '2026-07-13T11:02:00.000Z'), forumUsername: 'Unmatched' });
+    assert.equal(await monitor.runOnce(), true);
+    assert.deepEqual(notifications, ['4']);
+    assert.deepEqual(nonApplications, []);
+    for (const id of ['2', '3']) {
+        const record = await monitor.store.getRecord(id);
+        assert.equal(record.classification, 'ignored_author');
+        assert.equal(record.notificationStatus, 'not_required');
+        assert.ok(record.parserReasons.includes('discord_staff_author:officer'));
+    }
+    assert.equal(monitor.store.getCheckpoint().lastPostId, '4');
+});
+
+test('pending application and owner alerts are rechecked against current staff before retrying', async () => {
+    const posts = [forumPost(1, 100, '2026-06-01T12:00:00.000Z')];
+    const notifications = [], nonApplications = [];
+    const monitor = makeMonitor(posts, notifications, tempFile(), nonApplications);
+    await monitor.runOnce();
+    monitor.staffFilter = staffFilter('NewOfficer');
+    for (const [id, body] of [[2, forumPost(2, 200, '2026-07-13T11:00:00.000Z').bodyText], [3, 'Hello!']]) {
+        const record = await monitor.createRecord({ ...forumPost(id, 200, '2026-07-13T11:00:00.000Z'), forumUsername: 'NewOfficer', bodyText: body },
+            { baseline: false, latestApplications: {} });
+        record.classification = id === 2 ? 'application' : 'non_application';
+        record.notificationStatus = id === 2 ? 'error' : 'non_application_alert_error';
+        await monitor.store.saveRecord(record);
+    }
+    assert.equal(await monitor.runOnce(), true);
+    assert.deepEqual(notifications, []);
+    assert.deepEqual(nonApplications, []);
+    assert.equal((await monitor.store.getRecord('2')).notificationStatus, 'not_required');
+    assert.equal((await monitor.store.getRecord('3')).notificationStatus, 'not_required');
+});
+
+test('staff lookup failure leaves the new post unprocessed so it can be checked after Discord recovers', async t => {
+    t.mock.method(console, 'error', () => {});
+    const posts = [forumPost(1, 100, '2026-06-01T12:00:00.000Z')];
+    const notifications = [];
+    const monitor = makeMonitor(posts, notifications, tempFile());
+    await monitor.runOnce();
+    posts.push(forumPost(2, 200, '2026-07-13T11:00:00.000Z'));
+    monitor.staffFilter = { beginScan() {}, async matchAuthor() { throw new Error('Discord unavailable'); } };
+    assert.equal(await monitor.runOnce(), false);
+    assert.equal(monitor.store.getCheckpoint().lastPostId, '1');
+    assert.deepEqual(notifications, []);
+    monitor.staffFilter = staffFilter('OtherOfficer');
+    assert.equal(await monitor.runOnce(), true);
+    assert.deepEqual(notifications, ['2']);
+});

@@ -778,15 +778,16 @@ class GuildApplicationStore {
     }
 
     async pendingNotifications() {
-        const data = this.readData();
-        const local = data.records.filter(record => (
+        const localRecords = () => this.readData().records.filter(record => (
             record.classification === CLASSIFICATIONS.APPLICATION
             && !record.isBaseline
             && ['pending', 'error', 'officer_sent'].includes(record.notificationStatus)
         ));
+        let local = localRecords();
         if (this.storageMode === 'json') return local;
         try {
             await this.syncFallback();
+            local = localRecords();
             if (!this.canUseMysql()) return local;
             const [rows] = await this.db.query(`
                 SELECT * FROM guild_applications
@@ -806,16 +807,17 @@ class GuildApplicationStore {
     }
 
     async pendingNonApplicationAlerts() {
-        const data = this.readData();
-        const local = data.records.filter(record => (
+        const localRecords = () => this.readData().records.filter(record => (
             record.classification === CLASSIFICATIONS.NON_APPLICATION
             && !record.isBaseline
             && ['non_application_alert_pending', 'non_application_alert_error'].includes(record.notificationStatus)
         ));
+        let local = localRecords();
         if (this.storageMode === 'json') return local;
 
         try {
             await this.syncFallback();
+            local = localRecords();
             if (!this.canUseMysql()) return local;
             const [rows] = await this.db.query(`
                 SELECT * FROM guild_applications
@@ -835,11 +837,13 @@ class GuildApplicationStore {
     }
 
     async voteReminderCandidates(now = new Date()) {
-        const local = this.readData().records.filter(record => isVoteReminderCandidate(record, now));
+        const localRecords = () => this.readData().records.filter(record => isVoteReminderCandidate(record, now));
+        let local = localRecords();
         if (this.storageMode === 'json') return local;
 
         try {
             await this.syncFallback();
+            local = localRecords();
             if (!this.canUseMysql()) return local;
             const twelveHoursAgo = new Date(now.getTime() - (12 * 60 * 60 * 1000));
             const eighteenHoursAgo = new Date(now.getTime() - (18 * 60 * 60 * 1000));

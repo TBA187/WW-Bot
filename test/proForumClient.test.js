@@ -130,3 +130,12 @@ test('keeps the public image URL when an attachment download fails validation', 
     assert.equal(image.buffer, null);
     assert.match(image.error.message, /not an image/i);
 });
+
+test('later Vangogsan posts retain real application images instead of being treated as recruitment templates', () => {
+    const client = new ProForumClient();
+    const parsed = client.extractPosts(`<article data-commentid="123"><div data-ips-hook="postUsername">
+        <a href="/forum/profile/163701-vangogsan/">Vangogsan</a></div>
+        <div data-role="commentContent"><p>IGN: Vangogsan</p><img src="/forum/uploads/trainer.png" alt="Trainer card"></div></article>`, 2);
+    assert.deepEqual(parsed.posts[0].imageUrls, ['https://pokemonrevolution.net/forum/uploads/trainer.png']);
+    assert.deepEqual(client.getTemplateImageUrls(), []);
+});

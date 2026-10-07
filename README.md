@@ -68,7 +68,6 @@ Server IDs and feature IDs live in `config.json`, including:
 - `ownerID` for owner-only forum post review alerts
 - `forumGuildApplicationPage` for the PRO forum topic monitored for applications
 - `forumGuildApplicationCooldownHours`: number of hours the bot ignores additional valid applications from the same forum user after announcing one. Once the cooldown ends, the next valid application is announced. Use `0` to disable this filtering.
-- `forumGuildApplicationIgnoredUsers` for forum usernames whose posts should never trigger application handling
 - `tbaProForumShop` and `tbaProDungeonShop` for the two PRO shop topics monitored for new replies
 - `tbaProForumNotifications`: use `1` to enable the shop DMs or `0` to disable them
 - `pvpScoutingGoldChannelID` and `pvpScoutingSilverChannelID` for the separate Gold and Silver scout channels
@@ -179,10 +178,12 @@ Guild applications:
 - falls back to the stored raw forum post in a `Guild Application` field when too little structured information can be extracted
 - creates a 24-hour Yes/No poll in the Court House when the IGN is reliable
 - reminds the Officer role after 12 and 18 hours when fewer than half of current Officers have voted
-- follows changing forum pagination and relocates its saved post if the forum page size changes
+- follows changing forum pagination and relocates its saved post if the forum page size changes; empty or partially unreadable pages leave the checkpoint unchanged
+- bounds HTTP requests through the complete HTML/image-body download so a stalled response cannot block later scans
 - can ignore repeat applications from the same forum user. Setting `forumGuildApplicationCooldownHours`; `0` announces every valid application
-- ignores configured forum usernames, quoted posts, signatures, and copied recruitment-template images
-- stores all scanned forum posts and classifications in MySQL, with the same `STORAGE_MODE` JSON fallback behavior as other persistent systems
+- ignores forum authors who match a current member with `leaderRoleID`, `adminRoleID`, or `officerRoleID`; compares the server nickname, then global display name if no nickname exists, then username if neither exists. Matching is case-insensitive and accepts delimited IGN aliases such as `Vangogsan / Am1damaru`. Other members are not suppressed
+- excludes quoted posts, signatures, and copied recruitment-template images from application parsing
+- stores all scanned forum posts and classifications in MySQL; continues scanning from its local checkpoint during a MySQL outage, queues records in JSON, and merges delivery state when MySQL returns. Pending alerts are rechecked against current staff before retrying
 
 Before enabling the monitor in production, run `sql/create_guild_applications_table.sql`. Tesseract language data is loaded only when OCR is actually needed; normal labelled applications do not start the OCR worker.
 
@@ -215,7 +216,8 @@ TBA forum shop notifications:
 - uses exponential backoff for forum outages and rate limits, and retries failures without advancing the saved post checkpoint
 - adds a warning and keeps the original forum link when some post details or images cannot be fetched
 - ignores replies posted by the forum username `tba7`, using a case-insensitive comparison
-- mirrors its small page/post checkpoint in `data/tba_forum_shops.json` for MySQL outages
+- continues scanning from its local page/post checkpoint in `data/tba_forum_shops.json` during MySQL outages and synchronizes the newer progress when MySQL returns. Unchanged polls read the shared checkpoint without rewriting it
+- retains an unreadable checkpoint file and reports the error instead of replacing it with an empty baseline
 
 Preview a random strong historical application without posting it:
 

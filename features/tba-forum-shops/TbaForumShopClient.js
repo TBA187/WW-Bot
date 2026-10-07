@@ -2,6 +2,7 @@
 
 // Reads post IDs, authors, timestamps, and message text from one PRO forum topic.
 const cheerio = require('cheerio');
+const { discoverForumLastPage } = require('../../utils/forumPagination.js');
 const path = require('path');
 const sharp = require('sharp');
 const {
@@ -61,7 +62,7 @@ class TbaForumShopClient {
         return `${this.pageUrl(page)}#findComment-${postId}`;
     }
 
-    async request(url, timeoutMs = this.requestTimeoutMs, accept = 'text/html,application/xhtml+xml') {
+    async request(url, timeoutMs = this.requestTimeoutMs, accept = 'text/html,application/xhtml+xml', consume = response => response) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), timeoutMs);
         timeout.unref?.();
@@ -81,10 +82,10 @@ class TbaForumShopClient {
                     retryAfterMs: parseRetryAfter(response.headers.get('retry-after'))
                 });
             }
-            return response;
+            return await consume(response);
         } catch (error) {
             if (error instanceof TbaForumRequestError) throw error;
-            const message = error?.name === 'AbortError'
+            const message = controller.signal.aborted || error?.name === 'AbortError'
                 ? `PRO Forum request timed out after ${timeoutMs}ms.`
                 : `PRO Forum request failed: ${error?.message || error}`;
             throw new TbaForumRequestError(message, { cause: error });
@@ -94,20 +95,7 @@ class TbaForumShopClient {
     }
 
     discoverLastPage($) {
-        const pages = [1];
-        const lastHref = $('link[rel="last"]').attr('href');
-        const lastMatch = String(lastHref || '').match(/\/page\/(\d+)/i);
-        if (lastMatch) pages.push(Number(lastMatch[1]));
-
-        $('[data-ips-pagination-pages], [data-page]').each((_, element) => {
-            const value = Number($(element).attr('data-ips-pagination-pages') || $(element).attr('data-page'));
-            if (Number.isFinite(value)) pages.push(value);
-        });
-        $('a[href*="/page/"]').each((_, element) => {
-            const match = String($(element).attr('href') || '').match(/\/page\/(\d+)/i);
-            if (match) pages.push(Number(match[1]));
-        });
-        return Math.max(...pages);
+        return discoverForumLastPage($, this.topicUrl);
     }
 
     messageText($, content, pageUrl) {
@@ -161,7 +149,8 @@ class TbaForumShopClient {
         const posts = [];
         const pageUrl = this.pageUrl(page);
 
-        $('article[data-ips-hook="postWrapper"], article[data-commentid]').each((_, article) => {
+        const articles = $('article[data-ips-hook="postWrapper"], article[data-commentid]');
+        articles.each((_, article) => {
             const wrapper = $(article);
             const postId = wrapper.attr('data-commentid')
                 || wrapper.find('[id^="findComment-"]').first().attr('id')?.match(/findComment-(\d+)/i)?.[1]
@@ -202,12 +191,17 @@ class TbaForumShopClient {
             });
         });
 
+        if (posts.length !== articles.length) {
+            throw new TbaForumRequestError(`PRO Forum page ${page} contained a post that could not be read; checkpoint retained.`);
+        }
+
         return { posts, lastPage: this.discoverLastPage($) };
     }
 
     async fetchPage(page = 1) {
-        const response = await this.request(this.pageUrl(page));
-        const parsed = this.extractPosts(await response.text(), page);
+        const html = await this.request(this.pageUrl(page), this.requestTimeoutMs, 'text/html,application/xhtml+xml', response => response.text());
+        const parsed = this.extractPosts(html, page);
+        if (!parsed.posts.length) throw new TbaForumRequestError(`PRO Forum shop page ${page} did not contain any readable posts.`);
         return { page: Number(page), ...parsed };
     }
 
@@ -226,27 +220,29 @@ class TbaForumShopClient {
     }
 
     async downloadImage(url, index) {
-        const response = await this.request(
+        return this.request(
             url,
             this.imageTimeoutMs,
-            'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.8'
-        );
-        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-        const contentLength = Number(response.headers.get('content-length') || 0);
-        if (!contentType.startsWith('image/')) throw new TbaForumRequestError(`Forum attachment is not an image: ${url}`);
-        if (contentLength > this.maxImageBytes) throw new TbaForumRequestError(`Forum image is larger than ${this.maxImageBytes} bytes: ${url}`);
+            'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.8',
+            async response => {
+                const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+                const contentLength = Number(response.headers.get('content-length') || 0);
+                if (!contentType.startsWith('image/')) throw new TbaForumRequestError(`Forum attachment is not an image: ${url}`);
+                if (contentLength > this.maxImageBytes) throw new TbaForumRequestError(`Forum image is larger than ${this.maxImageBytes} bytes: ${url}`);
 
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.length > this.maxImageBytes) throw new TbaForumRequestError(`Forum image is larger than ${this.maxImageBytes} bytes: ${url}`);
-        try {
-            const metadata = await sharp(buffer).metadata();
-            if (!metadata.format || !metadata.width || !metadata.height) {
-                throw new Error('missing image metadata');
+                const buffer = Buffer.from(await response.arrayBuffer());
+                if (buffer.length > this.maxImageBytes) throw new TbaForumRequestError(`Forum image is larger than ${this.maxImageBytes} bytes: ${url}`);
+                try {
+                    const metadata = await sharp(buffer).metadata();
+                    if (!metadata.format || !metadata.width || !metadata.height) {
+                        throw new Error('missing image metadata');
+                    }
+                } catch (error) {
+                    throw new TbaForumRequestError(`Forum attachment did not contain a valid image: ${url}`, { cause: error });
+                }
+                return { url, buffer, name: this.imageFilename(url, index, contentType) };
             }
-        } catch (error) {
-            throw new TbaForumRequestError(`Forum attachment did not contain a valid image: ${url}`, { cause: error });
-        }
-        return { url, buffer, name: this.imageFilename(url, index, contentType) };
+        );
     }
 
     async downloadPostImages(post) {

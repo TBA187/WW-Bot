@@ -2,11 +2,12 @@
 
 // Fetches the PRO topic and reduces each forum post to the text and images the monitor needs.
 const cheerio = require('cheerio');
+const { discoverForumLastPage } = require('../../../utils/forumPagination.js');
 const path = require('path');
 const {
     TOPIC_URL,
-    IGNORED_FORUM_USER_ID,
-    IGNORED_FORUM_USERNAME,
+    TEMPLATE_FORUM_USER_ID,
+    TEMPLATE_FORUM_USERNAME,
     MAX_IMAGE_BYTES,
     IMAGE_DOWNLOAD_TIMEOUT_MS,
     FORUM_REQUEST_TIMEOUT_MS
@@ -60,12 +61,11 @@ function normalizeImageUrl(value) {
     }
 }
 
-function isIgnoredForumAuthor(forumUserId, forumUsername, ignoredUsernames = []) {
+function isTemplateAuthor(forumUserId, forumUsername) {
     const names = new Set([
-        IGNORED_FORUM_USERNAME,
-        ...(Array.isArray(ignoredUsernames) ? ignoredUsernames : [])
+        TEMPLATE_FORUM_USERNAME
     ].map(value => String(value || '').trim().toLowerCase()).filter(Boolean));
-    return String(forumUserId || '') === IGNORED_FORUM_USER_ID
+    return String(forumUserId || '') === TEMPLATE_FORUM_USER_ID
         || names.has(String(forumUsername || '').trim().toLowerCase());
 }
 
@@ -144,7 +144,6 @@ class ProForumClient {
         this.imageTimeoutMs = options.imageTimeoutMs || IMAGE_DOWNLOAD_TIMEOUT_MS;
         this.maxImageBytes = options.maxImageBytes || MAX_IMAGE_BYTES;
         this.templateImageUrls = new Set((options.templateImageUrls || []).map(normalizeImageUrl).filter(Boolean));
-        this.ignoredUsernames = Array.isArray(options.ignoredUsers) ? options.ignoredUsers : [];
 
         if (typeof this.fetch !== 'function') {
             throw new TypeError('ProForumClient requires a fetch implementation.');
@@ -161,7 +160,7 @@ class ProForumClient {
         return `${this.pageUrl(page)}#findComment-${postId}`;
     }
 
-    async request(url, timeoutMs = this.requestTimeoutMs) {
+    async request(url, timeoutMs = this.requestTimeoutMs, consume = response => response) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), timeoutMs);
         timeout.unref?.();
@@ -183,10 +182,10 @@ class ProForumClient {
                 });
             }
 
-            return response;
+            return await consume(response);
         } catch (err) {
             if (err instanceof ForumRequestError) throw err;
-            const message = err?.name === 'AbortError'
+            const message = controller.signal.aborted || err?.name === 'AbortError'
                 ? `PRO Forum request timed out after ${timeoutMs}ms.`
                 : `PRO Forum request failed: ${err?.message || err}`;
             throw new ForumRequestError(message, { cause: err });
@@ -196,27 +195,7 @@ class ProForumClient {
     }
 
     discoverLastPage($) {
-        const candidates = [1];
-        const lastHref = $('link[rel="last"]').attr('href');
-        const hrefMatch = String(lastHref || '').match(/\/page\/(\d+)/i);
-        if (hrefMatch) candidates.push(Number(hrefMatch[1]));
-
-        $('[data-ips-pagination-pages]').each((_, element) => {
-            const value = Number($(element).attr('data-ips-pagination-pages'));
-            if (Number.isFinite(value)) candidates.push(value);
-        });
-
-        $('[data-page]').each((_, element) => {
-            const value = Number($(element).attr('data-page'));
-            if (Number.isFinite(value)) candidates.push(value);
-        });
-
-        $('a[href*="/page/"]').each((_, element) => {
-            const match = String($(element).attr('href') || '').match(/\/page\/(\d+)/i);
-            if (match) candidates.push(Number(match[1]));
-        });
-
-        return Math.max(...candidates.filter(Number.isFinite));
+        return discoverForumLastPage($, this.topicUrl);
     }
 
     contentText($, content) {
@@ -283,7 +262,8 @@ class ProForumClient {
         const pageUrl = this.pageUrl(page);
         const posts = [];
 
-        $('article[data-ips-hook="postWrapper"], article[data-commentid]').each((_, article) => {
+        const articles = $('article[data-ips-hook="postWrapper"], article[data-commentid]');
+        articles.each((index, article) => {
             const wrapper = $(article);
             const idFromAttribute = wrapper.attr('data-commentid');
             const idFromAnchor = wrapper.find('[id^="findComment-"]').first().attr('id')?.match(/findComment-(\d+)/i)?.[1];
@@ -299,10 +279,10 @@ class ProForumClient {
             const authorName = cleanText(authorLink.text() || fallbackAuthor.text()) || 'Unknown';
             const time = wrapper.find('time[datetime]').first();
             const postedAt = time.attr('datetime') || time.attr('title') || null;
-            const ignoredAuthor = isIgnoredForumAuthor(identity.forumUserId, authorName, this.ignoredUsernames);
+            const templateAuthor = isTemplateAuthor(identity.forumUserId, authorName);
 
-            // Remember the owner's template assets so copied versions do not become application images.
-            if (ignoredAuthor) this.registerTemplateImages($, content, pageUrl);
+            // Only the opening recruitment post defines template assets; later author posts keep their images.
+            if (templateAuthor && Number(page) === 1 && index === 0) this.registerTemplateImages($, content, pageUrl);
 
             posts.push({
                 postId: String(postId),
@@ -314,17 +294,21 @@ class ProForumClient {
                 profileSlug: identity.profileSlug,
                 postedAt,
                 bodyText: this.contentText($, content),
-                imageUrls: ignoredAuthor ? [] : this.extractImageUrls($, content, pageUrl)
+                imageUrls: this.extractImageUrls($, content, pageUrl)
             });
         });
+
+        if (posts.length !== articles.length) {
+            throw new ForumRequestError(`PRO Forum page ${page} contained a post that could not be read; checkpoint retained.`);
+        }
 
         return { $, posts, lastPage: this.discoverLastPage($) };
     }
 
     async fetchPage(page = 1) {
-        const response = await this.request(this.pageUrl(page));
-        const html = await response.text();
+        const html = await this.request(this.pageUrl(page), this.requestTimeoutMs, response => response.text());
         const parsed = this.extractPosts(html, page);
+        if (!parsed.posts.length) throw new ForumRequestError(`PRO Forum page ${page} did not contain any readable posts.`);
         return { page: Number(page), html, posts: parsed.posts, lastPage: parsed.lastPage };
     }
 
@@ -343,27 +327,28 @@ class ProForumClient {
     }
 
     async downloadImage(url, index = 0) {
-        const response = await this.request(url, this.imageTimeoutMs);
-        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-        const contentLength = Number(response.headers.get('content-length') || 0);
-        if (!contentType.startsWith('image/')) {
-            throw new ForumRequestError(`Forum attachment is not an image: ${url}`);
-        }
-        if (contentLength > this.maxImageBytes) {
-            throw new ForumRequestError(`Forum image exceeds ${this.maxImageBytes} bytes: ${url}`);
-        }
+        return this.request(url, this.imageTimeoutMs, async response => {
+            const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+            const contentLength = Number(response.headers.get('content-length') || 0);
+            if (!contentType.startsWith('image/')) {
+                throw new ForumRequestError(`Forum attachment is not an image: ${url}`);
+            }
+            if (contentLength > this.maxImageBytes) {
+                throw new ForumRequestError(`Forum image exceeds ${this.maxImageBytes} bytes: ${url}`);
+            }
 
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.length > this.maxImageBytes) {
-            throw new ForumRequestError(`Forum image exceeds ${this.maxImageBytes} bytes: ${url}`);
-        }
+            const buffer = Buffer.from(await response.arrayBuffer());
+            if (buffer.length > this.maxImageBytes) {
+                throw new ForumRequestError(`Forum image exceeds ${this.maxImageBytes} bytes: ${url}`);
+            }
 
-        return {
-            url,
-            buffer,
-            contentType,
-            name: this.imageFilename(url, index, contentType)
-        };
+            return {
+                url,
+                buffer,
+                contentType,
+                name: this.imageFilename(url, index, contentType)
+            };
+        });
     }
 
     async downloadPostImages(post, limit = Infinity) {

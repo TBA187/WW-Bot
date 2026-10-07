@@ -5,15 +5,15 @@ const path = require('path');
 
 const TOPIC_URL = 'https://pokemonrevolution.net/forum/topic/228820-white-walkers-the-memory-of-the-winter/';
 const TOPIC_ID = '228820';
-const IGNORED_FORUM_USER_ID = '163701';
-const IGNORED_FORUM_USERNAME = 'vangogsan';
+const TEMPLATE_FORUM_USER_ID = '163701';
+const TEMPLATE_FORUM_USERNAME = 'vangogsan';
 
 module.exports = Object.freeze({
     TOPIC_URL,
     TOPIC_ID,
     TOPIC_ORIGIN: new URL(TOPIC_URL).origin,
-    IGNORED_FORUM_USER_ID,
-    IGNORED_FORUM_USERNAME,
+    TEMPLATE_FORUM_USER_ID,
+    TEMPLATE_FORUM_USERNAME,
     STORAGE_VERSION: 1,
     STORAGE_SYNC_INTERVAL_MS: 30 * 1000,
     MONITOR_INTERVAL_MS: 10 * 60 * 1000,

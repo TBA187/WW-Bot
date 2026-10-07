@@ -256,10 +256,9 @@ async function postPreview(client, forum, record, options = {}) {
 
 async function main() {
     const forum = new ProForumClient({
-        topicUrl: config.forumGuildApplicationPage || TOPIC_URL,
-        ignoredUsers: config.forumGuildApplicationIgnoredUsers
+        topicUrl: config.forumGuildApplicationPage || TOPIC_URL
     });
-    const parser = new GuildApplicationParser({ ignoredUsers: config.forumGuildApplicationIgnoredUsers });
+    const parser = new GuildApplicationParser();
     const posts = await fetchAllPosts(forum);
     const requestedPostId = argumentValue('post-id');
     const excludedPostId = argumentValue('exclude-post-id');

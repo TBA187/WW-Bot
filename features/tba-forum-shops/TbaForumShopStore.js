@@ -83,21 +83,29 @@ class TbaForumShopStore {
         this.ensureFile();
         try {
             const parsed = JSON.parse(fs.readFileSync(this.dataFile, 'utf8'));
+            if (!parsed?.shops || typeof parsed.shops !== 'object' || Array.isArray(parsed.shops)) {
+                throw new Error('Invalid TBA forum shop checkpoint mirror.');
+            }
             return {
                 version: DATA_VERSION,
                 shops: parsed?.shops && typeof parsed.shops === 'object' ? parsed.shops : {}
             };
         } catch (error) {
-            console.error('[WW LOG] Failed to read the TBA forum shop checkpoint mirror:', error);
-            return this.emptyData();
+            error.tbaForumShopStorage = true;
+            throw error;
         }
     }
 
     writeData(data) {
-        writeJsonIfChanged(this.dataFile, this.tempFile, {
-            version: DATA_VERSION,
-            shops: data.shops || {}
-        });
+        try {
+            writeJsonIfChanged(this.dataFile, this.tempFile, {
+                version: DATA_VERSION,
+                shops: data.shops || {}
+            });
+        } catch (error) {
+            error.tbaForumShopStorage = true;
+            throw error;
+        }
     }
 
     noteMysqlFailure(error) {
@@ -202,6 +210,7 @@ class TbaForumShopStore {
                     checkpoint = mergeCheckpoints(shop, checkpoint, savedRemote || {});
                     this.noteMysqlRestored();
                 } catch (error) {
+                    if (error.tbaForumShopStorage) throw error;
                     this.noteMysqlFailure(error);
                 }
             }
@@ -220,13 +229,20 @@ class TbaForumShopStore {
         try {
             const remote = await this.mysqlGetShop(key);
             const merged = mergeCheckpoints(shop, local || {}, remote || {});
-            await this.mysqlSaveShop(key, merged);
-            const saved = await this.mysqlGetShop(key);
-            const current = mergeCheckpoints(shop, merged, saved || {});
+            const remoteCheckpoint = normalizedCheckpoint(shop, remote || {});
+            const needsSync = ['topicUrl', 'initialized', 'lastSeenPostId', 'lastPage']
+                .some(field => merged[field] !== remoteCheckpoint[field]);
+            let current = merged;
+            if (needsSync) {
+                await this.mysqlSaveShop(key, merged);
+                const saved = await this.mysqlGetShop(key);
+                current = mergeCheckpoints(shop, merged, saved || {});
+            }
             this.saveLocalShop(key, current);
             this.noteMysqlRestored();
             return current;
         } catch (error) {
+            if (error.tbaForumShopStorage) throw error;
             this.noteMysqlFailure(error);
             return local;
         }
@@ -248,6 +264,7 @@ class TbaForumShopStore {
                 this.saveLocalShop(key, checkpoint);
                 this.noteMysqlRestored();
             } catch (error) {
+                if (error.tbaForumShopStorage) throw error;
                 this.noteMysqlFailure(error);
             }
         }

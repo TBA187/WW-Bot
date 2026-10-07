@@ -276,3 +276,30 @@ test('removes known decorative image URLs from the local fallback records', asyn
         'https://pokemonrevolution.net/forum/uploads/monthly_2026_07/trainer-card.png'
     ]);
 });
+
+for (const kind of ['application', 'non_application', 'reminder']) {
+    test(`${kind} retry lists discard stale local delivery state after fallback synchronization`, async t => {
+        t.mock.method(console, 'warn', () => {});
+        t.mock.method(console, 'log', () => {});
+        const db = new FakeDb();
+        db.fail = true;
+        const store = new GuildApplicationStore({ db, storageMode: 'auto', dataFile: tempFile(), hasMysqlCredentials: true });
+        const local = { ...record('777'), notificationStatus: kind === 'non_application' ? 'non_application_alert_pending' : 'pending' };
+        if (kind === 'non_application') local.classification = 'non_application';
+        if (kind === 'reminder') Object.assign(local, { notificationStatus: 'notified', pollCreatedAt: '2026-07-13T00:00:00.000Z',
+            pollMessageId: 'poll', pollMessageUrl: 'https://discord.test/poll', officerMessageUrl: 'https://discord.test/officer' });
+        await store.saveRecord(local);
+        const delivered = { ...local, post_id: local.postId,
+            notificationStatus: kind === 'non_application' ? 'non_application_alert_sent' : 'notified',
+            officerMessageId: 'officer', notifiedAt: '2026-07-13T01:00:00.000Z',
+            voteReminder12hCheckedAt: '2026-07-13T12:00:00.000Z' };
+        db.fail = false;
+        db.query = async sql => /WHERE post_id IN/u.test(sql) ? [[delivered]] : [[]];
+        const pending = kind === 'application' ? await store.pendingNotifications()
+            : kind === 'non_application' ? await store.pendingNonApplicationAlerts()
+                : await store.voteReminderCandidates(new Date('2026-07-13T12:30:00.000Z'));
+        assert.deepEqual(pending, []);
+        assert.equal(store.readData().pendingSync, false);
+        assert.ok(db.upserts.length > 0);
+    });
+}

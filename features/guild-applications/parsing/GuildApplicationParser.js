@@ -1,7 +1,7 @@
 'use strict';
 
 // Classifies forum posts and pulls application details out of the many formats people actually use.
-const { CLASSIFICATIONS, IGNORED_FORUM_USER_ID, IGNORED_FORUM_USERNAME } = require('../constants.js');
+const { CLASSIFICATIONS } = require('../constants.js');
 const { resolveCountryAtStart, resolveCountryName } = require('./countryRegistry.js');
 
 const BOILERPLATE_PATTERNS = [
@@ -184,25 +184,8 @@ function positionalApplication(lines, consumed) {
     return null;
 }
 
-function isIgnoredAuthor(post, ignoredUsernames = []) {
-    const names = new Set([
-        IGNORED_FORUM_USERNAME,
-        ...(Array.isArray(ignoredUsernames) ? ignoredUsernames : [])
-    ].map(value => String(value || '').trim().toLowerCase()).filter(Boolean));
-    return String(post.forumUserId || '') === IGNORED_FORUM_USER_ID
-        || names.has(String(post.forumUsername || '').trim().toLowerCase());
-}
-
 class GuildApplicationParser {
-    constructor(options = {}) {
-        this.ignoredUsernames = Array.isArray(options.ignoredUsers) ? options.ignoredUsers : [];
-    }
-
     parse(post) {
-        if (isIgnoredAuthor(post, this.ignoredUsernames)) {
-            return this.result(CLASSIFICATIONS.IGNORED_AUTHOR, 1, ['ignored_forum_author']);
-        }
-
         let body = removeAttachmentFilenames(String(post.bodyText || '')).replace(EDIT_METADATA_PATTERN, '');
         for (const pattern of BOILERPLATE_PATTERNS) body = body.replace(pattern, '');
         const lines = body.split(/\n+/).map(normalizeLine).filter(Boolean);
@@ -438,7 +421,6 @@ module.exports = {
     extractCountryFromText,
     extractNarrativeDetails,
     normalizeCountryCandidate,
-    isIgnoredAuthor,
     normalizeValue,
     normalizeLine,
     removeAttachmentFilenames,

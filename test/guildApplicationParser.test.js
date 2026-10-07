@@ -243,19 +243,19 @@ test('rejects questions and short discussion replies', () => {
     assert.equal(result.classification, CLASSIFICATIONS.NON_APPLICATION);
 });
 
-test('always ignores Vangogsan by ID or username', () => {
+test('parser does not suppress authors by a fixed name or forum ID', () => {
     const byId = parser.parse(post('IGN: Fake\nAge: 20\nCountry: USA', { forumUserId: '163701' }));
     const byName = parser.parse(post('IGN: Fake\nAge: 20\nCountry: USA', { forumUserId: null, forumUsername: 'VANGOgsan' }));
-    assert.equal(byId.classification, CLASSIFICATIONS.IGNORED_AUTHOR);
-    assert.equal(byName.classification, CLASSIFICATIONS.IGNORED_AUTHOR);
+    assert.equal(byId.classification, CLASSIFICATIONS.APPLICATION);
+    assert.equal(byName.classification, CLASSIFICATIONS.APPLICATION);
 });
 
-test('ignores additional configured forum usernames', () => {
+test('legacy ignored-name configuration cannot suppress a non-staff applicant', () => {
     const configuredParser = new GuildApplicationParser({ ignoredUsers: ['AnotherUniqueForumUser'] });
     const result = configuredParser.parse(post('IGN: Fake\nAge: 20\nCountry: USA', {
         forumUserId: null,
         forumUsername: 'anotheruniqueforumuser'
     }));
 
-    assert.equal(result.classification, CLASSIFICATIONS.IGNORED_AUTHOR);
+    assert.equal(result.classification, CLASSIFICATIONS.APPLICATION);
 });
