@@ -1,4 +1,4 @@
-// Database access for archived messages, scout groups, backfill progress, and staff corrections.
+// Database access for archived messages, scout groups, catch-up checkpoints, and staff corrections.
 'use strict';
 
 const crypto = require('crypto');
@@ -271,7 +271,6 @@ class PvpScoutStore {
         this.schemaPromise = (async () => {
             await ensureScoutTables(this.db, [
                 'pvp_scout_messages',
-                'pvp_scout_backfill',
                 'pvp_scout_catchup',
                 'pvp_scout_message_feedback',
                 'pvp_scout_feedback_pending',
@@ -817,41 +816,6 @@ class PvpScoutStore {
                 VALUES(last_message_id), last_message_id
             )
         `, [String(channelId), String(messageId)]);
-    }
-
-    async getBackfillState(channelId = this.channelId) {
-        await this.ensureSchema();
-        const [rows] = await this.db.query(
-            'SELECT * FROM pvp_scout_backfill WHERE channel_id = ? LIMIT 1',
-            [String(channelId)]
-        );
-        return rows[0] || { channel_id: String(channelId), before_message_id: null, backfill_complete: 0, processed_count: 0 };
-    }
-
-    async saveBackfillState(state, channelId = this.channelId) {
-        await this.ensureSchema();
-        await this.db.query(`
-            INSERT INTO pvp_scout_backfill (channel_id, before_message_id, backfill_complete, processed_count, last_error)
-            VALUES (?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE
-                before_message_id = VALUES(before_message_id),
-                backfill_complete = VALUES(backfill_complete),
-                processed_count = VALUES(processed_count),
-                last_error = VALUES(last_error)
-        `, [
-            String(channelId), state.beforeMessageId || null,
-            state.complete ? 1 : 0, Number(state.processedCount || 0), state.lastError || null
-        ]);
-    }
-
-    async setBackfillError(error, channelId = this.channelId) {
-        const state = await this.getBackfillState(channelId);
-        await this.saveBackfillState({
-            beforeMessageId: state.before_message_id,
-            complete: Boolean(Number(state.backfill_complete)),
-            processedCount: Number(state.processed_count || 0),
-            lastError: String(error?.message || error || '').slice(0, 2000)
-        }, channelId);
     }
 
     async listMessagesAfter(messageId = null, limit = 500, channelId = this.channelId) {

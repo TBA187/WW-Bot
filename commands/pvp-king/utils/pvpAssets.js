@@ -19,15 +19,15 @@ const pvpThumnbnail = 'attachment://serverLogo.png';
 
 const pvpBannerImage = 'attachment://serverBanner.png';
 
-const createPvpFooter = () => ({
-    text: 'WW PvP King Dominion',
+const createPvpFooter = serverName => ({
+    text: `WW PvP King Dominion${serverName ? ` • ${serverName}` : ''}`,
     iconURL: 'attachment://serverLogo.png'
     // text: `WW PvP King System • WW`,
     // iconURL: interaction.guild.iconURL()
 });
 
-const createPvpLogFooter = () => ({
-    text: 'WW PvP King Logs',
+const createPvpLogFooter = serverName => ({
+    text: `WW PvP King Logs${serverName ? ` • ${serverName}` : ''}`,
     iconURL: 'attachment://serverLogo.png'
 });
 

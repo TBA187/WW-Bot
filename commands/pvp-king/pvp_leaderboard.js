@@ -1,3 +1,4 @@
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 // ----------------------
 // /pvp_leaderboard
 // ----------------------
@@ -13,6 +14,9 @@ const {
 
 class PvpLeaderboard {
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_leaderboard";
         this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
@@ -30,7 +34,7 @@ class PvpLeaderboard {
             const rows = await this.db.listStats();
 
             if (rows.length === 0) {
-                return interaction.editReply("### 📜 The Hall of Fame is currently empty!");
+                return interaction.editReply(`### 📜 The Hall of Fame in ${this.pvpServerName} is currently empty!`);
             }
 
             // Count Total PvP Kings
@@ -80,11 +84,11 @@ class PvpLeaderboard {
                 const end = start + itemsPerPage;
                 const currentItems = sortedRows.slice(start, end);
                 const embed = new EmbedBuilder()
-                    .setColor('#FFD700')
+                    .setColor(this.pvpServerColor)
                     .setThumbnail(interaction.guild.iconURL())
                     .setTimestamp()
                     .setFooter({
-                        text: `WW PvP King System • Page ${page + 1} of ${totalPages}`,
+                        text: `WW PvP King System • ${this.pvpServerName} • Page ${page + 1} of ${totalPages}`,
                         iconURL: interaction.guild.iconURL()
                     });
 
@@ -96,7 +100,7 @@ class PvpLeaderboard {
                 };
                 const activeSort = sortTitles[currentSort] || sortTitles.total_wins;
 
-                let descriptionText = `## 🏆\u2002White Walkers — PvP Hall of Fame\u2002🏆\n` +
+                let descriptionText = `## 🏆\u2002White Walkers — PvP Hall of Fame in ${this.pvpServerName}\u2002🏆\n` +
                     `**In the grip of endless winter, \`${total_kings}\` PvP Kings stand frozen in time, their legacy etched in ice forever!\u2002🧊**\n` +
                     `-# - **Current PvP King:\u2002👑\u2002${currentKingText}\u2002👑**\n` +
                     `-# - Challenge the current PvP King with: **\`/pvp_challenge\`**\n` +
@@ -208,4 +212,4 @@ class PvpLeaderboard {
     }
 }
 
-module.exports = PvpLeaderboard;
+module.exports = wrapPvpServerCommand(PvpLeaderboard);

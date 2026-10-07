@@ -348,7 +348,7 @@ class ScoutReview {
     }
 
     async regroupAfterReview() {
-        if (!this.ingestor || this.ingestor.backfilling) return;
+        if (!this.ingestor) return;
         try {
             await this.ingestor.rebuildGroups();
         } catch (error) {

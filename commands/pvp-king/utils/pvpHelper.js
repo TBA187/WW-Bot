@@ -42,9 +42,11 @@ async function requireAnyRole(interaction, roleIds, message = '### ❌  No permi
 }
 
 async function requirePvpChannel(interaction, channelId, commandName) {
-    if (interaction.channelId === channelId) return true;
+    const channelIds = (Array.isArray(channelId) ? channelId : [channelId]).filter(Boolean);
+    if (channelIds.includes(interaction.channelId)) return true;
 
-    const content = `### ❌  The \`/${commandName}\` command can only be used in <#${channelId}>`;
+    const channels = channelIds.map(id => `<#${id}>`).join(' or ');
+    const content = `### ❌  The \`/${commandName}\` command can only be used in ${channels}`;
     if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content });
     } else {

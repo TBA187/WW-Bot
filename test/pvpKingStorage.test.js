@@ -74,9 +74,12 @@ class FakeDb {
             throw err;
         }
 
+        if (normalized.startsWith('select king_id, last_challenge, notify_on_expire from pvp_king_cooldowns')) {
+            return [this.cooldowns.filter(row => String(row.challenger_id) === String(params[0]))];
+        }
         if (normalized.startsWith('select user_id')) return [this.stats];
         if (normalized.startsWith('select id, challenger_id')) return [this.cooldowns];
-        if (normalized.startsWith('select * from pvp_king_history')) return [this.history];
+        if (normalized === 'select * from pvp_king_history order by id asc') return [this.history];
         if (normalized.startsWith('select id from pvp_king_history where sync_event_id')) {
             return [this.history.filter(row => row.sync_event_id === params[0]).map(row => ({ id: row.id }))];
         }
@@ -519,4 +522,89 @@ test('reverse-style local operations remove fallback history and stats', async (
 
     assert.equal(remainingHistory, null);
     assert.equal(remainingStats, null);
+});
+
+
+class PartitionedDb {
+    constructor() {
+        this.gold = new FakeDb();
+        this.silver = new FakeDb();
+        this.calls = [];
+    }
+
+    async query(sql, params = []) {
+        this.calls.push({ sql, params });
+        const server = /\bpvp_king_silver_/u.test(sql) ? this.silver : this.gold;
+        const logicalSql = sql.replace(/\bpvp_king_silver_/gu, 'pvp_king_');
+        return server.query(logicalSql, params);
+    }
+
+    async getConnection() {
+        return {
+            beginTransaction: async () => {},
+            commit: async () => {},
+            rollback: async () => {},
+            release() {},
+            query: (sql, params) => this.query(sql, params)
+        };
+    }
+}
+
+test('Gold and Silver MySQL crowns, reversals, cooldowns, and fallback replay remain isolated', async () => {
+    await withDbEnv(async () => {
+        const db = new PartitionedDb();
+        const gold = new PvpKingStorage({ db, storageMode: 'mysql', dataFile: tempDataFile() });
+        const silver = new PvpKingStorage({ db, server: 'silver', storageMode: 'mysql', dataFile: tempDataFile() });
+        await gold.restore();
+        await silver.restore();
+        await gold.recordCrownEvent({ newKingId: 'same-user', newKingName: 'Gold King' });
+        await gold.recordCrownEvent({ newKingId: 'same-user', newKingName: 'Gold King', isDefense: true });
+        await silver.recordCrownEvent({ newKingId: 'same-user', newKingName: 'Silver King' });
+        await gold.upsertChallengeCooldown('challenger', 'Challenger', 'same-user', 'Gold King');
+        await gold.setCooldownNotification('challenger', true);
+        await silver.upsertChallengeCooldown('challenger', 'Challenger', 'same-user', 'Silver King');
+        await silver.setCooldownNotification('challenger', true);
+        const goldSnapshot = gold.serializeState();
+
+        // A Silver dethrone resets only Silver cooldowns, even for the same IDs.
+        const silverCallStart = db.calls.length;
+        await silver.recordCrownEvent({ newKingId: 'silver-new', newKingName: 'New Silver King',
+            oldKingId: 'same-user', oldKingName: 'Silver King' });
+        assert.equal((await silver.getCooldown('challenger')).last_challenge, null);
+        assert.equal((await gold.getCooldown('challenger')).king_id, 'same-user');
+        assert.ok((await gold.getCooldown('challenger')).last_challenge);
+        const latestSilver = await silver.latestHistory();
+        assert.equal(latestSilver.king_id, 'silver-new');
+        await silver.reverseLatestCrownEvent({ expectedHistoryId: latestSilver.id });
+        assert.equal((await silver.latestHistory()).king_id, 'same-user');
+        assert.equal((await silver.getStats('same-user')).total_wins, 1);
+        assert.deepEqual(gold.serializeState(), goldSnapshot);
+        const silverTransactionCalls = db.calls.slice(silverCallStart).filter(call => call.sql.includes('INSERT') || call.sql.includes('UPDATE') || call.sql.includes('DELETE'));
+        assert.ok(silverTransactionCalls.length > 0);
+        assert.ok(silverTransactionCalls.every(call => /\bpvp_king_silver_/u.test(call.sql)));
+
+        // Writes during an outage replay into Silver only after recovery.
+        db.silver.failWrites = true;
+        await silver.recordCrownEvent({ newKingId: 'same-user', newKingName: 'Silver King', isDefense: true });
+        assert.equal(silver.state.operations.length, 1);
+        assert.equal((await silver.getStats('same-user')).total_wins, 2);
+        db.silver.failWrites = false;
+        const recoveryStart = db.calls.length;
+        await silver.syncFallbackOperations();
+        assert.equal(silver.state.operations.length, 0);
+        assert.equal(db.silver.stats.find(row => row.user_id === 'same-user').total_wins, 2);
+        assert.equal(db.gold.stats.find(row => row.user_id === 'same-user').total_wins, 2);
+        assert.equal(db.gold.history.length, 2);
+        assert.equal(db.silver.history.length, 2);
+        assert.ok(db.calls.slice(recoveryStart).every(call => /\bpvp_king_silver_/u.test(call.sql)));
+        assert.deepEqual(gold.serializeState(), goldSnapshot);
+    });
+});
+
+test('Silver defaults to its own JSON mirror and rejects unsupported server keys', () => {
+    const gold = new PvpKingStorage({ storageMode: 'json' });
+    const silver = new PvpKingStorage({ server: 'silver', storageMode: 'json' });
+    assert.equal(path.basename(gold.dataFile), 'pvp_king_data.json');
+    assert.equal(path.basename(silver.dataFile), 'pvp_king_silver_data.json');
+    assert.throws(() => new PvpKingStorage({ server: 'cross' }), /Unsupported PvP King server/u);
 });

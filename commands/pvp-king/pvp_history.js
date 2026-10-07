@@ -1,3 +1,4 @@
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 // ----------------------
 // /pvp_history
 // ----------------------
@@ -7,6 +8,9 @@ const { stopIfOnCooldown } = require('./utils/pvpHelper.js');
 class PvpHistory {
 
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_history";
         this.db = config.pvpKingStorage || config.db;
         this.historyThreadID = config.historyThreadID;
@@ -41,7 +45,7 @@ class PvpHistory {
             const totalKingEntries = await this.db.countHistory();
 
             if (!rowsDesc.length) {
-                return interaction.editReply('### ⚠️ No PvP King history found.');
+                return interaction.editReply(`### ⚠️ No PvP King history found for ${this.pvpServerName} ${this.pvpServerEmoji}`);
             }
 
             // Remove consecutive duplicates and take last streak/wins in block
@@ -97,7 +101,7 @@ class PvpHistory {
             );
 
             await interaction.editReply(
-                `# 👑  PvP King History (Last ${historyRows.length} entries)  👑\n` +
+                `# 👑  PvP King History in ${this.pvpServerName} (Last ${historyRows.length} entries)  👑\n` +
                 `**<:pepe_king:1455434151262949535>  ${totalKings} individual PvP Kings have ruled White Walkers so far! View all PvP Kings with the \`/pvp_leaderboard\` command.**\n\n` +
                 entries.join('\n') +
                 `\n\n### View all \`${totalKingEntries}\` PvP King entries in <#${this.historyThreadID}>`
@@ -116,4 +120,4 @@ class PvpHistory {
     }
 }
 
-module.exports = PvpHistory;
+module.exports = wrapPvpServerCommand(PvpHistory);

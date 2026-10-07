@@ -1,4 +1,4 @@
--- Stores each source message and the resumable cursor used to backfill channel history.
+-- Stores scout source messages, catch-up checkpoints and staff review history.
 CREATE TABLE IF NOT EXISTS `pvp_scout_messages` (
   `message_id` varchar(32) NOT NULL,
   `channel_id` varchar(32) NOT NULL,
@@ -37,16 +37,6 @@ CREATE TABLE IF NOT EXISTS `pvp_scout_messages` (
   KEY `idx_pvp_scout_root` (`channel_id`,`root_message_id`,`message_id`),
   KEY `idx_pvp_scout_review` (`channel_id`,`review_status`,`is_deleted`,`message_id`),
   KEY `idx_pvp_scout_author` (`channel_id`,`author_id`,`message_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS `pvp_scout_backfill` (
-  `channel_id` varchar(32) NOT NULL,
-  `before_message_id` varchar(32) DEFAULT NULL,
-  `backfill_complete` tinyint(1) NOT NULL DEFAULT 0,
-  `processed_count` bigint unsigned NOT NULL DEFAULT 0,
-  `last_error` text DEFAULT NULL,
-  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-  PRIMARY KEY (`channel_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Only advances after history through this message has been successfully archived.

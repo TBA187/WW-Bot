@@ -1,8 +1,12 @@
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 const { SlashCommandBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const path = require('path');
 
 class PvPKingRules {
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_rules";
         this.officerRoleID = config.officerRoleID;
         this.pvpKingRoleID = config.pvpKingRoleID;
@@ -23,7 +27,7 @@ class PvPKingRules {
 
             const rulesEmbed = new EmbedBuilder()
                 .setTitle('❄️ The Long Night Awaits ❄️')
-                .setDescription(`The **PvP King Challenge** is White Walkers ultimate test of strength. One warrior holds the PvP Crown; many seek to claim it. Do you have the steel to seize the throne?\n` +
+                .setDescription(`The **PvP King Challenge** is White Walkers ultimate test of strength. Each server has its own PvP King. One King holds this server's PvP Crown. Do you have the steel to seize the throne?\n` +
                     `### ⚔️ How to Challenge\n` +
                     `Head over to <#${this.pvpKingChannelID}> and use the command:\n` +
                     `> **/pvp_challenge**\n` +
@@ -39,17 +43,17 @@ class PvPKingRules {
                     `- The PvP King may decline a challenge with a valid reason. However, should a challenge go ignored for **48 hours**, the King shall be deemed to have **Forfeited**, and the Crown will pass automatically to the first challenger!\n` +
                     `- All PvP Kings are reborn in the eternal frost, claiming the <@&${this.pvpWarriorRoleID}> role as tribute to the **White Walker** legion!\n` +
                     `- Only **One King** can hold the <@&${this.pvpKingRoleID}> role at a time!\n\u200b`)
-                .setColor(0x02f3d7)
+                .setColor(this.pvpServerColor)
                 .addFields(
                     { name: '❄️ Commands of the Cold', value: `\`/pvp_help\``, inline: true },
                     { name: '🧊 The Frozen Records', value: `<#${this.historyThreadID}>`, inline: true },
                 )
                 .setThumbnail('attachment://ww_logo.png')
-                .setFooter({ text: 'WW PvP King System', iconURL: 'attachment://ww_logo.png' })
+                .setFooter({ text: `WW PvP King System • ${this.pvpServerName}`, iconURL: 'attachment://ww_logo.png' })
                 .setTimestamp();
 
             await interaction.editReply({
-                content: `## 👑  White Walkers PvP King Challenge Rules  📜`,
+                content: `## 📜  White Walkers PvP King Challenge Rules — ${this.pvpServerName} ${this.pvpServerEmoji}`,
                 embeds: [rulesEmbed],
                 files: [wwLogo]
             });
@@ -61,4 +65,4 @@ class PvPKingRules {
     }
 }
 
-module.exports = PvPKingRules;
+module.exports = wrapPvpServerCommand(PvPKingRules);

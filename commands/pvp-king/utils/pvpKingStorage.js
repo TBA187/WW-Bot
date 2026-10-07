@@ -66,9 +66,15 @@ function createSyncEventId(prefix = 'pvp') {
 
 class PvpKingStorage {
     constructor(options = {}) {
+        this.server = options.server ?? 'gold';
+        if (!['gold', 'silver'].includes(this.server)) {
+            throw new Error(`Unsupported PvP King server: ${this.server}`);
+        }
         this.db = options.db;
         this.storageMode = parseStorageMode(options.storageMode ?? process.env.STORAGE_MODE);
-        this.dataFile = options.dataFile || DEFAULT_DATA_FILE;
+        this.dataFile = options.dataFile || (this.server === 'silver'
+            ? path.join(DEFAULT_DATA_DIR, 'pvp_king_silver_data.json')
+            : DEFAULT_DATA_FILE);
         this.tempFile = `${this.dataFile}.tmp`;
         this.syncIntervalMs = options.syncIntervalMs || STORAGE_SYNC_INTERVAL_MS;
         this.syncInterval = null;
@@ -132,9 +138,16 @@ class PvpKingStorage {
         console.log('[WW LOG] MySQL PvP King storage restored; pending JSON operations will synchronize automatically.');
     }
 
+    // The JSON interpreter and queued operations use the same logical table
+    // names. Translate only at the MySQL boundary, including transactions.
+    sqlForServer(sql) {
+        if (this.server === 'gold') return sql;
+        return sql.replace(/\bpvp_king_(stats|history|cooldowns)\b/g, 'pvp_king_silver_$1');
+    }
+
     async mysqlQuery(sql, params = [], retries) {
         try {
-            const result = await this.db.query(sql, params, retries);
+            const result = await this.db.query(this.sqlForServer(sql), params, retries);
             this.noteMysqlRestored();
             return result;
         } catch (err) {
@@ -339,9 +352,9 @@ class PvpKingStorage {
         let results;
         try {
             results = await Promise.all([
-                this.db.query('SELECT user_id, king_name, total_wins, total_crown_losses, current_streak, longest_streak, first_crowned, crowned_at FROM pvp_king_stats'),
-                this.db.query('SELECT id, challenger_id, challenger_name, king_id, king_name, last_challenge, notify_on_expire FROM pvp_king_cooldowns'),
-                this.db.query('SELECT * FROM pvp_king_history ORDER BY id ASC')
+                this.db.query(this.sqlForServer('SELECT user_id, king_name, total_wins, total_crown_losses, current_streak, longest_streak, first_crowned, crowned_at FROM pvp_king_stats')),
+                this.db.query(this.sqlForServer('SELECT id, challenger_id, challenger_name, king_id, king_name, last_challenge, notify_on_expire FROM pvp_king_cooldowns')),
+                this.db.query(this.sqlForServer('SELECT * FROM pvp_king_history ORDER BY id ASC'))
             ]);
             this.noteMysqlRestored();
         } catch (err) {
@@ -386,7 +399,7 @@ class PvpKingStorage {
     }
 
     async transactionQuery(connection, sql, params = []) {
-        return connection.query(sql, params);
+        return connection.query(this.sqlForServer(sql), params);
     }
 
     startSyncLoop() {
@@ -1342,23 +1355,13 @@ class PvpKingStorage {
         return row ?? { totalKingEntries: 0, latestKingId: null };
     }
 
-    async eventHistorySince(eventStartDate) {
+    async eventHistorySince(eventStartDate, eventEndDate = null, { inclusiveStart = false } = {}) {
         const [rows] = await this.query(`
-            SELECT king_id, king_name, created_at
+            SELECT id, king_id, king_name, created_at
             FROM pvp_king_history
-            WHERE created_at > ?
-            ORDER BY created_at ASC
-        `, [eventStartDate]);
-
-        return rows;
-    }
-
-    async eventHistorySinceDesc(eventStartDate) {
-        const [rows] = await this.query(`
-            SELECT king_id, created_at FROM pvp_king_history
-            WHERE created_at > ?
-            ORDER BY created_at DESC
-        `, [eventStartDate]);
+            WHERE created_at ${inclusiveStart ? '>=' : '>'} ? ${eventEndDate ? 'AND created_at <= ?' : ''}
+            ORDER BY created_at ASC, id ASC
+        `, eventEndDate ? [eventStartDate, eventEndDate] : [eventStartDate]);
 
         return rows;
     }
@@ -1963,9 +1966,17 @@ class PvpKingStorage {
             return [{ totalKingEntries: rows.length }];
         }
 
-        if (normalized.includes('where created_at > ?')) {
+        if (normalized.includes('where created_at >= ?')) {
+            const cutoff = toSqlDate(params[0]);
+            rows = rows.filter(row => compareSqlDatesAsc(row.created_at, cutoff) >= 0);
+        } else if (normalized.includes('where created_at > ?')) {
             const cutoff = toSqlDate(params[0]);
             rows = rows.filter(row => compareSqlDatesAsc(row.created_at, cutoff) > 0);
+        }
+
+        if (normalized.includes('created_at <= ?')) {
+            const cutoff = toSqlDate(params[1]);
+            rows = rows.filter(row => compareSqlDatesAsc(row.created_at, cutoff) <= 0);
         }
 
         if (normalized.includes('order by id desc')) {

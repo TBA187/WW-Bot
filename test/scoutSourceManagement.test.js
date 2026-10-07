@@ -476,3 +476,26 @@ test('stopping ingestion while OCR is in flight prevents a late database write',
     const saving = ingestor.saveMessage({ id: ROOT, channelId: 'channel' });
     ingestor.stopped = true; complete({}); assert.equal(await saving, null);
 });
+
+test('startup goes directly to checkpoint catch-up for saved and missing cursors', async t => {
+    t.mock.method(console, 'log', () => {});
+    for (const [server, cursor] of [['gold', ROOT], ['silver', null]]) {
+        const f = catchupFixture(105, cursor);
+        f.ingestor.server = server;
+        f.store.ensureSchema = async () => {};
+        f.store.autocomplete = async () => [];
+        f.store.refreshAutomaticRecords = async () => 0;
+        let restored = 0, inspected = 0;
+        f.ingestor.feedback = { async restorePending() { restored++; }, async stop() {} };
+        f.ingestor.reinspectLegacyResultCards = async () => { inspected++; };
+        await f.ingestor.start();
+        await Promise.all([f.ingestor.catchupPromise, f.ingestor.reinspectionPromise]);
+        assert.equal(f.ingestor.catchupReady, true);
+        assert.equal(f.state.created.length, 105);
+        assert.equal(f.state.cursor, f.id(105));
+        assert.equal(restored, 1);
+        assert.equal(inspected, 1);
+        await f.ingestor.stop();
+        assert.equal(f.ingestor.started, false);
+    }
+});

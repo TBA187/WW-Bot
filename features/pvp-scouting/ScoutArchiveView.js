@@ -53,7 +53,6 @@ class ScoutArchiveView {
             rebuildGroups: async () => {
                 const contexts = [...this.dirty];
                 for (const context of contexts) {
-                    if (context.ingestor?.backfilling) continue;
                     await context.ingestor?.rebuildGroups();
                     this.dirty.delete(context);
                 }

@@ -6,7 +6,9 @@ function parseJsonArray(value) {
     if (!value) return [];
 
     try {
-        const parsed = JSON.parse(value);
+        const parsed = typeof value === 'string' || Buffer.isBuffer(value)
+            ? JSON.parse(value)
+            : value;
         return Array.isArray(parsed) ? parsed : [];
     } catch (err) {
         console.error('[XP DB HELPER] Error parsing JSON array:', err);
@@ -18,7 +20,9 @@ function parseJsonObject(value) {
     if (!value) return null;
 
     try {
-        const parsed = JSON.parse(value);
+        const parsed = typeof value === 'string' || Buffer.isBuffer(value)
+            ? JSON.parse(value)
+            : value;
         return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
     } catch (err) {
         console.error('[XP DB HELPER] Error parsing JSON object:', err);

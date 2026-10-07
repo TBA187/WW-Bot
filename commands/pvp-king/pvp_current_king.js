@@ -1,3 +1,4 @@
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 // ----------------------
 // /pvp_current_king
 // ----------------------
@@ -8,6 +9,9 @@ const { formatNowMinute, resolveSinglePvpKing, stopIfOnCooldown } = require('./u
 class PvpCurrentKing {
 
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_current_king";
         this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
@@ -49,7 +53,7 @@ class PvpCurrentKing {
             const firstCrowned = stats?.first_crowned ? `<t:${Math.floor(new Date(stats?.first_crowned).getTime() / 1000)}:F>` : '*Never*';
             const lastCrowned = stats?.crowned_at ? `<t:${Math.floor(new Date(stats?.crowned_at).getTime() / 1000)}:F>` : '*Never*';
             const embed = new EmbedBuilder()
-                .setTitle('<:kyurem:1472065995089645609>\u2002White Walker PvP King\u2002<:kyurem:1472065995089645609>')
+                .setTitle(`<:kyurem:1472065995089645609>\u2002White Walker PvP King — ${this.pvpServerName} ${this.pvpServerEmoji}`)
                 .setDescription(`## 👑\u2002<@${currentKing.id}>\u2002👑`)
                 .addFields(
                     { name: `🔥\u2002 Current Win Streak:\u2002${currentStreak}`, value: '\u2002', inline: false },
@@ -61,9 +65,9 @@ class PvpCurrentKing {
                     { name: '\u2002', value: `- Challenge <@${currentKing.id}> with the \`/pvp_challenge\` command!`, inline: false },
                     { name: '\u2002', value: '\u2002', inline: false }
                 )
-                .setColor(0xf1c40f)
+                .setColor(this.pvpServerColor)
                 .setThumbnail(currentKing.displayAvatarURL())
-                .setFooter(createPvpFooter())
+                .setFooter(createPvpFooter(this.pvpServerName))
                 .setTimestamp();
 
             return interaction.editReply({
@@ -83,4 +87,4 @@ class PvpCurrentKing {
     }
 }
 
-module.exports = PvpCurrentKing;
+module.exports = wrapPvpServerCommand(PvpCurrentKing);

@@ -1,3 +1,5 @@
+// Shows each server's configured PvP event or the preserved finished event results.
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 // ----------------------
 // /pvp_event
 // ----------------------
@@ -9,37 +11,59 @@ const {
     ButtonBuilder,
     ButtonStyle
 } = require('discord.js');
-const { refreshGuildMembers } = require('./utils/pvpHelper.js');
+const { configuredEvent, loadEventResults, configuredEventSummary, utcEventDate } = require('./utils/pvpEvent.js');
+
+// Vangogsan's eighth consecutive event victory is recorded in Gold history
+// at this UTC time. The finished event is shared; each leaderboard reads only
+// its own server's history up to the closing victory.
+const PVP_KING_EVENT = Object.freeze({
+    name: "Vangogsan's PvP King Event",
+    startDate: '2026-05-06 01:00:00',
+    endDate: '2026-07-10 08:56:20',
+    targetStreak: 8,
+    rewardCoinCapsules: 23,
+    winnerId: '632207715229368349',
+    winnerName: 'Vangogsan'
+});
+
+function completedEventSummary() {
+    const event = PVP_KING_EVENT;
+    const endTime = Math.floor(new Date(`${event.endDate}Z`).getTime() / 1000);
+    return `## ⚔️ ${event.name} — Finished\n`
+        + `### 🥇 Event Winner: <@${event.winnerId}> (${event.winnerName})\n`
+        + `### 🏆 Requirement: ${event.targetStreak} wins in a row\n`
+        + `### 🎁 Reward: ${event.rewardCoinCapsules} Coin Capsules\n`
+        + `-# Finished: <t:${endTime}:F>. Later victories do not count towards this event.\n`;
+}
 
 class PvpEvent {
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_event";
         this.db = config.pvpKingStorage || config.db;
-        this.pvpKingRoleID = config.pvpKingRoleID;
+        this.eventConfig = config;
         this.data = new SlashCommandBuilder()
             .setName('pvp_event')
-            .setDescription("View the time limited PvP King Event Leaderboard");
+            .setDescription("View the finished PvP King Event results");
     }
 
     async execute(interaction) {
         await interaction.deferReply();
 
         try {
-            const EVENT_START_DATE = '2026-05-06 01:00:00';
-
-            const historyRows = await this.db.eventHistorySince(EVENT_START_DATE);
-
-            await refreshGuildMembers(interaction.guild, '/pvp_event');
-
-            const kingRole = interaction.guild.roles.cache.get(this.pvpKingRoleID);
-            const currentKingId = kingRole?.members.first()?.id || null;
-            const currentKingText = currentKingId ? `<@${currentKingId}>` : '*No current PvP King found*';
+            const configured = configuredEvent(this.eventConfig);
+            const results = configured ? await loadEventResults(this.db, configured) : null;
+            const event = results?.event || PVP_KING_EVENT;
+            const historyRows = results?.history || await this.db.eventHistorySince(event.startDate, event.endDate);
+            const summary = configured ? configuredEventSummary(event) : completedEventSummary();
 
             if (historyRows.length === 0) {
-                return interaction.editReply(
-                    `### ⏳ The PvP Event has started, but no one has claimed a victory yet!\n` +
-                    `Be the first to challenge the current PvP King (${currentKingText}) with the \`/pvp_challenge\` command in <#1469101041189523657>`
-                );
+                return interaction.editReply({
+                    content: summary
+                        + `\nNo event victories were recorded for **${this.pvpServerName}**.`
+                });
             }
 
             let currentTempKing = null;
@@ -82,18 +106,11 @@ class PvpEvent {
                 }
             }
 
-            // // Sort by Best Streak primarily
-            // let sortedRows = Array.from(eventStats.values()).sort((a, b) =>
-            //     (b.best_streak - a.best_streak) ||
-            //     (b.total_wins - a.total_wins) ||
-            //     (new Date(a.first_crowned) - new Date(b.first_crowned))
-            // );
 
             // Sort logic: 1. Show current King always at top, 2. Total Wins, 3. Best Streak, 4. Date Crowned
-            let sortedRows = Array.from(eventStats.values()).sort((a, b) => {
-                // 1. Priority: Who has the active unbroken streak?
-                if (a.active_streak > 0 && b.active_streak === 0) return -1;
-                if (b.active_streak > 0 && a.active_streak === 0) return 1;
+            const sortedRows = Array.from(eventStats.values()).sort((a, b) => {
+                if (a.king_id === event.winnerId && b.king_id !== event.winnerId) return -1;
+                if (b.king_id === event.winnerId && a.king_id !== event.winnerId) return 1;
 
                 // 2. Secondary: Total Wins
                 if (b.total_wins !== a.total_wins) {
@@ -106,7 +123,7 @@ class PvpEvent {
                 }
 
                 // 4. Final: Who got their first win earliest?
-                return new Date(a.first_crowned) - new Date(b.first_crowned);
+                return utcEventDate(a.first_crowned) - utcEventDate(b.first_crowned);
             });
 
             const itemsPerPage = 10;
@@ -119,37 +136,26 @@ class PvpEvent {
                 const currentItems = sortedRows.slice(start, end);
 
                 const embed = new EmbedBuilder()
-                    .setColor(0x02f3d7)
+                    .setColor(this.pvpServerColor)
                     .setThumbnail(interaction.guild.iconURL())
                     .setTimestamp()
                     .setFooter({
-                        text: `Event Page ${page + 1} of ${totalPages}`,
+                        text: `${event.winnerId ? 'Finished Event' : 'PvP Event'} • ${this.pvpServerName} • Page ${page + 1} of ${totalPages}`,
                         iconURL: interaction.guild.iconURL()
                     });
 
-                let descriptionText = `## ⚔️\u2002Vangogsan's PvP King Event\u2002⚔️\n` +
-                    `**The race is on! Only victories after May 6th, 2026 count towards this challenge.**\n` +
-                    `### 🏆\u2002Goal: First to Win 10 times in a row!\n` +
-                    `### 🥇\u2002Reward:\u200223 Coin Capsules\n` +
-                    `### 👑\u2002Current PvP King:\u2002${currentKingText}\n` +
-                    `-# Challenge the current PvP King with the \`/pvp_challenge\` command in <#1469101041189523657>\n` +
-                    `-# Read the PvP King **Rules** by using the \`/pvp_rules\` command.\n\n` +
-                    `## <:pepe_king:1455434151262949535>\u2002PvP Event Kings:\n\n`;
+                let descriptionText = summary
+                    + `-# ${this.pvpServerEmoji} Event results for **${this.pvpServerName}**.\n\n`
+                    + `## <:pepe_king:1455434151262949535> PvP Event Kings:\n\n`;
 
                 currentItems.forEach((row, index) => {
                     const overallIndex = start + index;
-                    const unixLast = Math.floor(new Date(row.last_win + " UTC").getTime() / 1000);
-                    const isCurrentKing = row.king_id === currentKingId;
-                    const crownLabel = isCurrentKing ? " 👑" : "";
-
-                    // Show [EVENT WINNER] if they hit 10 at any point
-                    const eventWinnerMedal = row.best_streak >= 10 ? "\n🌟 **[EVENT WINNER]** 🌟" : "";
+                    const unixLast = Math.floor(utcEventDate(row.last_win).getTime() / 1000);
+                    const crownLabel = row.king_id === event.winnerId ? ' 👑' : '';
+                    const eventWinnerMedal = row.king_id === event.winnerId ? "\n🌟 **[EVENT WINNER]** 🌟" : '';
                     const rankMedal = overallIndex === 0 ? "🥇" : overallIndex === 1 ? "🥈" : overallIndex === 2 ? "🥉" : `**${overallIndex + 1}.**`;
 
-                    // Only show the streak line if it is ACTIVE or they already finished (10/10)
-                    const displayStreak = row.best_streak >= 10 ? row.best_streak : row.active_streak;
-                    const showStreakLine = (row.active_streak > 0 || row.best_streak >= 10);
-                    const streakText = showStreakLine ? `**└ Unbroken Streak:\u2002\`${displayStreak}/10\`\u2002🔥**\n` : "";
+                    const streakText = `**└ Best Event Streak: \`${row.best_streak}/${event.targetStreak}\` 🔥**\n`;
 
                     descriptionText += `${rankMedal} **${row.king_name}**${crownLabel} ${eventWinnerMedal}\n` +
                         streakText +
@@ -219,4 +225,6 @@ class PvpEvent {
     }
 }
 
-module.exports = PvpEvent;
+module.exports = wrapPvpServerCommand(PvpEvent);
+
+module.exports.PVP_KING_EVENT = PVP_KING_EVENT;

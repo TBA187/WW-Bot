@@ -30,7 +30,7 @@ const {
     MessageFlags
 } = require('discord.js');
 const {
-    botTimezone, guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, guildMemberRoleID, pvpKingRoleID, pvpWarriorRoleID, wwRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, pvpScoutingGoldChannelID, pvpScoutingSilverChannelID, goldRoleID, silverRoleID, historyThreadID, dungeonChannelID, dungeonRoleID, giveawayChannelID
+    botTimezone, guildId, welcomeChannelID, ownerID, leaderRoleID, adminRoleID, officerRoleID, guildMemberRoleID, pvpKingRoleID, pvpKingSilverRoleID, pvpWarriorRoleID, wwRoleID, botChannelID, logChannelID, ignoredLogChannels, ignoreLogPrivateChannelCreate, blockedEditBotMsgChannels, pvpKingChannelID, pvpKingSilverChannelID, pvpScoutingGoldChannelID, pvpScoutingSilverChannelID, goldRoleID, silverRoleID, historyThreadID, historySilverThreadID, dungeonChannelID, dungeonRoleID, giveawayChannelID
 } = appConfig;
 
 const fs = require("fs");
@@ -303,6 +303,11 @@ const commandMap = new Map();
 // let activeChallenge = null; // Global PvP Challenge Lock
 const challengeTimeouts = new Map(); // PvP challenge confirmation timers
 const pvpKingStorage = new PvpKingStorage({ db });
+const pvpKingStores = {
+    gold: pvpKingStorage,
+    silver: new PvpKingStorage({ db, server: 'silver' })
+};
+const pvpChallengeTimeouts = { gold: challengeTimeouts, silver: new Map() };
 const giveawayStore = createGiveawayStore({ db });
 const notificationStore = new NotificationStore({
     db,
@@ -337,6 +342,7 @@ const commandConfig = {
     officerRoleID,
     guildMemberRoleID,
     pvpKingRoleID,
+    pvpKingSilverRoleID,
     pvpWarriorRoleID,
     wwRoleID,
     botChannelID,
@@ -345,6 +351,7 @@ const commandConfig = {
     ignoreLogPrivateChannelCreate,
     blockedEditBotMsgChannels,
     pvpKingChannelID,
+    pvpKingSilverChannelID,
     pvpScoutingGoldChannelID,
     pvpScoutingSilverChannelID,
     goldRoleID,
@@ -352,6 +359,7 @@ const commandConfig = {
     scoutServers,
     scoutServerSettings,
     historyThreadID,
+    historySilverThreadID,
     dungeonChannelID,
     dungeonRoleID,
     giveawayChannelID,
@@ -359,6 +367,8 @@ const commandConfig = {
     notificationStore,
     challengeTimeouts,
     pvpKingStorage,
+    pvpKingStores,
+    pvpChallengeTimeouts,
     pvpScoutStore,
     scoutRosterStore,
     guildMemberStore: scoutRosterStore,
@@ -396,7 +406,7 @@ async function bootstrap() {
         }
         await startupStep('guild settings', () => syncDBSettings());
 
-        await startupStep('PvP King data', () => pvpKingStorage.restore());
+        await startupStep('PvP King data', () => Promise.all(Object.values(pvpKingStores).map(store => store.restore())));
         await startupStep('giveaway data', () => giveawayStore.restore());
         await startupStep('notification data', () => notificationStore.restore());
         // A cold first run warms suggestions before commands become usable.
@@ -587,7 +597,7 @@ async function shutdown(signal, exitCode = 0) {
     console.log(`[WW LOG] ${signal} received. Shutting down cleanly...`);
     // Cancel timers before closing the database and Discord connection.
     client.cooldownNotifier?.stop?.();
-    pvpKingStorage.stopSyncLoop();
+    for (const store of Object.values(pvpKingStores)) store.stopSyncLoop();
     notificationStore.stopSyncLoop();
     clearInterval(client.guildSettingsSyncLoop);
     client.giveawayLoop?.stop?.();
@@ -645,7 +655,7 @@ client.once(Events.ClientReady, async () => {
     });
 
     // Check if PvP King cooldowns naturally expired (every 60 seconds)
-    pvpKingStorage.startSyncLoop();
+    for (const store of Object.values(pvpKingStores)) store.startSyncLoop();
     notificationStore.startSyncLoop();
     startGuildSettingsSyncLoop();
     // Check active Giveaways to end them on time

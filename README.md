@@ -82,7 +82,7 @@ Ready-to-run SQL files are grouped by feature in `sql/`:
 - `sql/create_giveaway_tables.sql`
 - `sql/create_guild_settings_table.sql`
 - `sql/create_notification_tables.sql`
-- `sql/create_pvp_king_tables.sql`
+- `sql/create_pvp_king_tables.sql` (both Gold and Silver)
 - `sql/create_xp_level_tables.sql`
 - `sql/create_guild_applications_table.sql`
 - `sql/create_bot_runtime_tables.sql`
@@ -93,7 +93,8 @@ Ready-to-run SQL files are grouped by feature in `sql/`:
 Local runtime state is stored in `data/` and ignored by Git.
 
 - `data/dungeon_runs.json`: temporary dungeon fallback state.
-- `data/pvp_king_data.json`: temporary PvP King fallback state.
+- `data/pvp_king_data.json`: Gold PvP King fallback state.
+- `data/pvp_king_silver_data.json`: Silver PvP King fallback state.
 - `data/giveaways.json`: giveaway metadata mirror, plus entries and draw history for active and recently ended giveaways. It preserves pending changes during an outage and syncs them to MySQL when the connection returns.
 - `data/guild_settings.json`: mirror of guild settings, kept populated so XP/logging settings still load during a database outage.
 - `data/notifications.json`: notification settings and member subscriptions, used during a MySQL outage and synchronized when MySQL returns.
@@ -113,7 +114,7 @@ Guild settings:
 - The shared `guild_members` table stores Discord profiles, current/former membership history and one `selected_server` value (`gold`, `silver`, `cross`, or no selection).
 - Authorized settings users who have never held the guild-member role are stored with status `other`, so their settings do not create current/former-member scout warnings.
 - Other commands can read the saved preference through `guildMemberStore.getSelectedServer(guildId, discordId)`. Existing commands keep their current behavior until they explicitly use it.
-- `pvp_scout_backfill` is required for resumable initial history import and its completion marker. Normal offline catch-up uses the separate `pvp_scout_catchup` checkpoint.
+- `pvp_scout_catchup` stores each channel's last successfully processed message ID. Startup scans newer messages, skips archived sources and advances the checkpoint only after a successful catch-up. A missing checkpoint triggers one history scan to establish it.
 
 XP and ranks:
 
@@ -126,6 +127,32 @@ PvP King:
 - manages crown, challenge, cooldown, history, stats, leaderboard, reverse, and notifier flows
 - uses MySQL transactions where multiple PvP database updates must succeed together
 - falls back to JSON when MySQL is unavailable
+- All eleven PvP King slash commands run only in `pvpKingChannelID` (Gold) or `pvpKingSilverChannelID` (Silver). The invoking channel selects the king role, history thread, stats, challenge cooldowns, and notifications. Buttons remain bound to that server. Configure Silver with `pvpKingSilverChannelID`, `historySilverThreadID`, and `pvpKingSilverRoleID`.
+
+Future PvP King events:
+
+- Configure an event under `pvpKingEvents.gold` or `pvpKingEvents.silver` in `config.json`, then restart. Each server has a separate winner, requirement and reward.
+- `/pvp_event` shows the configured event's progress, then its finished results. Without an enabled event, it preserves Vangogsan's finished event, defined in `commands/pvp-king/pvp_event.js`.
+- `/pvp_crown` announces the winner in the configured channel. It checks the bot's existing announcement by event ID before posting, including after restarts. Announcement failures are logged without undoing the crown and can be retried on the next crown.
+
+Example event configuration:
+
+```json
+"pvpKingEvents": {
+  "gold": {
+    "enabled": true,
+    "id": "gold-winter-2026",
+    "name": "Gold Winter PvP King Challenge",
+    "startDate": "2026-11-01T00:00:00Z",
+    "endDate": null,
+    "targetStreak": 10,
+    "rewardCoinCapsules": 3,
+    "announcementChannelID": "1180559473501290688",
+    "mentionEveryone": false
+  },
+  "silver": null
+}
+```
 
 Dungeon recruitment:
 

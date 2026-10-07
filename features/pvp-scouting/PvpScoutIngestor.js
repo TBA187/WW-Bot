@@ -8,7 +8,7 @@ const { hasKnownTeamDetail, isPokemonDetailNote, matchKnownTermHeading, matchSpe
 const { setImmediate: yieldToEvents } = require('node:timers/promises');
 const { ScoutMessageFeedback } = require('./ScoutMessageFeedback.js');
 
-const BACKFILL_PAGE_SIZE = 100;
+const HISTORY_PAGE_SIZE = 100;
 const FOLLOW_UP_WINDOW_MS = 15 * 60 * 1000;
 const IMMEDIATE_FOLLOW_UP_WINDOW_MS = 2 * 60 * 1000;
 const EDIT_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -189,9 +189,7 @@ class PvpScoutIngestor {
         this.ocr = options.ocr || new PvpScoutOcr(options.ocrOptions);
         this.stopped = false;
         this.started = false;
-        this.backfilling = false;
         this.queue = Promise.resolve();
-        this.backfillPromise = null;
         this.reinspectionPromise = null;
         this.catchupPromise = null;
         this.catchupReady = false;
@@ -233,8 +231,6 @@ class PvpScoutIngestor {
                 this.store.autocomplete('', this.channelId).catch(error => {
                     console.warn(`[WW LOG] Could not preload PvP scout autocomplete: ${error.message}`);
                 });
-                const state = await this.store.getBackfillState();
-                this.backfilling = Number(state.backfill_complete) !== 1;
                 const updatedRecords = await this.enqueue(async () => {
                     const updated = await this.store.refreshAutomaticRecords();
                     await this.rebuildGroups();
@@ -248,17 +244,11 @@ class PvpScoutIngestor {
                     console.log(`[WW LOG] PvP scout archive refreshed from saved messages: ${updatedRecords} record(s) updated; ${pending} still need review.`);
                 }
                 this.failureCount = 0;
-                if (this.backfilling) {
-                    this.backfillPromise = this.runBackfill().catch(error => {
-                        console.error('[WW LOG] PvP scouting backfill stopped unexpectedly:', error);
-                    });
-                } else {
-                    this.startCatchup();
-                    // Reread screenshots saved with an older OCR version in the background.
-                    this.reinspectionPromise = this.reinspectLegacyResultCards().catch(error => {
-                        console.error('[WW LOG] PvP scouting result-card refresh failed:', error);
-                    });
-                }
+                this.startCatchup();
+                // Reread screenshots saved with an older OCR version in the background.
+                this.reinspectionPromise = this.reinspectLegacyResultCards().catch(error => {
+                    console.error('[WW LOG] PvP scouting result-card refresh failed:', error);
+                });
                 return;
             } catch (error) {
                 this.failureCount++;
@@ -271,7 +261,6 @@ class PvpScoutIngestor {
 
     async stop() {
         this.stopped = true;
-        await this.backfillPromise?.catch(() => {});
         await this.reinspectionPromise?.catch(() => {});
         await this.catchupPromise?.catch(() => {});
         await this.queue.catch(() => {});
@@ -437,7 +426,7 @@ class PvpScoutIngestor {
         const record = await this.buildRecord(message);
         if (this.stopped) return null;
         const saved = await this.store.saveMessage(record);
-        if (!this.backfilling && !regroup) await this.assignLiveGroup(saved);
+        if (!regroup) await this.assignLiveGroup(saved);
         return saved;
     }
 
@@ -504,7 +493,7 @@ class PvpScoutIngestor {
     }
 
     async notifyNewReview(saved) {
-        if (!this.officerChannelId || this.backfilling || this.stopped) return;
+        if (!this.officerChannelId || this.stopped) return;
         const row = await this.store.getMessage(saved.message_id);
         if (!row || row.review_status !== 'pending' || row.is_deleted) return;
         const age = Date.now() - messageTimestamp(row.created_at);
@@ -541,7 +530,7 @@ class PvpScoutIngestor {
     }
 
     async notifyEditReview(edit) {
-        if (!this.officerChannelId || this.backfilling || this.stopped || !edit) return;
+        if (!this.officerChannelId || this.stopped || !edit) return;
         const row = await this.store.getMessage(edit.message_id);
         const latest = await this.store.getEditReview(edit.message_id);
         if (!row || row.is_deleted || latest?.status !== 'pending'
@@ -634,7 +623,7 @@ class PvpScoutIngestor {
         if (!canArchiveMessage(message, this.client.user?.id)) return;
         await this.enqueue(async () => {
             await this.store.markDeleted(message.id, this.channelId);
-            if (!this.backfilling) await this.rebuildGroups();
+            await this.rebuildGroups();
         });
         await this.feedback.remove(message.id);
     }
@@ -690,7 +679,7 @@ class PvpScoutIngestor {
         // ID: newer live events may already be saved beyond an unprocessed gap.
         try {
             while (!this.stopped) {
-                const messages = await channel.messages.fetch({ limit: BACKFILL_PAGE_SIZE, cache: false,
+                const messages = await channel.messages.fetch({ limit: HISTORY_PAGE_SIZE, cache: false,
                     ...(before ? { before } : {}) });
                 if (this.stopped) return;
                 const ordered = [...messages.values()].sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
@@ -707,7 +696,7 @@ class PvpScoutIngestor {
                     if (saved) count++;
                 }
                 const oldestId = ordered[0].id;
-                if (cursor && BigInt(oldestId) <= BigInt(cursor) || ordered.length < BACKFILL_PAGE_SIZE) break;
+                if (cursor && BigInt(oldestId) <= BigInt(cursor) || ordered.length < HISTORY_PAGE_SIZE) break;
                 if (before && BigInt(oldestId) >= BigInt(before)) throw new Error('Discord message history did not advance.');
                 before = oldestId;
             }
@@ -723,73 +712,9 @@ class PvpScoutIngestor {
         });
         if (count && !this.stopped) console.log(`[WW LOG] PvP scout catch-up archived ${count} missed message(s).`);
     }
-
-    async runBackfill() {
-        let backfillState = await this.store.getBackfillState(this.channelId);
-        let cursor = backfillState.before_message_id || null;
-        let processedCount = Number(backfillState.processed_count || 0);
-        const channel = await this.getChannel();
-        console.log(`[WW LOG] PvP scouting history backfill started at ${cursor || 'latest messages'}.`);
-
-        while (!this.stopped) {
-            try {
-                const page = await channel.messages.fetch({
-                    limit: BACKFILL_PAGE_SIZE,
-                    ...(cursor ? { before: cursor } : {})
-                });
-                const messages = [...page.values()].sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
-                if (!messages.length) {
-                    await this.store.saveBackfillState({
-                        beforeMessageId: cursor,
-                        complete: true,
-                        processedCount,
-                        lastError: null
-                    }, this.channelId);
-                    await this.enqueue(() => this.rebuildGroups());
-                    await this.store.autocomplete('', this.channelId).catch(error => {
-                        console.warn(`[WW LOG] Could not refresh PvP scout autocomplete: ${error.message}`);
-                    });
-                    this.backfilling = false;
-                    console.log(`[WW LOG] PvP scouting backfill complete: ${processedCount} historical message(s) archived.`);
-                    this.startCatchup();
-                    this.reinspectionPromise = this.reinspectLegacyResultCards().catch(error => {
-                        console.error('[WW LOG] PvP scouting screenshot refresh failed:', error);
-                    });
-                    return;
-                }
-
-                await this.enqueue(async () => {
-                    for (const message of messages) {
-                        if (this.stopped) break;
-                        await this.saveMessage(message, { regroup: true });
-                        processedCount++;
-                    }
-                });
-                if (this.stopped) return;
-                cursor = messages[0].id;
-                await this.store.saveBackfillState({
-                    beforeMessageId: cursor,
-                    complete: false,
-                    processedCount,
-                    lastError: null
-                }, this.channelId);
-                if (processedCount % 1000 < messages.length) {
-                    console.log(`[WW LOG] PvP scouting backfill archived ${processedCount} message(s); continuing before ${cursor}.`);
-                }
-            } catch (error) {
-                if (this.stopped) return;
-                await this.store.setBackfillError(error, this.channelId).catch(() => {});
-                this.failureCount++;
-                const delayMs = Math.min(60000, 1000 * (2 ** Math.min(this.failureCount - 1, 6)));
-                console.warn(`[WW LOG] PvP scouting backfill paused (${error.message}); retrying in ${Math.ceil(delayMs / 1000)}s.`);
-                await new Promise(resolve => setTimeout(resolve, Math.min(delayMs, 5000)));
-            }
-        }
-    }
 }
 
 module.exports = {
-    BACKFILL_PAGE_SIZE,
     FOLLOW_UP_WINDOW_MS,
     PvpScoutIngestor,
     attachmentIsImage,

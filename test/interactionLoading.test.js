@@ -1,3 +1,4 @@
+// Checks loading responses and control restoration during scout navigation.
 'use strict';
 
 const test = require('node:test');

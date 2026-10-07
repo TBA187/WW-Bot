@@ -1,3 +1,4 @@
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 // ----------------------
 // /pvp_cooldown
 // ----------------------
@@ -7,6 +8,9 @@ const { formatNowMinute, resolveSinglePvpKing, stopIfOnCooldown } = require('./u
 class PvpCooldown {
 
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_cooldown";
         this.db = config.pvpKingStorage || config.db;
         this.pvpKingRoleID = config.pvpKingRoleID;
@@ -59,7 +63,7 @@ class PvpCooldown {
 
             // Helper function to build the message dynamically
             const getMessageContent = (isExpired = false) => {
-                let header = '# ⏱️ PvP King Cooldown Status\n';
+                let header = `# ⏱️ PvP King Cooldown Status — ${this.pvpServerName} ${this.pvpServerEmoji}\n`;
                 let statusSection = `### ✅  You do not have any cooldowns!\n- You can challenge the PvP King (<@${currentKing.id}>) with the \`/pvp_challenge\` command in <#${this.pvpKingChannelID}>`;
                 if (!lastChallenge || lastChallengeKing_id !== currentKing.id) {
                     statusSection = `### ✅  No Active Cooldown!\n- You can challenge the PvP King (<@${currentKing.id}>) with the \`/pvp_challenge\` command in <#${this.pvpKingChannelID}>`;
@@ -135,7 +139,7 @@ class PvpCooldown {
                     });
 
                     await i.followUp({
-                        content: `### ${isNotifyEnabled ? '🔔' : '🔕'} Notifications ${isNotifyEnabled ? 'enabled' : 'disabled'}!`,
+                        content: `### ${isNotifyEnabled ? '🔔' : '🔕'} Notifications ${isNotifyEnabled ? 'enabled' : 'disabled'} for ${this.pvpServerName}!`,
                         flags: MessageFlags.Ephemeral
                     });
                 } catch (error) {
@@ -165,4 +169,4 @@ class PvpCooldown {
     }
 }
 
-module.exports = PvpCooldown;
+module.exports = wrapPvpServerCommand(PvpCooldown);

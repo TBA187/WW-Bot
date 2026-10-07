@@ -1,3 +1,4 @@
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 // ----------------------
 // /pvp_stats
 // ----------------------
@@ -12,6 +13,9 @@ function formatWinTimesTxt(count) {
 class PvpStats {
 
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_stats";
         this.db = config.pvpKingStorage || config.db;
         this.onCooldown = config.onCooldown;
@@ -41,7 +45,7 @@ class PvpStats {
 
             if (!stats) {
                 return interaction.editReply(
-                    `### 📈  No PvP King data found for ${name}\n`
+                    `### 📈  No PvP King data in ${this.pvpServerName} found for ${name}\n`
                 );
             }
 
@@ -49,7 +53,7 @@ class PvpStats {
             const firstCrowned = stats.first_crowned ? `<t:${Math.floor(new Date(stats.first_crowned).getTime() / 1000)}:F>` : '*Never*';
             const lastCrowned = stats.crowned_at ? `<t:${Math.floor(new Date(stats.crowned_at).getTime() / 1000)}:F>` : '*Never*';
             const embed = new EmbedBuilder()
-                .setTitle('<:kyurem:1472065995089645609>\u2002White Walker PvP King Stats\u2002<:kyurem:1472065995089645609>')
+                .setTitle(`White Walker PvP King Stats — ${this.pvpServerName} ${this.pvpServerEmoji}`)
                 .setDescription(`### 📈\u2002PvP Stats for <@${user.id}>`)
                 .addFields(
                     { name: `🔥\u2002Current Win Streak:\u2002${stats.current_streak ?? 0}`, value: '', inline: false },
@@ -65,9 +69,9 @@ class PvpStats {
                     { name: `🥇\u2002First Victory:\u2002${firstCrowned}`, value: '', inline: false },
                     { name: `<:pepe_king:1455434151262949535>\u2002Last Victory:\u2002${lastCrowned}`, value: '', inline: false }
                 )
-                .setColor(0x02f3d7)
+                .setColor(this.pvpServerColor)
                 .setThumbnail(user.displayAvatarURL())
-                .setFooter(createPvpFooter())
+                .setFooter(createPvpFooter(this.pvpServerName))
                 .setTimestamp();
 
             await interaction.editReply({
@@ -87,4 +91,4 @@ class PvpStats {
     }
 }
 
-module.exports = PvpStats;
+module.exports = wrapPvpServerCommand(PvpStats);

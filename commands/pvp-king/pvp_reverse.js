@@ -1,3 +1,4 @@
+const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 
 // ----------------------
 // /pvp_reverse
@@ -8,6 +9,9 @@ const { getLogChannel, requireAnyRole, stopIfOnCooldown } = require('./utils/pvp
 class PvpReverse {
 
     constructor(config) {
+        this.pvpServerName = config.pvpServerName;
+        this.pvpServerEmoji = config.pvpServerEmoji;
+        this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_reverse";
         this.db = config.pvpKingStorage || config.db;
         this.leaderRoleID = config.leaderRoleID;
@@ -86,7 +90,7 @@ class PvpReverse {
             const endTime = now + countdownSeconds;
 
             const message = await interaction.editReply({
-                content: `# ⚠️  Warning!\n## Are you sure you want to reverse the last PvP Crown event of <@${wrongKing.king_id}>?\n` +
+                content: `# ⚠️  Warning — ${this.pvpServerName} ${this.pvpServerEmoji}\n## Are you sure you want to reverse the last PvP Crown event of <@${wrongKing.king_id}> in ${this.pvpServerName}?\n` +
                     `- **Event Type:** ${type}\n` +
                     `- **${typeTxt}** ${last_crowned_time}\n` +
                     `### ℹ️  ${reverseWarningTxt} ${prevKingTag} and update the database accordingly!\n` +
@@ -175,7 +179,7 @@ class PvpReverse {
                         // Log to Discord Log Channel
                         if (logChannel) {
                             await logChannel.send(
-                                `## 🚨  PvP Crown reversed! (${now})\n` +
+                                `## 🚨  PvP Crown reversed in ${this.pvpServerName} ${this.pvpServerEmoji} (${now})\n` +
                                 `- **${executorName}** successfully reversed the last PvP Crown of **<@${wrongKing.king_id}>**\n` +
                                 `### ❌ No previous King found to assign the PvP King role!\n` +
                                 `### <@${this.ownerID}> - No Members currently have the PvP King role. Assign it manually!\n` +
@@ -186,7 +190,7 @@ class PvpReverse {
 
                         // User feedback message
                         return interaction.editReply(
-                            `## 🚨  PvP Crown reversed! (${now})\n` +
+                            `## 🚨  PvP Crown reversed in ${this.pvpServerName} ${this.pvpServerEmoji} (${now})\n` +
                             `- The last PvP Crown of **<@${wrongKing.king_id}>** has been successfully reversed!\n` +
                             `### ❌ However, no previous King found to assign the PvP King role! Assign it manually to a new King with the */pvp_crown* command!\n` +
                             `### ✅ All stats for the wrong King are restored correctly in the database!`
@@ -210,7 +214,7 @@ class PvpReverse {
                     // Log to Discord Log Channel
                     if (logChannel) {
                         await logChannel.send(
-                            `## 🚨  PvP Crown reversed! (${now})\n` +
+                            `## 🚨  PvP Crown reversed in ${this.pvpServerName} ${this.pvpServerEmoji} (${now})\n` +
                             `- **${executorName} reversed the last PvP Crown event of <@${wrongKing.king_id}>**\n` +
                             `- **Event Type:** ${type}\n` +
                             `- **${typeTxt}** ${last_crowned_time}\n` +
@@ -231,7 +235,7 @@ class PvpReverse {
 
                     // Send new public message to the channel
                     return interaction.channel.send(
-                        `## 🚨  PvP Crown reversed! (${now})\n` +
+                        `## 🚨  PvP Crown reversed in ${this.pvpServerName} ${this.pvpServerEmoji} (${now})\n` +
                         `- **${executorName} reversed the last PvP Crown event of <@${wrongKing.king_id}>**\n` +
                         `- **Event Type:** ${type}\n` +
                         `- **${typeTxt}** ${last_crowned_time}\n` +
@@ -268,4 +272,4 @@ class PvpReverse {
     }
 }
 
-module.exports = PvpReverse;
+module.exports = wrapPvpServerCommand(PvpReverse);

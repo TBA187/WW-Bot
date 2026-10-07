@@ -18,10 +18,10 @@ test('Gold, Silver and roster initialize the exact checked-in definitions once p
     await Promise.all([gold.ensureSchema(), silver.ensureSchema(), roster.ensureSchema()]);
     const expected = [...fs.readFileSync(path.join(__dirname, '../sql/create_pvp_scout_tables.sql'), 'utf8')
         .matchAll(/CREATE TABLE IF NOT EXISTS `[^`]+`[^;]+;/gu)].map(match => match[0]);
-    assert.equal(calls.length, 11);
+    assert.equal(calls.length, 10);
     assert.deepEqual([...calls].sort(), expected.sort());
     await Promise.all([gold.ensureSchema(), silver.ensureSchema(), roster.ensureSchema()]);
-    assert.equal(calls.length, 11);
+    assert.equal(calls.length, 10);
     const otherCalls = [];
     await ensureScoutTables({ async query(sql) { otherCalls.push(sql); } }, ['pvp_scout_messages']);
     assert.equal(otherCalls.length, 1);
@@ -33,12 +33,12 @@ test('failed scout table setup retries the failed statement without repeating co
     const db = { async query(sql) {
         const table = sql.match(/CREATE TABLE IF NOT EXISTS `([^`]+)`/u)[1];
         calls.push(table);
-        if (table === 'pvp_scout_backfill' && fail) { fail = false; throw new Error('Database unavailable'); }
+        if (table === 'pvp_scout_catchup' && fail) { fail = false; throw new Error('Database unavailable'); }
     } };
-    const tables = ['pvp_scout_messages', 'pvp_scout_backfill', 'pvp_scout_catchup'];
+    const tables = ['pvp_scout_messages', 'pvp_scout_catchup', 'pvp_scout_message_feedback'];
     await assert.rejects(ensureScoutTables(db, tables), /Database unavailable/u);
     await ensureScoutTables(db, tables);
-    assert.deepEqual(calls, ['pvp_scout_messages', 'pvp_scout_backfill', 'pvp_scout_backfill', 'pvp_scout_catchup']);
+    assert.deepEqual(calls, ['pvp_scout_messages', 'pvp_scout_catchup', 'pvp_scout_catchup', 'pvp_scout_message_feedback']);
 });
 
 test('missing SQL definitions fail before changing the database', async () => {
