@@ -265,6 +265,10 @@ class Leaderboard {
                 );
             }
 
+            if (this.config.db.xpStore?.hasPending(guildId, track)) {
+                lbEmbed.addFields({ name: 'XP synchronization',
+                    value: 'Recent activity is waiting to sync. These totals may be behind.' });
+            }
             const components = [
                 buildSortMenu(track, activeSortKey),
                 buildPageButtons(page, track, activeSortKey, users.length < limit)
@@ -274,6 +278,11 @@ class Leaderboard {
             if (interaction.replied || interaction.deferred) return interaction.editReply(payload);
             return interaction.update(payload);
         } catch (err) {
+            if (this.config.db.isDatabaseUnavailableError?.(err)) {
+                const payload = { content: 'XP data is temporarily unavailable while the database reconnects. New XP/activity is saved locally and will sync automatically.', components: [] };
+                if (interaction.replied || interaction.deferred) return interaction.editReply(payload);
+                return interaction.update(payload);
+            }
             console.error('[WW LOG] Level Leaderboard Error:', err);
             const payload = { content: 'Error fetching leaderboard data.', components: [] };
             if (interaction.replied || interaction.deferred) return interaction.editReply(payload);

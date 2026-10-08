@@ -19,6 +19,9 @@ const { ScoutServerSettings } = require('./features/pvp-scouting/ScoutServerSett
 const { ScoutAuditLogger } = require('./features/pvp-scouting/ScoutAuditLogger.js');
 const { DiscordDiagnosticLogger } = require('./utils/discordDiagnostics.js');
 const { writeJsonIfChanged } = require('./utils/jsonFile.js');
+const { XpStore } = require('./utils/xpStore.js');
+const { configureXpRecovery } = require('./utils/xpEngine.js');
+const { fetchSpecialTracks } = require('./utils/xpDbHelper.js');
 const {
     Client,
     GatewayIntentBits,
@@ -309,6 +312,8 @@ const pvpKingStores = {
 };
 const pvpChallengeTimeouts = { gold: challengeTimeouts, silver: new Map() };
 const giveawayStore = createGiveawayStore({ db });
+const xpStore = new XpStore({ db, shutdownSignal: lifecycle.signal });
+db.xpStore = xpStore;
 const notificationStore = new NotificationStore({
     db,
     guildId,
@@ -378,6 +383,8 @@ const commandConfig = {
     guildSettingsCache
 };
 
+configureXpRecovery(commandConfig);
+
 async function startupStep(label, work) {
     lifecycle.check();
     const startedAt = Date.now();
@@ -405,6 +412,12 @@ async function bootstrap() {
             console.warn('[WW LOG] Database unavailable at startup. DB-backed features will retry when used.');
         }
         await startupStep('guild settings', () => syncDBSettings());
+        await startupStep('XP recovery data', () => xpStore.restore());
+        await lifecycle.preload(() => fetchSpecialTracks(db), {
+            timeoutCode: 'XP_TRACK_PRELOAD_TIMEOUT',
+            onTimeout: error => console.log(`[WW LOG] XP tracks will refresh in the background (${error.code}).`),
+            onError: error => console.warn('[WW LOG] Could not preload XP tracks:', error)
+        });
 
         await startupStep('PvP King data', () => Promise.all(Object.values(pvpKingStores).map(store => store.restore())));
         await startupStep('giveaway data', () => giveawayStore.restore());
@@ -599,11 +612,12 @@ async function shutdown(signal, exitCode = 0) {
     client.cooldownNotifier?.stop?.();
     for (const store of Object.values(pvpKingStores)) store.stopSyncLoop();
     notificationStore.stopSyncLoop();
+    const xpCleanup = xpStore.stopSyncLoop();
     clearInterval(client.guildSettingsSyncLoop);
     client.giveawayLoop?.stop?.();
     require('./tasks/proNotifications.js').stop?.();
     const cleanup = Promise.allSettled([
-        guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop()
+        guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop(), xpCleanup
     ]);
     botDiagnostics.stop();
     client.destroy();
@@ -657,6 +671,7 @@ client.once(Events.ClientReady, async () => {
     // Check if PvP King cooldowns naturally expired (every 60 seconds)
     for (const store of Object.values(pvpKingStores)) store.startSyncLoop();
     notificationStore.startSyncLoop();
+    xpStore.startSyncLoop()?.catch(error => console.error('[XP QUEUE] Could not start recovery:', error));
     startGuildSettingsSyncLoop();
     // Check active Giveaways to end them on time
     startGiveawayLoop(client, commandConfig);

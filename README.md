@@ -95,6 +95,7 @@ Local runtime state is stored in `data/` and ignored by Git.
 - `data/pvp_king_data.json`: Gold PvP King fallback state.
 - `data/pvp_king_silver_data.json`: Silver PvP King fallback state.
 - `data/giveaways.json`: giveaway metadata mirror, plus entries and draw history for active and recently ended giveaways. It preserves pending changes during an outage and syncs them to MySQL when the connection returns.
+- `data/xp_pending.json`: persistent queue of XP awards and raw activity counters, plus the last successful special-track settings snapshot. Operations are saved before their first database attempt and replayed automatically after an outage, including after a restart. When moving the bot to another computer or remote host, stop the old instance first. If this file contains pending updates, copy it to the new host before starting the bot there.
 - `data/guild_settings.json`: mirror of guild settings, kept populated so XP/logging settings still load during a database outage.
 - `data/notifications.json`: notification settings and member subscriptions, used during a MySQL outage and synchronized when MySQL returns.
 - `data/guild_applications.json`: forum scan checkpoint and temporary application records during a MySQL outage. In `json` mode it is the permanent local store.
@@ -120,6 +121,10 @@ XP and ranks:
 - tracks global XP and special XP tracks
 - supports messages, reactions, commands, and voice XP
 - assigns level rewards and shows `/rank` and `/leaderboard`
+- preserves the original XP amounts, boosts, eligibility, cooldown decisions and activity timestamps during MySQL outages; replay does not reroll or recalculate awards
+- uses a transaction and a unique receipt in `xp_applied_operations` to prevent an uncertain save or retry from adding the same XP/activity twice. All four XP tables (`xp_user_levels`, `xp_channel_tracks`, `xp_rewards`, and `xp_applied_operations`) are defined in `sql/create_xp_level_tables.sql`
+- retries saved updates with backoff after recovery; committed level-ups retain their original reward/message context for retry, while unsynchronized totals receive a brief note in rank/leaderboard displays
+- keeps MySQL as the source for rank/leaderboard totals; those commands explain a database outage instead of showing unverified local totals. Saved special-track settings remain usable after an offline restart; a first installation without a saved snapshot needs MySQL to load special-track rules
 
 PvP King:
 

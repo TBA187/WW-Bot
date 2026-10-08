@@ -22,6 +22,7 @@ test('actual index startup cannot restore stores, register commands, login or st
     const processHandlers = new Map();
     const exit = deferred();
     let client;
+    let xpStopped = false;
     class FakeClient extends EventEmitter {
         constructor() { super(); client = this; }
         destroy() { calls.push('disconnect'); }
@@ -33,6 +34,7 @@ test('actual index startup cannot restore stores, register commands, login or st
         startSyncLoop() { calls.push('start sync'); }
         autocomplete() { return Promise.resolve([]); }
     }
+    class FakeXpStore extends FakeStore { stopSyncLoop() { xpStopped = true; } }
     const monitor = { start() { calls.push('monitor start'); return Promise.resolve(); }, stop() {} };
     class FakeIngestor { start() { calls.push('ingestor start'); return Promise.resolve(); } stop() {} }
     const db = { initPromise: databaseReady.promise,
@@ -59,6 +61,9 @@ test('actual index startup cannot restore stores, register commands, login or st
         './features/pvp-scouting/ScoutRosterStore.js': { ScoutRosterStore: FakeStore },
         './features/pvp-scouting/ScoutAuditLogger.js': { ScoutAuditLogger: class { async flush() {} } },
         './utils/jsonFile.js': { writeJsonIfChanged() {} },
+        './utils/xpStore.js': { XpStore: FakeXpStore },
+        './utils/xpEngine.js': { configureXpRecovery() {} },
+        './utils/xpDbHelper.js': { fetchSpecialTracks: async () => { calls.push('XP track load'); return []; } },
         './tasks/proNotifications.js': { stop() {} },
         'discord.js': { ...discord, Client: FakeClient },
         'fs': {}, 'path': path
@@ -84,4 +89,5 @@ test('actual index startup cannot restore stores, register commands, login or st
     client.emit(discord.Events.ClientReady);
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(calls, ['disconnect', 'feature pool closed', 'exit 0']);
+    assert.equal(xpStopped, true);
 });

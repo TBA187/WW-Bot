@@ -24,6 +24,8 @@ data/giveaways.json
 data/giveaways.json.tmp
 data/guild_settings.json
 data/guild_settings.json.tmp
+data/xp_pending.json
+data/xp_pending.json.tmp
 data/scout-autocomplete-cache.json
 data/scout-autocomplete-cache.json.tmp
 data/scout-autocomplete-silver-cache.json

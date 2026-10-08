@@ -44,3 +44,11 @@ CREATE TABLE IF NOT EXISTS `xp_rewards` (
   PRIMARY KEY (`id`),
   KEY `idx_level` (`level`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- Receipts make queued XP/activity increments safe to retry after an uncertain save.
+CREATE TABLE IF NOT EXISTS `xp_applied_operations` (
+  `operation_id` char(36) NOT NULL,
+  `result_json` longtext DEFAULT NULL,
+  `created_at` timestamp(3) NOT NULL DEFAULT current_timestamp(3),
+  PRIMARY KEY (`operation_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;

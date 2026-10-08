@@ -2,6 +2,8 @@
 // Utility - XP Database Helper
 // ==========================
 
+const { getXpStore } = require('./xpStore');
+
 function parseJsonArray(value) {
     if (!value) return [];
 
@@ -64,11 +66,15 @@ function mapTrackRow(row) {
 const SPECIAL_TRACKS_CACHE_TTL_MS = Number(process.env.XP_TRACK_CACHE_TTL_MS || 60000);
 const OUTAGE_LOG_INTERVAL_MS = 5 * 60 * 1000;
 const outageWarnings = new WeakMap();
-let specialTracksRequest = null;
-let specialTracksCache = {
-    expiresAt: 0,
-    tracks: null
-};
+const trackCaches = new WeakMap();
+function getTrackCache(db) {
+    let cache = trackCaches.get(db);
+    if (!cache) {
+        cache = { expiresAt: 0, tracks: db.xpStore?.getSpecialTracks() ?? null, request: null };
+        trackCaches.set(db, cache);
+    }
+    return cache;
+}
 
 function reportXpDatabaseError(db, error, { context, write = false, fallback = '', prefix = '[XP DB HELPER]' }) {
     const unavailable = error?.code === 'DATABASE_UNAVAILABLE' || error?.isCircuitOpen
@@ -93,7 +99,7 @@ function reportXpDatabaseError(db, error, { context, write = false, fallback = '
     state.loggedAt.set(kind, now);
     const code = db.getErrorCode?.(error) || error.causeCode || error.code || 'UNKNOWN';
     const detail = write
-        ? 'XP/activity updates could not be completed; failed operations are not queued for replay.'
+        ? 'XP/activity updates are retained in the persistent JSON queue for recovery.'
         : fallback;
     console.warn(`${prefix} ${context}: MySQL unavailable (${code}).${detail ? ` ${detail}` : ''}`);
 }
@@ -104,23 +110,24 @@ function reportXpDatabaseError(db, error, { context, write = false, fallback = '
  * @returns {Promise<Array>} Array of track objects
  */
 async function fetchSpecialTracks(db) {
+    const specialTracksCache = getTrackCache(db);
     const now = Date.now();
     if (specialTracksCache.tracks && now < specialTracksCache.expiresAt) {
         return specialTracksCache.tracks;
     }
 
     // Message, reaction and command events can request the same refresh.
-    if (specialTracksRequest) return specialTracksRequest;
-    const request = loadSpecialTracks(db);
-    specialTracksRequest = request;
+    if (specialTracksCache.request) return specialTracksCache.request;
+    const request = loadSpecialTracks(db, specialTracksCache);
+    specialTracksCache.request = request;
     try {
         return await request;
     } finally {
-        if (specialTracksRequest === request) specialTracksRequest = null;
+        if (specialTracksCache.request === request) specialTracksCache.request = null;
     }
 }
 
-async function loadSpecialTracks(db) {
+async function loadSpecialTracks(db, specialTracksCache) {
     try {
         const [rows] = await db.query(`
             SELECT id, name, role_ids, channel_ids, level_rewards,
@@ -130,10 +137,10 @@ async function loadSpecialTracks(db) {
         `);
 
         const tracks = rows.map(mapTrackRow);
-        specialTracksCache = {
-            expiresAt: Date.now() + SPECIAL_TRACKS_CACHE_TTL_MS,
-            tracks
-        };
+        specialTracksCache.expiresAt = Date.now() + SPECIAL_TRACKS_CACHE_TTL_MS;
+        specialTracksCache.tracks = tracks;
+        try { db.xpStore?.saveSpecialTracks(tracks); }
+        catch (error) { console.error('[XP DB HELPER] Could not save XP track recovery settings:', error); }
 
         return tracks;
     } catch (err) {
@@ -155,7 +162,7 @@ async function loadSpecialTracks(db) {
  * @param {number} trackId - The track ID
  * @returns {Promise<Object|null>} Track object or null if not found
  */
-async function fetchTrackById(db, trackId) {
+async function fetchTrackById(db, trackId, { requireMysql = false } = {}) {
     try {
         const [rows] = await db.query(`
             SELECT id, name, role_ids, channel_ids, level_rewards,
@@ -168,6 +175,7 @@ async function fetchTrackById(db, trackId) {
         if (rows.length === 0) return null;
         return mapTrackRow(rows[0]);
     } catch (err) {
+        if (requireMysql) throw err;
         reportXpDatabaseError(db, err, { context: `Error fetching track ${trackId}` });
         return null;
     }
@@ -260,16 +268,8 @@ async function recordRawActivity(db, userId, guildId, username, xpType, actionTy
     }
 
     try {
-        const query = `
-            INSERT INTO xp_user_levels (user_id, guild_id, username, xp_type, xp_date, ${totalColumn})
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-            ON DUPLICATE KEY UPDATE
-                username = VALUES(username),
-                xp_date = COALESCE(xp_date, CURRENT_TIMESTAMP),
-                ${totalColumn} = ${totalColumn} + ?
-        `;
-
-        await db.query(query, [userId, guildId, username, safeXpType, statCount, statCount]);
+        await getXpStore(db).record({ kind: 'activity', userId, guildId, username,
+            xpType: safeXpType, actionType, statCount });
     } catch (err) {
         reportXpDatabaseError(db, err, { context: `Error recording raw ${actionType} activity`, write: true });
     }
@@ -281,7 +281,7 @@ async function recordRawActivity(db, userId, guildId, username, xpType, actionTy
  * @param {Array<number>} rewardIds - Array of reward IDs
  * @returns {Promise<Array>} Array of reward objects
  */
-async function fetchRewardsByIds(db, rewardIds) {
+async function fetchRewardsByIds(db, rewardIds, { requireMysql = false } = {}) {
     if (!rewardIds || rewardIds.length === 0) return [];
 
     try {
@@ -300,6 +300,7 @@ async function fetchRewardsByIds(db, rewardIds) {
             roleId: row.role_id
         }));
     } catch (err) {
+        if (requireMysql) throw err;
         reportXpDatabaseError(db, err, { context: 'Error fetching rewards by IDs' });
         return [];
     }

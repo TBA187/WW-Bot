@@ -162,6 +162,10 @@ class Rank {
                     noDataEmbed.addFields(trackRequirements.fields);
                 }
 
+                if (this.config.db.xpStore?.hasPending(guildId, track, target.id)) {
+                    noDataEmbed.addFields({ name: 'XP synchronization',
+                        value: 'Recent activity is waiting to sync. Your saved XP will appear after recovery.' });
+                }
                 await interaction.deleteReply().catch(() => { });
                 return interaction.followUp({
                     embeds: [noDataEmbed],
@@ -233,8 +237,15 @@ class Rank {
                 rankEmbed.setDescription(trackRequirements.description);
             }
 
+            if (this.config.db.xpStore?.hasPending(guildId, track, target.id)) {
+                rankEmbed.addFields({ name: 'XP synchronization',
+                    value: 'Recent activity is waiting to sync. These totals may be behind.' });
+            }
             return interaction.editReply({ embeds: [rankEmbed], files: [logoFile] });
         } catch (err) {
+            if (this.config.db.isDatabaseUnavailableError?.(err)) {
+                return interaction.editReply({ content: 'XP data is temporarily unavailable while the database reconnects. New XP/activity is saved locally and will sync automatically.' });
+            }
             console.error('[WW LOG] Rank Command Error:', err);
             return interaction.editReply({ content: 'Error fetching rank data.' });
         }
