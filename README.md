@@ -55,8 +55,6 @@ The bot registers its application commands in the configured guild at startup. K
 
 Guild application monitoring posts Officer alerts and Court House polls. Forum shop monitoring delivers new-reply notifications to the configured owner. See [operations and configuration](docs/operations.md) for monitor settings, storage, backups and PvP event configuration.
 
-The message builder's `white_walker_branding` option supplies an editable White Walker footer, logo, color and timestamp. Message editing respects `blockedEditBotMsgChannels`; audit delivery uses `logChannelID` and `ignoredLogChannels`.
-
 ## Operation
 
 Runtime state is stored in MySQL and feature-specific files under `data/`. In `auto` and `mysql` modes, features with JSON recovery support preserve pending changes through database outages. Scouting and some XP queries require MySQL.
