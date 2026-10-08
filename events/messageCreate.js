@@ -34,6 +34,10 @@ async function notifyWriteFailure(message) {
 
 module.exports = {
     name: 'messageCreate',
+    prefixCommands: [
+        { name: 'write', prefixes: ['!', '?'] },
+        { name: 'welcome', prefixes: ['!', '?'] }
+    ],
     async execute(message, config) {
         if (message.author.bot) return;
         if (!message.content.startsWith('?') && !message.content.startsWith('!')) return;

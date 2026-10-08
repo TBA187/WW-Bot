@@ -278,3 +278,79 @@ test('typed cache pressure cannot evict the default newest-25 list', async () =>
     assert.equal(store.autocompleteCache.size, 100);
     assert.deepEqual(store.cachedAutocomplete(''), latest);
 });
+
+test('autocomplete rechecks the current deadline after preparing cached suggestions', async t => {
+    let clock = 10_000;
+    t.mock.method(Date, 'now', () => clock);
+    let queries = 0;
+    const command = commandForStore({
+        pvpScoutStore: storeWithQuery(async () => { queries++; return [[]]; }),
+        pvpScoutingGoldChannelID: 'channel'
+    });
+    const notices = [];
+    t.mock.method(command, 'logAutocompleteDelay', message => notices.push(message));
+    t.mock.method(command, 'cachedSuggestions', () => {
+        clock += 200;
+        return [{ name: 'Miltos7', server: 'gold', count: 1 }];
+    });
+    const interaction = autocompleteInteraction('', 2400);
+    await command.handleAutocomplete(interaction);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(interaction.responses, []);
+    assert.equal(queries, 0);
+    assert.match(notices[0], /2400ms old on arrival, 2600ms old before reply/u);
+});
+
+test('background autocomplete queries wait until the reply is acknowledged', async () => {
+    const reply = deferred();
+    let queries = 0;
+    const command = commandForStore({
+        pvpScoutStore: storeWithQuery(async () => { queries++; return [[{ opponent_ign: 'Miltos7' }]]; }),
+        pvpScoutingGoldChannelID: 'channel'
+    });
+    const interaction = autocompleteInteraction('');
+    interaction.respond = choices => { interaction.responses.push(choices); return reply.promise; };
+    const pending = command.handleAutocomplete(interaction);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(interaction.responses, [[]]);
+    assert.equal(queries, 0, 'cache refresh must not block the reply still in flight');
+    reply.resolve();
+    await pending;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(queries, 1);
+});
+
+test('a rejected autocomplete acknowledgement does not start background queries or retry', async t => {
+    let queries = 0, replies = 0;
+    const command = commandForStore({
+        pvpScoutStore: storeWithQuery(async () => { queries++; return [[]]; }),
+        pvpScoutingGoldChannelID: 'channel'
+    });
+    t.mock.method(command, 'logAutocompleteDelay', () => {});
+    const interaction = autocompleteInteraction('');
+    interaction.respond = async () => {
+        replies++;
+        throw Object.assign(new Error('Unknown interaction'), { code: 10062 });
+    };
+    await command.handleAutocomplete(interaction);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(replies, 1);
+    assert.equal(queries, 0);
+});
+
+test('a cache error after the response budget expires does not send a doomed fallback', async t => {
+    let clock = 10_000;
+    t.mock.method(Date, 'now', () => clock);
+    t.mock.method(console, 'warn', () => {});
+    const command = commandForStore({
+        pvpScoutStore: storeWithQuery(async () => [[]]),
+        pvpScoutingGoldChannelID: 'channel'
+    });
+    t.mock.method(command, 'cachedSuggestions', () => {
+        clock += 300;
+        throw new Error('controlled cache failure');
+    });
+    const interaction = autocompleteInteraction('', 2400);
+    await command.handleAutocomplete(interaction);
+    assert.deepEqual(interaction.responses, []);
+});

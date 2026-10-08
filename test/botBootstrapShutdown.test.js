@@ -21,6 +21,11 @@ test('actual index startup cannot restore stores, register commands, login or st
     const calls = [];
     const processHandlers = new Map();
     const exit = deferred();
+    const fakeProcess = {
+        env: { TOKEN: 'fake-token', CLIENT_ID: 'fake-client' },
+        on() {}, once: (event, handler) => processHandlers.set(event, handler),
+        exit: code => { calls.push('exit ' + code); exit.resolve(); }
+    };
     let client;
     let xpStopped = false;
     class FakeClient extends EventEmitter {
@@ -41,7 +46,13 @@ test('actual index startup cannot restore stores, register commands, login or st
         end: async () => calls.push('feature pool closed') };
     const imports = {
         'dotenv': { config() {} },
-        './config.json': { guildId: 'test-guild' },
+        './config.json': { guildId: 'test-guild', botTimezone: 'Europe/Copenhagen' },
+        './utils/runtimeLogging.js': { installRuntimeLogging() {
+            assert.equal(fakeProcess.env.TZ, 'Europe/Copenhagen');
+            calls.push('logging started');
+            return { stop: () => calls.push('logging stopped') };
+        } },
+        './utils/commandSummary.js': require('../utils/commandSummary.js'),
         './db/db-conn.js': db,
         './utils/abortable.js': abortHelpers,
         './utils/discordDiagnostics.js': require('../utils/discordDiagnostics.js'),
@@ -71,23 +82,25 @@ test('actual index startup cannot restore stores, register commands, login or st
     const root = path.resolve(__dirname, '..');
     vm.runInNewContext(fs.readFileSync(path.join(root, 'index.js'), 'utf8'), {
         __dirname: root, require: name => {
-            if (!(name in imports)) throw new Error(`Unexpected startup import: ${name}`);
+            if (!(name in imports)) throw new Error('Unexpected startup import: ' + name);
+            if (name === './db/db-conn.js') calls.push('database imported');
             return imports[name];
         },
-        process: {
-            env: { TOKEN: 'fake-token', CLIENT_ID: 'fake-client' },
-            on() {}, once: (event, handler) => processHandlers.set(event, handler),
-            exit: code => { calls.push(`exit ${code}`); exit.resolve(); }
-        },
+        process: fakeProcess,
         console: { log() {}, warn() {}, error() {} },
         setTimeout, clearTimeout, setInterval, clearInterval, Map, Set
     });
     await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, ['logging started', 'database imported']);
     await processHandlers.get('SIGINT')();
     await exit.promise;
     databaseReady.resolve(true);
     client.emit(discord.Events.ClientReady);
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(calls, ['disconnect', 'feature pool closed', 'exit 0']);
+    await processHandlers.get('SIGINT')();
+    assert.deepEqual(calls, [
+        'logging started', 'database imported', 'disconnect', 'feature pool closed',
+        'logging stopped', 'exit 0'
+    ]);
     assert.equal(xpStopped, true);
 });

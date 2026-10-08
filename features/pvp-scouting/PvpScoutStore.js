@@ -1104,7 +1104,7 @@ class PvpScoutStore {
         // An empty fresh result is authoritative too. Merging older snapshots
         // would put deleted or renamed opponents back into the suggestions.
         const authoritative = exact && (!latest || refreshedAt(exact) > refreshedAt(latest)) ? exact : latest;
-        const candidates = [...(authoritative?.names || [])];
+        const candidates = authoritative?.names || [];
         if (term && !authoritative) {
             for (const [key, entry] of this.autocompleteCache) {
                 if (key.startsWith(`${channel}:`) && entry !== exact && entry !== latest) candidates.push(...entry.names);

@@ -4,6 +4,7 @@
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createHash } = require('node:crypto');
 const { escapeMarkdown } = require('discord.js');
+const { stripBotLogPrefix } = require('./logFormat.js');
 
 const TRANSIENT_CONNECTION_CODES = /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|EHOSTUNREACH|ENOTFOUND|PROTOCOL_CONNECTION_LOST|ER_CON_COUNT_ERROR)$/u;
 
@@ -92,7 +93,7 @@ class DiscordDiagnosticLogger {
         const key = createHash('sha256').update(`${level}:${reportId || ''}:${category}`).digest('hex');
         const previous = this.recent.get(key), now = this.now();
         if (previous && now - previous.at < repeatMs) { previous.repeats++; return; }
-        const event = { level, message: escapeMarkdown(clean).slice(0, 3500), component: databaseStatus ? 'MySQL'
+        const event = { level, message: escapeMarkdown(stripBotLogPrefix(clean)).slice(0, 3500), component: databaseStatus ? 'MySQL'
                 : autocompleteStatus ? 'PvP scouting' : runtimeWarning ? 'Bot runtime' : context.component
                 || (/MySQL|\[DB LOG\]|Pool is closed/iu.test(clean) ? 'MySQL'
                     : /scout/iu.test(clean) ? 'PvP scouting' : /Discord|interaction/iu.test(clean) ? 'Discord' : 'Bot runtime'),

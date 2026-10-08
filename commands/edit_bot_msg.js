@@ -1,393 +1,337 @@
-// ==================================================================
-// Edit Bot Messages (Slash Commands & Context Menu Commands + Modal
-// ==================================================================
+/**
+ * @fileoverview Expose /edit_bot_msg and Edit Bot Message (Officer) for Leaders, Admins and Officers.
+ * Edit text by message ID or through a private confirmation, with optional embed replacement.
+ */
 
 // - TO-DO: Show ALSO CONTENT of Embeds when Created/Updated, and when Deleted
-// - BUG: When an Embed is removed manually from a message, bot won't add another one!
+
+'use strict';
 
 const {
-    SlashCommandBuilder,
-    ContextMenuCommandBuilder,
-    ApplicationCommandType,
-    ModalBuilder,
-    TextInputBuilder,
-    TextInputStyle,
-    ActionRowBuilder,
-    ButtonBuilder,
-    ButtonStyle,
-    EmbedBuilder,
-    AttachmentBuilder,
-    MessageFlags
+    SlashCommandBuilder, ContextMenuCommandBuilder, ApplicationCommandType,
+    ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
+    ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlags
 } = require('discord.js');
-const path = require('path');
+const { randomBytes } = require('node:crypto');
+const { brandedEditAttachments, visibleEmbedEditOptions, logoFile, LOGO_ATTACHMENT_URL } = require('../features/message-builder/draft.js');
+
+const ZERO_WIDTH_SPACE = '\u200B';
+const CONFIRM_TIMEOUT = 300_000;
+
+function hasAllowedRole(member, allowedRoles) {
+    const roles = member?.roles;
+    if (roles?.cache?.some) return roles.cache.some(role => allowedRoles.includes(role.id));
+    if (Array.isArray(roles)) return roles.some(role => allowedRoles.includes(typeof role === 'string' ? role : role.id));
+    return false;
+}
+
+// Match Python's SequenceMatcher line grouping to preserve the source edit-log text.
+function matchingBlocks(oldLines, newLines) {
+    const positions = new Map();
+    for (let index = 0; index < newLines.length; index++) {
+        const indexes = positions.get(newLines[index]) || [];
+        indexes.push(index);
+        positions.set(newLines[index], indexes);
+    }
+    if (newLines.length >= 200) {
+        const popularityLimit = Math.floor(newLines.length / 100) + 1;
+        for (const [line, indexes] of positions) if (indexes.length > popularityLimit) positions.delete(line);
+    }
+    const queue = [[0, oldLines.length, 0, newLines.length]];
+    const matches = [];
+    while (queue.length) {
+        const [oldStart, oldEnd, newStart, newEnd] = queue.pop();
+        let bestOld = oldStart, bestNew = newStart, bestLength = 0;
+        let previousLengths = new Map();
+        for (let oldIndex = oldStart; oldIndex < oldEnd; oldIndex++) {
+            const lengths = new Map();
+            for (const newIndex of positions.get(oldLines[oldIndex]) || []) {
+                if (newIndex < newStart) continue;
+                if (newIndex >= newEnd) break;
+                const length = (previousLengths.get(newIndex - 1) || 0) + 1;
+                lengths.set(newIndex, length);
+                if (length > bestLength) {
+                    bestOld = oldIndex - length + 1;
+                    bestNew = newIndex - length + 1;
+                    bestLength = length;
+                }
+            }
+            previousLengths = lengths;
+        }
+        while (bestOld > oldStart && bestNew > newStart && oldLines[bestOld - 1] === newLines[bestNew - 1]) {
+            bestOld--; bestNew--; bestLength++;
+        }
+        while (bestOld + bestLength < oldEnd && bestNew + bestLength < newEnd &&
+            oldLines[bestOld + bestLength] === newLines[bestNew + bestLength]) bestLength++;
+        if (!bestLength) continue;
+        matches.push([bestOld, bestNew, bestLength]);
+        if (oldStart < bestOld && newStart < bestNew) queue.push([oldStart, bestOld, newStart, bestNew]);
+        if (bestOld + bestLength < oldEnd && bestNew + bestLength < newEnd) {
+            queue.push([bestOld + bestLength, oldEnd, bestNew + bestLength, newEnd]);
+        }
+    }
+    matches.sort((first, second) => first[0] - second[0] || first[1] - second[1]);
+    const merged = [];
+    for (const block of matches) {
+        const previous = merged.at(-1);
+        if (previous && previous[0] + previous[2] === block[0] && previous[1] + previous[2] === block[1]) previous[2] += block[2];
+        else merged.push(block);
+    }
+    merged.push([oldLines.length, newLines.length, 0]);
+    return merged;
+}
+
+function formatDiffLine(prefix, line) {
+    if (line !== '') return prefix + ' ' + line;
+    if (prefix === '+') return '+ *[ADDED EMPTY LINE]*';
+    if (prefix === '-') return '- *[REMOVED EMPTY LINE]*';
+    return '  ';
+}
+
+function buildDiffLines(oldContent, newContent, compact = false) {
+    const oldLines = (String(oldContent).trimEnd() + '\n').split('\n');
+    const newLines = (String(newContent).trimEnd() + '\n').split('\n');
+    oldLines.pop(); newLines.pop();
+    const lines = [];
+    let oldPosition = 0, newPosition = 0;
+    for (const [oldStart, newStart, length] of matchingBlocks(oldLines, newLines)) {
+        for (const line of oldLines.slice(oldPosition, oldStart)) lines.push(formatDiffLine('-', line));
+        for (const line of newLines.slice(newPosition, newStart)) lines.push(formatDiffLine('+', line));
+        if (length) {
+            if (compact && length > 2) lines.push('  ... (' + length + ' unchanged lines) ...');
+            else for (const line of oldLines.slice(oldStart, oldStart + length)) lines.push(formatDiffLine(' ', line));
+        }
+        oldPosition = oldStart + length;
+        newPosition = newStart + length;
+    }
+    return lines;
+}
+
+function formatMessageDiff(oldContent, newContent) {
+    let result = buildDiffLines(oldContent, newContent).join('\n');
+    if (result.length > 1000) {
+        result = buildDiffLines(oldContent, newContent, true).join('\n').slice(0, 980) + '\n... [Truncated due to length]';
+    }
+    return '```diff\n' + (result || '  No text changes') + '\n```';
+}
 
 class EditBotMsg {
     constructor(config) {
-        this.name = "edit_bot_msg";
-        this.leaderRoleID = config.leaderRoleID;
-        this.adminRoleID = config.adminRoleID;
-        this.officerRoleID = config.officerRoleID;
+        this.name = 'edit_bot_msg';
+        this.allowedRoles = [config.leaderRoleID, config.adminRoleID, config.officerRoleID].filter(Boolean);
         this.logChannelID = config.logChannelID;
-        this.historyThreadID = config.historyThreadID;
-        this.ignoredLogChannels = config.ignoredLogChannels;
-        this.blockedEditBotMsgChannels = config.blockedEditBotMsgChannels;
-        this.onCooldown = config.onCooldown;
+        this.ignoredLogChannels = config.ignoredLogChannels || [];
+        this.blockedEditBotMsgChannels = config.blockedEditBotMsgChannels || [];
+        this.onCooldown = config.onCooldown || (() => false);
         this.data = [
-            // Slash Commands
-            new SlashCommandBuilder()
-                .setName('edit_bot_msg')
-                .setDescription('Edit messages sent by White Walker Bot (Admin only)')
-                .addStringOption(o =>
-                    o.setName('channel_id')
-                        .setDescription('Channel ID where the message is located')
-                        .setRequired(true)
-                )
-                .addStringOption(o =>
-                    o.setName('message_id')
-                        .setDescription('Message ID you want to edit')
-                        .setRequired(true)
-                )
-                .addStringOption(o =>
-                    o.setName('content')
-                        .setDescription('New message content (use \\n for new line)')
-                        .setRequired(true)
-                ),
-
-            // Context Menu Commands
-            new ContextMenuCommandBuilder()
-                .setName('Edit Bot Message (Admin)')
-                .setType(ApplicationCommandType.Message)
+            new SlashCommandBuilder().setName('edit_bot_msg')
+                .setDescription('Edit messages sent by White Walker Bot (Officer only)').setDMPermission(false)
+                .addStringOption(option => option.setName('channel_id')
+                    .setDescription('Channel ID where the message is located').setRequired(true))
+                .addStringOption(option => option.setName('message_id')
+                    .setDescription('Message ID you want to edit').setRequired(true))
+                .addStringOption(option => option.setName('content')
+                    .setDescription('New message content (use \\n for new line)').setRequired(true)),
+            new ContextMenuCommandBuilder().setName('Edit Bot Message (Officer)')
+                .setType(ApplicationCommandType.Message).setDMPermission(false)
         ];
     }
 
-    // Main Execution Router
     async execute(interaction) {
-        if (interaction.isChatInputCommand()) {
-            return this.handleSlash(interaction);
-        }
-
-        if (interaction.isMessageContextMenuCommand()) {
-            return this.handleContext(interaction);
-        }
+        if (interaction.isChatInputCommand()) return this.handleSlash(interaction);
+        if (interaction.isMessageContextMenuCommand()) return this.handleContext(interaction);
     }
 
-    // ---------------------------
-    // SLASH COMMAND (manual edit)
-    // ---------------------------
+    async denyIfUnauthorized(interaction) {
+        if (hasAllowedRole(interaction.member, this.allowedRoles)) return false;
+        await interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
+        return true;
+    }
+
+    async fetchMessage(interaction, channelId, messageId) {
+        const channel = await interaction.client.channels.fetch(channelId);
+        if (!channel?.messages?.fetch) return { channel, message: null };
+        const message = await channel.messages.fetch(messageId);
+        return { channel, message };
+    }
+
     async handleSlash(interaction) {
-        if (this.onCooldown(interaction.user.id, 'edit_msg', 2)) {
-            return interaction.reply('⏳ Slow down!');
-        }
-
-        // Check for role permissions
-        const allowedRoles = [this.adminRoleID];
-        if (!interaction.member.roles.cache.some(r => allowedRoles.includes(r.id))) {
-            return interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
-        }
-
+        if (this.onCooldown(interaction.user.id, 'edit_msg', 2)) return interaction.reply('⏳ Slow down!');
+        if (await this.denyIfUnauthorized(interaction)) return;
         const channelId = interaction.options.getString('channel_id');
         const messageId = interaction.options.getString('message_id');
         const newContent = interaction.options.getString('content').replace(/\\n/g, '\n');
-
-        // Check for blocked channels for editing Bot Messages
-        if (this.blockedEditBotMsgChannels && this.blockedEditBotMsgChannels.includes(channelId)) {
+        if (this.blockedEditBotMsgChannels.includes(channelId)) {
             return interaction.reply({ content: '### ❌  Editing bot messages is not allowed in this channel!', flags: MessageFlags.Ephemeral });
         }
-
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
         try {
-            const channel = await interaction.client.channels.fetch(channelId);
-            const message = await channel.messages.fetch(messageId);
-
-            // Check if message is a bot message
-            if (message.author.id !== interaction.client.user.id) {
-                return interaction.editReply('### ❌  Only bot messages can be edited!');
-            }
-
-            await message.edit(newContent);
-
+            const { channel, message } = await this.fetchMessage(interaction, channelId, messageId);
+            if (!message) return interaction.editReply('### ❌  Failed to edit message.');
+            if (message.author.id !== interaction.client.user.id) return interaction.editReply('### ❌  Only bot messages can be edited!');
+            const oldContent = message.content || '';
+            await message.edit({ content: newContent });
+            await this.logMessageEdit(interaction, channel, message, oldContent, newContent, 'no changes');
             return interaction.editReply('### ✅  Message edited!');
-
-        } catch (err) {
-            console.error(err);
+        } catch {
             return interaction.editReply('### ❌  Failed to edit message.');
         }
     }
 
-    // ------------ Context Menu Commands ---------------
-    // Right Click Bot message → Apps → New Modal Window
-    // --------------------------------------------------
     async handleContext(interaction) {
-        // Check for role permissions
-        const allowedRoles = [this.leaderRoleID, this.adminRoleID, this.officerRoleID];
-        if (!interaction.member.roles.cache.some(r => allowedRoles.includes(r.id))) {
-            return interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
-        }
-
-        // Check if message is a bot message
+        if (await this.denyIfUnauthorized(interaction)) return;
         const message = interaction.targetMessage;
         if (message.author.id !== interaction.client.user.id) {
             return interaction.reply({ content: '### ❌  Only bot messages can be edited!', flags: MessageFlags.Ephemeral });
         }
-
-        // Check for blocked channels for editing Bot Messages
-        if (this.blockedEditBotMsgChannels && this.blockedEditBotMsgChannels.includes(message.channelId)) {
+        if (this.blockedEditBotMsgChannels.includes(message.channelId)) {
             return interaction.reply({ content: '### ❌  Editing bot messages is not allowed in this channel!', flags: MessageFlags.Ephemeral });
         }
-
-        const modal = new ModalBuilder()
-            .setCustomId(`editMsg_${message.id}_${message.channelId}`)
-            .setTitle('Edit Bot Message (Admin)');
-
-        // Content field
-        const contentInput = new TextInputBuilder()
-            .setCustomId('content')
-            .setLabel('Message content')
-            .setStyle(TextInputStyle.Paragraph)
-            .setValue(message.content || '\u200B') // zero-width space for empty content
-            .setRequired(false);
-
-        // Append toggle
-        const appendInput = new TextInputBuilder()
-            .setCustomId('append')
-            .setLabel('Append instead of replace? (Y/N) - (optional)')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('N')
-            .setRequired(false);
-
-        // Embed JSON
-        const embedInput = new TextInputBuilder()
-            .setCustomId('embed')
-            .setLabel('Embed JSON (optional)')
-            .setStyle(TextInputStyle.Paragraph)
-            .setPlaceholder('{"title":"Example","description":"Hello"}')
-            .setRequired(false);
-
+        const modal = new ModalBuilder().setCustomId('editMsg_' + message.id + '_' + message.channelId)
+            .setTitle('Edit Bot Message (Officer)');
+        const contentInput = new TextInputBuilder().setCustomId('content').setLabel('Message content')
+            .setStyle(TextInputStyle.Paragraph).setValue((message.content || ZERO_WIDTH_SPACE).slice(0, 4000)).setRequired(false);
+        const appendInput = new TextInputBuilder().setCustomId('append')
+            .setLabel('Append instead of replace? (Y/N) - (optional)').setStyle(TextInputStyle.Short).setPlaceholder('N').setRequired(false);
+        const embedInput = new TextInputBuilder().setCustomId('embed').setLabel('Embed JSON (optional)')
+            .setStyle(TextInputStyle.Paragraph).setPlaceholder('{"title":"Example","description":"Hello"}').setRequired(false);
         modal.addComponents(
             new ActionRowBuilder().addComponents(contentInput),
             new ActionRowBuilder().addComponents(appendInput),
             new ActionRowBuilder().addComponents(embedInput)
         );
-
         await interaction.showModal(modal);
     }
 
-    // ----------------------------
-    // MODAL SUBMIT → CONFIRM STEP
-    // ----------------------------
     async handleModal(interaction) {
         if (!interaction.customId.startsWith('editMsg_')) return false;
-
+        if (await this.denyIfUnauthorized(interaction)) return true;
         const [, messageId, channelId] = interaction.customId.split('_');
-
-        // --- VALIDATION for Append  ---
-        let appendRaw = interaction.fields.getTextInputValue('append')?.toLowerCase().trim();
-        if (!appendRaw) appendRaw = 'n'; // Default to 'n' if empty
-
+        const appendRaw = (interaction.fields.getTextInputValue('append') || 'n').toLowerCase().trim() || 'n';
         if (appendRaw !== 'y' && appendRaw !== 'n') {
-            return interaction.reply({
-                content: '### ❌  Invalid Append Input!\n- Please enter **Y** for Yes or **N** for No.',
-                flags: MessageFlags.Ephemeral
+            await interaction.reply({
+                content: '### ❌  Invalid Append Input!\n- Please enter **Y** for Yes or **N** for No.', flags: MessageFlags.Ephemeral
             });
+            return true;
         }
-
         const isAppend = appendRaw === 'y';
-        const content = interaction.fields.getTextInputValue('content') || '\u200B';
+        const content = interaction.fields.getTextInputValue('content') || ZERO_WIDTH_SPACE;
         const embedRaw = interaction.fields.getTextInputValue('embed');
-        const confirmId = `confirmEdit_${messageId}_${channelId}_${isAppend}`;
-
-        // Save edit temporarily
-        interaction.client.editCache ??= new Map();
-        interaction.client.editCache.set(confirmId, {
-            content,
-            embedRaw
+        const confirmId = 'confirmEdit_' + messageId + '_' + channelId + '_' + isAppend + '_' + randomBytes(8).toString('hex');
+        this.editCache(interaction.client).set(confirmId, {
+            content, embedRaw, ownerId: interaction.user.id, expiresAt: Date.now() + CONFIRM_TIMEOUT
         });
-
         const buttons = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(confirmId)
-                .setLabel('✅ Confirm Edit')
-                .setStyle(ButtonStyle.Success),
-
-            new ButtonBuilder()
-                .setCustomId('cancelEdit')
-                .setLabel('❌ Cancel')
-                .setStyle(ButtonStyle.Danger)
+            new ButtonBuilder().setCustomId(confirmId).setLabel('✅ Confirm Edit').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId('cancelEdit_' + confirmId).setLabel('❌ Cancel').setStyle(ButtonStyle.Danger)
         );
-
-        let previewLabel = isAppend ? 'APPEND to existing message:' : 'your edit below!\n## 👁️‍🗨️ New Message:\n';
-
+        const previewLabel = isAppend ? 'APPEND to existing message:' : 'your edit below!\n## 👁️‍🗨️ New Message:\n';
         await interaction.reply({
-            content: `### ⚠️  <@${interaction.user.id}>, please confirm ${previewLabel}\n\n${content}\n\n${embedRaw ? '- 📦 *Contains Embed JSON*' : ''}`,
-            components: [buttons],
-            flags: MessageFlags.Ephemeral
+            content: '### ⚠️  <@' + interaction.user.id + '>, please confirm ' + previewLabel + '\n\n' +
+                content + '\n\n' + (embedRaw ? '- 📦 *Contains Embed JSON*' : ''),
+            components: [buttons], flags: MessageFlags.Ephemeral
         });
-
         return true;
     }
 
-    // =====================================================
-    // BUTTON HANDLER (CONFIRM / CANCEL)
-    // =====================================================
+    editCache(client) {
+        client.editCache ??= new Map();
+        for (const [key, value] of client.editCache) if (value.expiresAt <= Date.now()) client.editCache.delete(key);
+        return client.editCache;
+    }
+
     async handleButton(interaction) {
-        if (interaction.customId === 'cancelEdit') {
+        const isCancel = interaction.customId === 'cancelEdit' || interaction.customId.startsWith('cancelEdit_');
+        if (!isCancel && !interaction.customId.startsWith('confirmEdit_')) return false;
+        if (await this.denyIfUnauthorized(interaction)) return true;
+        const cacheMap = this.editCache(interaction.client);
+        const confirmId = isCancel ? interaction.customId.slice('cancelEdit_'.length) : interaction.customId;
+        const cache = cacheMap.get(confirmId);
+        if (cache?.ownerId && cache.ownerId !== interaction.user.id) {
+            await interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
+            return true;
+        }
+        cacheMap.delete(confirmId);
+        if (isCancel) {
             await interaction.update({ content: '### ❌  Edit cancelled.', components: [] });
             return true;
         }
-
-        if (!interaction.customId.startsWith('confirmEdit_')) return false;
-
-        const cache = interaction.client.editCache.get(interaction.customId);
-        if (!cache) return true;
-        interaction.client.editCache.delete(interaction.customId); // Delete the cache immediately so rapid consecutive clicks are ignored
-
         await interaction.deferUpdate();
-
-        const [, messageId, channelId, isAppendStr] = interaction.customId.split('_');
-        const isAppend = isAppendStr === 'true';
-
+        if (!cache) return true;
+        const [, messageId, channelId, appendValue] = confirmId.split('_');
+        if (this.blockedEditBotMsgChannels.includes(channelId)) {
+            await interaction.editReply({ content: '### ❌  Editing bot messages is not allowed in this channel!', components: [] });
+            return true;
+        }
         try {
-            const channel = await interaction.client.channels.fetch(channelId);
-            const message = await channel.messages.fetch(messageId);
-            const oldContent = message.content || '';
-            const oldEmbedsCount = message.embeds.length;
-            let finalContent = cache.content;
-
-            if (isAppend) {
-                // If appending, combine them. If content is just the default placeholder, append nothing.
-                const addition = (finalContent === '\u200B') ? '' : finalContent;
-                finalContent = oldContent.trimEnd() + '\n' + addition;
-            } else {
-                // Safety: If overwriting with an empty/default field, keep the old content
-                if (!finalContent || finalContent === '\u200B') finalContent = oldContent;
+            const { channel, message } = await this.fetchMessage(interaction, channelId, messageId);
+            if (!message) {
+                await interaction.editReply({ content: '### ❌  Failed to edit bot message!', components: [] });
+                return true;
             }
-
-            // Prepare embeds
-            let finalEmbeds = null;
+            if (message.author.id !== interaction.client.user.id) {
+                await interaction.editReply({ content: '### ❌  Only bot messages can be edited!', components: [] });
+                return true;
+            }
+            const oldContent = message.content || '';
+            let finalContent = cache.content;
+            if (appendValue === 'true') {
+                const addition = finalContent === ZERO_WIDTH_SPACE ? '' : finalContent;
+                finalContent = oldContent.trimEnd() + '\n' + addition;
+            } else if (!finalContent || finalContent === ZERO_WIDTH_SPACE) finalContent = oldContent;
+            const editPayload = { content: finalContent || message.content };
             let embedStatus = 'no changes';
-            const trimmedEmbed = cache.embedRaw ? cache.embedRaw.trim() : '';
-            if (trimmedEmbed.length > 0) {
+            const trimmedEmbed = cache.embedRaw?.trim() || '';
+            if (trimmedEmbed) {
+                let replacementEmbed;
                 try {
                     const parsed = JSON.parse(trimmedEmbed);
-                    finalEmbeds = [parsed];
-                    if (oldEmbedsCount === 0) embedStatus = '✅ **Added**';
-                    else embedStatus = '✏️ **Modified**';
+                    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('Expected embed object');
+                    replacementEmbed = new EmbedBuilder(parsed);
                 } catch {
-                    return interaction.editReply({ content: '❌ Invalid embed JSON.', components: [] });
+                    await interaction.editReply({ content: '❌ Invalid embed JSON.', components: [] });
+                    return true;
                 }
+                editPayload.embeds = [replacementEmbed];
+                Object.assign(editPayload, brandedEditAttachments(message, replacementEmbed), visibleEmbedEditOptions(message));
+                embedStatus = message.embeds.length ? '✏️ **Modified**' : '✅ **Added**';
             }
-
-            const editPayload = {
-                content: finalContent || message.content
-            };
-
-            if (finalEmbeds) editPayload.embeds = finalEmbeds;
             await message.edit(editPayload);
-
-            // Ignore log events for specified channels (this.ignoredLogChannels)
-            if (this.logChannelID && !this.ignoredLogChannels.includes(channel.id)) {
-                const logChannel = await interaction.client.channels.fetch(this.logChannelID);
-                const Diff = require('diff');
-
-                // --- NORMALIZATION ---
-                const cleanOld = oldContent.split('\n').map(l => l.trimEnd()).join('\n').trimEnd() + '\n';
-                const cleanNew = finalContent.split('\n').map(l => l.trimEnd()).join('\n').trimEnd() + '\n';
-                const diffParts = Diff.diffLines(cleanOld, cleanNew);
-                let diffLinesArray = [];
-
-                // Helper to format lines based on whether they changed
-                const formatLine = (line, part) => {
-                    if (line !== '') return `${part.added ? '+ ' : part.removed ? '- ' : '  '}${line}`;
-                    if (part.added) return `+ *[ADDED EMPTY LINE]*`;
-                    if (part.removed) return `- *[REMOVED EMPTY LINE]*`;
-                    return `  `; // Unchanged empty line
-                };
-
-                // First pass: Try to show everything
-                diffParts.forEach((part, i) => {
-                    const lines = part.value.split('\n');
-                    if (lines[lines.length - 1] === '') lines.pop();
-
-                    // If this is a removed empty line AND the next part is an addition, skip the removed label
-                    const isRemovedEmpty = part.removed && lines.length === 1 && lines[0] === '';
-                    const nextIsAddition = diffParts[i + 1] && diffParts[i + 1].added;
-
-                    if (isRemovedEmpty && nextIsAddition) return;
-
-                    lines.forEach(line => {
-                        diffLinesArray.push(formatLine(line, part));
-                    });
-                });
-
-                let diffResult = diffLinesArray.join('\n');
-
-                // Second pass: Truncate only if it exceeds Discord's limits (1024)
-                if (diffResult.length > 1000) {
-                    let tempArray = [];
-                    diffParts.forEach((part, i) => {
-                        const lines = part.value.split('\n');
-                        if (lines[lines.length - 1] === '') lines.pop();
-
-                        const isRemovedEmpty = part.removed && lines.length === 1 && lines[0] === '';
-                        const nextIsAddition = diffParts[i + 1] && diffParts[i + 1].added;
-                        if (isRemovedEmpty && nextIsAddition) return;
-
-                        if (part.added || part.removed) {
-                            lines.forEach(line => tempArray.push(formatLine(line, part)));
-                        } else {
-                            if (lines.length > 2) {
-                                tempArray.push(`  ... (${lines.length} unchanged lines) ...`);
-                            } else {
-                                lines.forEach(line => tempArray.push(formatLine(line, part)));
-                            }
-                        }
-                    });
-                    diffResult = tempArray.join('\n').slice(0, 980) + '\n... [Truncated due to length]';
-                }
-
-                let diffStr = `\`\`\`diff\n${diffResult || '  No text changes'}\n\`\`\``;
-
-                const logFields = [
-                    { name: 'Channel:', value: `<#${channelId}>`, inline: true },
-                    { name: 'Message ID:', value: `\`${messageId}\``, inline: true }
-                ];
-
-                if (embedStatus !== 'no changes') {
-                    logFields.push({ name: 'Embed Status:', value: embedStatus, inline: true });
-                }
-
-                logFields.push(
-                    { name: 'Message Link:', value: `[Jump to Message](${message.url})`, inline: false },
-                    { name: 'Difference:', value: diffStr }
-                );
-
-                const imagePath = path.join(__dirname, '../images/ww.png');
-                const footerLogo = new AttachmentBuilder(imagePath, { name: 'footer_logo.png' });
-
-                const embed = new EmbedBuilder()
-                    .setColor(0x00FFFF)
-                    .setTitle('🤖  Bot Message Edited  ✏️')
-                    .setDescription(`Edited by <@${interaction.user.id}> (${interaction.user.username})`)
-                    .addFields(logFields)
-                    .setFooter({ text: 'White Walker Logs', iconURL: 'attachment://footer_logo.png' })
-                    .setTimestamp();
-
-                await logChannel.send({ embeds: [embed], files: [footerLogo] });
-            }
-
-            await interaction.editReply({
-                content: '### ✅  Bot message successfully updated!',
-                components: []
-            });
-
-        } catch (err) {
-            console.error(err);
+            await this.logMessageEdit(interaction, channel, message, oldContent, finalContent, embedStatus);
+            await interaction.editReply({ content: '### ✅  Bot message successfully updated!', components: [] });
+        } catch {
             await interaction.editReply({ content: '### ❌  Failed to edit bot message!', components: [] });
         }
-
         return true;
+    }
+
+    async logMessageEdit(interaction, channel, message, oldContent, finalContent, embedStatus) {
+        if (!this.logChannelID || this.ignoredLogChannels.includes(channel.id)) return;
+        try {
+            const logChannel = await interaction.client.channels.fetch(this.logChannelID);
+            if (!logChannel?.send) return;
+            const embed = new EmbedBuilder().setColor(0x00FFFF).setTitle('🤖  Bot Message Edited  ✏️')
+                .setDescription('Edited by <@' + interaction.user.id + '> (' + interaction.user.username + ')')
+                .addFields(
+                    { name: 'Channel:', value: '<#' + channel.id + '>', inline: true },
+                    { name: 'Message ID:', value: '`' + message.id + '`', inline: true }
+                );
+            if (embedStatus !== 'no changes') embed.addFields({ name: 'Embed Status:', value: embedStatus, inline: true });
+            embed.addFields(
+                { name: 'Message Link:', value: '[Jump to Message](' + message.url + ')', inline: false },
+                { name: 'Difference:', value: formatMessageDiff(oldContent, finalContent), inline: false }
+            ).setTimestamp();
+            const logo = logoFile();
+            const footer = { text: 'White Walker Logs' };
+            if (logo) footer.iconURL = LOGO_ATTACHMENT_URL;
+            embed.setFooter(footer);
+            await logChannel.send({ embeds: [embed], ...(logo ? { files: [logo] } : {}) });
+        } catch {
+            // A failed audit delivery must not report an already-applied edit as a failed edit.
+        }
     }
 }
 
 module.exports = EditBotMsg;
+module.exports.formatMessageDiff = formatMessageDiff;
+module.exports.hasAllowedRole = hasAllowedRole;

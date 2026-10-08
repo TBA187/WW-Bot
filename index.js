@@ -1,6 +1,8 @@
 require('dotenv').config({ quiet: true });
 const appConfig = require('./config.json');
 process.env.TZ = appConfig.botTimezone || 'Etc/UTC';
+const runtimeLogging = require('./utils/runtimeLogging.js').installRuntimeLogging();
+const { buildCommandSummary } = require('./utils/commandSummary.js');
 const db = require('./db/db-conn.js');
 const { StartupLifecycle, abortable } = require('./utils/abortable.js');
 const lifecycle = new StartupLifecycle();
@@ -439,6 +441,7 @@ async function bootstrap() {
 
         // Load commands
         const commandsForDiscord = []; // JSON for the REST API
+        const prefixCommands = []; // Invocation metadata from loaded event modules
         const commandsPath = path.join(__dirname, "commands");
         const items = fs.readdirSync(commandsPath, { withFileTypes: true }); // Check if item is a folder or a file
 
@@ -460,34 +463,22 @@ async function bootstrap() {
             for (const file of commandFiles) {
                 const CommandClass = require(`${basePath}${file}`);
                 const command = new CommandClass(commandConfig);
-                commandMap.set(command.name, command);
+                if (typeof command.name === 'string' && command.name.trim()) {
+                    commandMap.set(command.name, command);
+                }
 
                 const commandData = Array.isArray(command.data) ? command.data : [command.data];
                 for (const cmd of commandData) {
-                    commandsForDiscord.push(cmd.toJSON());
-                    if (cmd.name) commandMap.set(cmd.name, command);
+                    const definition = cmd.toJSON();
+                    commandsForDiscord.push(definition);
+                    if (definition.name) commandMap.set(definition.name, command);
                 }
             }
         }
-        console.log(`[WW LOG] Loaded ${commandMap.size} commands:`);
-        console.log(' - ' + [...commandMap.keys()].join(", "));
 
         // Register commands dynamically
-        const rest = new REST({ version: '10' }).setToken(token);
-        try {
-            console.log('[WW LOG] Registering Guild slash commands...');
-            await lifecycle.run(() => rest.put(
-                Routes.applicationGuildCommands(clientId, guildId),
-                { body: commandsForDiscord }
-            ));
-            console.log('[WW LOG] ✅ Guild slash commands registered to Discord');
-        } catch (err) {
-            lifecycle.check();
-            console.error('[WW LOG] ❌ ERROR: Command registration failed:', err);
-            throw err;
-        }
-
-        // Load events dynamically
+        // Load event modules once to include their prefix metadata in the command inventory.
+        const eventModules = [];
         const eventsPath = path.join(__dirname, 'events');
         const eventItems = fs.readdirSync(eventsPath, { withFileTypes: true });
 
@@ -508,82 +499,107 @@ async function bootstrap() {
             for (const file of eventFiles) {
                 const event = require(`${basePath}${file}`);
 
-                if (file === 'memberExit.js') {
-                    client.on('guildMemberRemove', member => event.handleMemberRemove(member, logChannelID));
-                    client.on('guildBanAdd', ban => event.handleGuildBanAdd(ban, logChannelID));
-                    client.on('guildBanRemove', ban => event.handleGuildBanRemove(ban, logChannelID));
-                    client.on('guildMemberUpdate', (oldM, newM) => event.handleGuildMemberUpdate(oldM, newM, logChannelID));
-                    continue;
+                eventModules.push({ file, basePath, event });
+                if (typeof event.register === 'function'
+                    || (event.name && typeof event.execute === 'function')) {
+                    prefixCommands.push(...(event.prefixCommands || []));
                 }
+            }
+        }
 
-                if (file === 'channelLogs.js') {
-                    client.on('channelCreate', channel => event.handleChannelCreate(channel, commandConfig));
-                    client.on('channelDelete', channel => event.handleChannelDelete(channel, commandConfig));
-                    client.on('channelUpdate', (oldC, newC) => event.handleChannelUpdate(oldC, newC, commandConfig));
-                    continue;
-                }
+        const rest = new REST({ version: '10' }).setToken(token);
+        try {
+            console.log('[WW LOG] Registering Guild slash commands...');
+            await lifecycle.run(() => rest.put(
+                Routes.applicationGuildCommands(clientId, guildId),
+                { body: commandsForDiscord }
+            ));
+            console.log('[WW LOG] ✅ Guild slash commands registered to Discord');
+        } catch (err) {
+            lifecycle.check();
+            console.error('[WW LOG] ❌ ERROR: Command registration failed:', err);
+            throw err;
+        }
 
-                if (file === 'integrationLogs.js') {
-                    client.on('webhooksUpdate', channel => event.handleWebhookUpdate(channel, commandConfig));
-                    continue;
-                }
+        runtimeLogging.logBlock(buildCommandSummary(commandsForDiscord, prefixCommands).lines);
 
-                if (file === 'threadLogs.js') {
-                    client.on('threadCreate', thread => event.handleThreadCreate(thread, commandConfig));
-                    client.on('threadDelete', thread => event.handleThreadDelete(thread, commandConfig));
-                    client.on('threadUpdate', (oldT, newT) => event.handleThreadUpdate(oldT, newT, commandConfig));
-                    continue;
-                }
+        // Load events dynamically
+        for (const { file, basePath, event } of eventModules) {
+            if (file === 'memberExit.js') {
+                client.on('guildMemberRemove', member => event.handleMemberRemove(member, logChannelID));
+                client.on('guildBanAdd', ban => event.handleGuildBanAdd(ban, logChannelID));
+                client.on('guildBanRemove', ban => event.handleGuildBanRemove(ban, logChannelID));
+                client.on('guildMemberUpdate', (oldM, newM) => event.handleGuildMemberUpdate(oldM, newM, logChannelID));
+                continue;
+            }
 
-                if (file === 'userUpdatesLogger.js') {
-                    client.on('userUpdate', (oldU, newU) => event.handleUserUpdate(oldU, newU, commandConfig));
-                    client.on('guildMemberUpdate', (oldM, newM) => event.handleGuildMemberUpdate(oldM, newM, commandConfig));
-                    continue;
-                }
+            if (file === 'channelLogs.js') {
+                client.on('channelCreate', channel => event.handleChannelCreate(channel, commandConfig));
+                client.on('channelDelete', channel => event.handleChannelDelete(channel, commandConfig));
+                client.on('channelUpdate', (oldC, newC) => event.handleChannelUpdate(oldC, newC, commandConfig));
+                continue;
+            }
 
-                // Grouped event modules can register several related Discord events from one file.
-                if (typeof event.register === 'function') {
-                    event.register(client, commandConfig);
-                    console.log(`[WW LOG] Registered Event Group: ${basePath}${file}`);
-                    continue;
-                }
+            if (file === 'integrationLogs.js') {
+                client.on('webhooksUpdate', channel => event.handleWebhookUpdate(channel, commandConfig));
+                continue;
+            }
 
-                // Standard Event Handling
-                if (event.name && typeof event.execute === 'function') {
-                    // MASTER SETTINGS LOGIC - Skip listening for events if disabled globally
-                    const isXPFile = file.toLowerCase().startsWith('xp'); // Checks if filename starts with 'xp'
-                    // Add check for logging_enabled, etc.
+            if (file === 'threadLogs.js') {
+                client.on('threadCreate', thread => event.handleThreadCreate(thread, commandConfig));
+                client.on('threadDelete', thread => event.handleThreadDelete(thread, commandConfig));
+                client.on('threadUpdate', (oldT, newT) => event.handleThreadUpdate(oldT, newT, commandConfig));
+                continue;
+            }
 
-                    const executeEvent = (...args) => {
-                        if (lifecycle.stopping) return;
-                        if (isXPFile) {
-                            const eventData = args[0];
-                            // const gId = eventData?.guild?.id || eventData?.guildId;
-                            // Correctly extract Guild ID regardless of event type
-                            const gId = eventData?.guild?.id ||     // For Message
-                                eventData?.message?.guild?.id ||    // For Reaction
-                                eventData?.guildId;                 // For VoiceState/Interaction
+            if (file === 'userUpdatesLogger.js') {
+                client.on('userUpdate', (oldU, newU) => event.handleUserUpdate(oldU, newU, commandConfig));
+                client.on('guildMemberUpdate', (oldM, newM) => event.handleGuildMemberUpdate(oldM, newM, commandConfig));
+                continue;
+            }
 
-                            // Prevent errors/db clutter if the event happens in a DM
-                            if (!gId) return;
+            // Grouped event modules can register several related Discord events from one file.
+            if (typeof event.register === 'function') {
+                event.register(client, commandConfig);
+                console.log(`[WW LOG] Registered Event Group: ${basePath}${file}`);
+                continue;
+            }
 
-                            // Default to FALSE if not found in cache
-                            const settings = guildSettingsCache.get(String(gId)) || { xpEnabled: false };
+            // Standard Event Handling
+            if (event.name && typeof event.execute === 'function') {
+                // MASTER SETTINGS LOGIC - Skip listening for events if disabled globally
+                const isXPFile = file.toLowerCase().startsWith('xp'); // Checks if filename starts with 'xp'
+                // Add check for logging_enabled, etc.
 
-                            // Exit immediately if XP is disabled for this guild
-                            if (!settings.xpEnabled) return;
-                        }
+                const executeEvent = (...args) => {
+                    if (lifecycle.stopping) return;
+                    if (isXPFile) {
+                        const eventData = args[0];
+                        // const gId = eventData?.guild?.id || eventData?.guildId;
+                        // Correctly extract Guild ID regardless of event type
+                        const gId = eventData?.guild?.id ||     // For Message
+                            eventData?.message?.guild?.id ||    // For Reaction
+                            eventData?.guildId;                 // For VoiceState/Interaction
 
-                        event.execute(...args, commandConfig);
-                    };
+                        // Prevent errors/db clutter if the event happens in a DM
+                        if (!gId) return;
 
-                    if (event.once) {
-                        client.once(event.name, executeEvent);
-                    } else {
-                        client.on(event.name, executeEvent);
+                        // Default to FALSE if not found in cache
+                        const settings = guildSettingsCache.get(String(gId)) || { xpEnabled: false };
+
+                        // Exit immediately if XP is disabled for this guild
+                        if (!settings.xpEnabled) return;
                     }
-                    console.log(`[WW LOG] Registered Event: ${event.name} (${basePath}${file})`);
+
+                    event.execute(...args, commandConfig);
+                };
+
+                if (event.once) {
+                    client.once(event.name, executeEvent);
+                } else {
+                    client.on(event.name, executeEvent);
                 }
+                console.log(`[WW LOG] Registered Event: ${event.name} (${basePath}${file})`);
             }
         }
 
@@ -626,6 +642,7 @@ async function shutdown(signal, exitCode = 0) {
     await abortable(db.end(), {
         timeoutMs: 2000, timeoutCode: 'SHUTDOWN_POOL_TIMEOUT'
     }).catch(() => {});
+    runtimeLogging.stop();
     process.exit(exitCode);
 }
 
@@ -738,6 +755,10 @@ client.on('interactionCreate', async interaction => {
             if (manager && await manager.handleInteraction(interaction)) return true;
         }
         if (interaction.isButton()) {
+            if (interaction.customId?.startsWith('send_message:')) {
+                const builder = commandMap.get('send_message');
+                if (builder && await builder.handleButton(interaction)) return true;
+            }
             if (interaction.customId?.startsWith('scout-stats:page:')) {
                 const stats = commandMap.get('scout-stats');
                 if (stats && await stats.handleButton(interaction)) return true;
@@ -774,7 +795,11 @@ client.on('interactionCreate', async interaction => {
         }
 
         // Select Menu Handling
-        if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) {
+        if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu() || interaction.isChannelSelectMenu()) {
+            if (interaction.customId?.startsWith('send_message:')) {
+                const builder = commandMap.get('send_message');
+                if (builder && await builder.handleSelect(interaction)) return true;
+            }
             if (interaction.customId?.startsWith('scout-settings:')) {
                 const settings = commandMap.get('scout-settings');
                 if (settings && await settings.handleSelect(interaction)) return true;
@@ -789,6 +814,10 @@ client.on('interactionCreate', async interaction => {
 
         // Modal Handling
         if (interaction.isModalSubmit()) {
+            if (interaction.customId?.startsWith('send_message:')) {
+                const builder = commandMap.get('send_message');
+                if (builder && await builder.handleModal(interaction)) return true;
+            }
             if (interaction.customId?.startsWith('pvp-scout:')) {
                 const scout = commandMap.get('scout');
                 if (scout && await scout.handleModal(interaction)) return true;

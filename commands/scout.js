@@ -1416,15 +1416,19 @@ class Scout {
             const contexts = (this.registry?.contexts() || [{ server: this.server, channelId: this.channelId, store: this.store }])
                 .filter(context => mode === 'cross' || context.server === mode);
             const term = interaction.options.getFocused();
-            const choices = this.cachedSuggestions(mode, term);
-            // Start the acknowledgement before scheduling any database work.
-            // Discord cannot revive an interaction that arrived after its deadline.
-            if (receivedAge >= AUTOCOMPLETE_REPLY_BY_MS) {
-                this.logAutocompleteDelay(`arrived too late to answer (${receivedAge}ms old)`);
+            const choices = this.cachedSuggestions(mode, term)
+                .map(choice => ({ name: suggestionLabel(choice), value: choice.name.slice(0, 32) }));
+            // Recheck after preparing suggestions, preserving time for the REST
+            // response rather than using the age captured on arrival a second time.
+            const replyAge = Math.max(0, Date.now() - (interaction.createdTimestamp || Date.now()));
+            if (replyAge >= AUTOCOMPLETE_REPLY_BY_MS) {
+                this.logAutocompleteDelay(`ran out of time preparing suggestions (${receivedAge}ms old on arrival, ${replyAge}ms old before reply)`);
                 return;
             }
             responseAttempted = true;
-            const reply = interaction.respond(choices.map(choice => ({ name: suggestionLabel(choice), value: choice.name.slice(0, 32) })));
+            await interaction.respond(choices);
+            // Finish the acknowledgement before starting queries or cache-file
+            // writes, so background work cannot delay the pending reply.
             setImmediate(() => {
                 if (selected === undefined && this.serverSettings) {
                     void this.serverSettings.getSelectedServer(this.guildId, interaction.user.id)
@@ -1436,14 +1440,15 @@ class Scout {
                     return Promise.all(refresh);
                 }).catch(error => console.warn(`[WW LOG] /scout autocomplete cache refresh failed: ${error.message}`));
             });
-            await reply;
         } catch (error) {
             if ([10062, 40060].includes(Number(error.code))) {
                 this.logAutocompleteDelay(`reply rejected (${error.code}; ${receivedAge}ms old on arrival, ${Date.now() - interaction.createdTimestamp}ms old after the API request)`);
                 return;
             }
             console.warn(`[WW LOG] /scout autocomplete failed: ${error.message}`);
-            if (!responseAttempted) await interaction.respond([]).catch(() => { });
+            if (!responseAttempted && Date.now() - (interaction.createdTimestamp || Date.now()) < AUTOCOMPLETE_REPLY_BY_MS) {
+                await interaction.respond([]).catch(() => { });
+            }
         }
     }
 

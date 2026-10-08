@@ -170,3 +170,16 @@ test('stopping restores console methods and does not modify unrelated logging ho
     assert.equal(consoleObject.warn, otherWrapper);
     consoleObject.error('Still logged'); assert.deepEqual(printed, ['Still logged']);
 });
+
+test('Discord diagnostic messages omit the redundant WW tag without changing component context', () => {
+    const f = fixture(); f.logger.start();
+    f.logger.run({ component: 'Scout ingestion' }, () => {
+        f.consoleObject.error('[WW LOG] Could not save report.');
+    });
+    assert.equal(f.sent[0].message, 'Could not save report.');
+    assert.equal(f.sent[0].component, 'Scout ingestion');
+    f.consoleObject.error('[DB LOG] MySQL query failed.');
+    assert.match(f.sent[1].message, /^\[DB LOG\] MySQL query failed/u);
+    assert.equal(f.sent[1].component, 'MySQL');
+    f.logger.stop();
+});
