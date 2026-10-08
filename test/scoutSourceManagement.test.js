@@ -485,16 +485,14 @@ test('startup goes directly to checkpoint catch-up for saved and missing cursors
         f.store.ensureSchema = async () => {};
         f.store.autocomplete = async () => [];
         f.store.refreshAutomaticRecords = async () => 0;
-        let restored = 0, inspected = 0;
+        let restored = 0;
         f.ingestor.feedback = { async restorePending() { restored++; }, async stop() {} };
-        f.ingestor.reinspectLegacyResultCards = async () => { inspected++; };
         await f.ingestor.start();
-        await Promise.all([f.ingestor.catchupPromise, f.ingestor.reinspectionPromise]);
+        await f.ingestor.catchupPromise;
         assert.equal(f.ingestor.catchupReady, true);
         assert.equal(f.state.created.length, 105);
         assert.equal(f.state.cursor, f.id(105));
         assert.equal(restored, 1);
-        assert.equal(inspected, 1);
         await f.ingestor.stop();
         assert.equal(f.ingestor.started, false);
     }

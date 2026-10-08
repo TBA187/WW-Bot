@@ -2,6 +2,8 @@
 'use strict';
 
 const path = require('node:path');
+const { diffLines } = require('diff');
+const { reviewSuggestions } = require('./ScoutFeedbackText.js');
 const { AttachmentBuilder, EmbedBuilder, escapeMarkdown } = require('discord.js');
 
 const ACTIONS = {
@@ -77,6 +79,53 @@ function publishedPayload(event, logoPath = path.join(__dirname, '../../images/w
         allowedMentions: { parse: [] }, nonce: `sp:${event.messageId}`, enforceNonce: true };
 }
 
+function scoutTextDiff(before = '', after = '') {
+    return diffLines(String(before), String(after)).filter(part => part.added || part.removed)
+        .map(part => part.value.replace(/\n$/u, '').split('\n')
+            .map(line => `${part.removed ? '-' : '+'} ${line}`).join('\n')).join('\n');
+}
+
+function memberEditPayload(event, logoPath = path.join(__dirname, '../../images/ww_logo.png')) {
+    const before = event.before || {}, after = event.after || {};
+    const ignored = ['ignored', 'not_scout'].includes(after.classification) || after.reviewStatus === 'not_scout';
+    const failed = Boolean(event.failed) || after.reviewStatus === 'pending';
+    const status = failed ? '❌ Failed validation' : ignored ? 'Not a scout report'
+        : event.awaitingApproval ? '⏳ Parsed successfully • awaiting officer approval' : '✅ Successfully validated';
+    const color = failed ? 0xED4245 : ignored ? 0x95A5A6 : event.awaitingApproval ? 0xFEE75C : 0x57F287;
+    const diff = scoutTextDiff(before.content, after.content);
+    const preview = (diff || '(Message text unchanged; see attachment changes below.)').replace(/`/gu, 'ˋ');
+    const attachmentNames = value => (value.attachments || []).map(a => `${a.id}: ${a.name || 'image'}`);
+    const attachmentsChanged = JSON.stringify(attachmentNames(before)) !== JSON.stringify(attachmentNames(after));
+    const confidence = value => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : 'Unavailable';
+    const embed = new EmbedBuilder().setTitle('Scout Message Edited').setColor(color)
+        .setDescription(`**Reporter:** ${display(event.authorUsername || after.authorUsername || 'Unknown', 128)}`
+            + (event.authorId ? ` (\`${event.authorId}\`)` : '')
+            + `\n**Server:** ${event.server === 'silver' ? 'Silver' : 'Gold'}\n**Status:** ${status}`
+            + `\n**Scout Report ID:** \`${event.reportId}\`\n**Scout Message ID:** \`${event.messageId}\``
+            + (event.sourceUrl ? `\n[Jump to scout message ↗️](${event.sourceUrl})` : ''))
+        .addFields({ name: 'Message changes', value: `\`\`\`diff\n${preview.slice(0, 940)}\n\`\`\``
+                + (preview.length > 940 ? '\nFull diff attached.' : ''), inline: false },
+            { name: 'Opponent IGN', value: `${display(before.ign, 64)} → ${display(after.ign, 64)}`, inline: true },
+            { name: 'IGN confidence', value: `${confidence(before.ignConfidence)} → ${confidence(after.ignConfidence)}`, inline: true },
+            { name: 'IGN detection source', value: `${display(before.ignSource, 100)} → ${display(after.ignSource, 100)}`, inline: false })
+        .setFooter({ text: `WW • Scout Report ID: ${event.reportId}`, iconURL: 'attachment://ww_logo.png' })
+        .setTimestamp(event.timestamp ? new Date(event.timestamp) : new Date());
+    embed.addFields({ name: 'Validation reason', value: display(after.reviewReason || (failed
+        ? 'The opponent or team could not be verified confidently.'
+        : ignored ? 'This message is not recognized as a scout report.' : 'Validation passed.'), 850), inline: false });
+    const suggestions = failed || event.awaitingApproval ? reviewSuggestions({ reason: after.reviewReason,
+        edit: event.awaitingApproval ? { after } : null }) : [];
+    embed.addFields({ name: 'Bot suggestions', value: suggestions.length
+        ? suggestions.map(suggestion => `- ${suggestion}`).join('\n').slice(0, 1024)
+        : ignored ? 'Submit an opponent IGN and Pokémon team details or a screenshot.' : 'No corrections needed.', inline: false });
+    if (before.rating !== after.rating) embed.addFields({ name: 'PvP rating', value: `${display(before.rating)} → ${display(after.rating)}`, inline: true });
+    if (attachmentsChanged) embed.addFields({ name: 'Attachments', value: `Before: ${display(attachmentNames(before), 350)}\nAfter: ${display(attachmentNames(after), 350)}`, inline: false });
+    const files = [new AttachmentBuilder(logoPath, { name: 'ww_logo.png' }),
+        new AttachmentBuilder(Buffer.from(JSON.stringify(event, null, 2)), { name: `scout-edit-${event.messageId}.json` })];
+    if (diff.length > 940) files.push(new AttachmentBuilder(Buffer.from(diff), { name: `scout-edit-${event.messageId}.diff.txt` }));
+    return { embeds: [embed], files, allowedMentions: { parse: [] } };
+}
+
 function diagnosticPayload(event, ownerId, logoPath = path.join(__dirname, '../../images/ww_logo.png')) {
     const warning = event.level === 'warn';
     const reportId = String(event.reportId || '').trim();
@@ -109,6 +158,12 @@ class ScoutAuditLogger {
         this.queuePayload(() => publishedPayload(saved, this.logoPath), `scout publication log for ${saved.messageId}`);
     }
 
+    memberEdited(event) {
+        if (!this.channelId) return;
+        const saved = structuredClone({ ...event, timestamp: new Date().toISOString() });
+        this.queuePayload(() => memberEditPayload(saved, this.logoPath), `scout member edit log for ${saved.messageId}`);
+    }
+
     diagnostic(event) {
         if (!this.channelId) return;
         const saved = structuredClone(event);
@@ -137,4 +192,4 @@ class ScoutAuditLogger {
     flush() { return this.pending; }
 }
 
-module.exports = { ScoutAuditLogger, auditPayload, changesBetween, diagnosticPayload, publishedPayload };
+module.exports = { ScoutAuditLogger, auditPayload, changesBetween, diagnosticPayload, publishedPayload, memberEditPayload, scoutTextDiff };

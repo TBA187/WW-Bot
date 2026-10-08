@@ -6,7 +6,8 @@ const { extractScoutData, candidateFromText, cleanIgn, isClearlySpamTeam, normal
 const { hasKnownTeamDetail, isPokemonDetailNote, matchKnownTermHeading, matchSpeciesHeading,
     reportContextSpecies, resolveNoteShorthand, splitScoutText } = require('./PokemonTeamParser.js');
 const { setImmediate: yieldToEvents } = require('node:timers/promises');
-const { ScoutMessageFeedback } = require('./ScoutMessageFeedback.js');
+const { ScoutMessageFeedback, feedbackOutcome } = require('./ScoutMessageFeedback.js');
+const { contentHash, scoutVersion } = require('./PvpScoutStore.js');
 
 const HISTORY_PAGE_SIZE = 100;
 const FOLLOW_UP_WINDOW_MS = 15 * 60 * 1000;
@@ -190,7 +191,6 @@ class PvpScoutIngestor {
         this.stopped = false;
         this.started = false;
         this.queue = Promise.resolve();
-        this.reinspectionPromise = null;
         this.catchupPromise = null;
         this.catchupReady = false;
         this.catchupFailureRevision = 0;
@@ -200,6 +200,7 @@ class PvpScoutIngestor {
             channelId: this.channelId, stopped: () => this.stopped,
             diagnostics: this.diagnostics,
             onReview: async messageId => this.notifyNewReview({ message_id: messageId }),
+            recheck: async messageId => this.recheckCorrection(messageId),
             onPublished: async event => { this.store.auditLogger?.published(event); } });
     }
 
@@ -245,10 +246,6 @@ class PvpScoutIngestor {
                 }
                 this.failureCount = 0;
                 this.startCatchup();
-                // Reread screenshots saved with an older OCR version in the background.
-                this.reinspectionPromise = this.reinspectLegacyResultCards().catch(error => {
-                    console.error('[WW LOG] PvP scouting result-card refresh failed:', error);
-                });
                 return;
             } catch (error) {
                 this.failureCount++;
@@ -261,7 +258,6 @@ class PvpScoutIngestor {
 
     async stop() {
         this.stopped = true;
-        await this.reinspectionPromise?.catch(() => {});
         await this.catchupPromise?.catch(() => {});
         await this.queue.catch(() => {});
         if (this.feedback.stop) await this.feedback.stop();
@@ -275,43 +271,6 @@ class PvpScoutIngestor {
             || await this.client.channels.fetch(this.channelId);
         if (!channel?.messages?.fetch) throw new Error(`Channel ${this.channelId} does not expose message history.`);
         return channel;
-    }
-
-    async reinspectLegacyResultCards() {
-        const cards = await this.store.savedResultCardsToReinspect();
-        if (!cards.length || this.stopped) {
-            if (!this.stopped) console.log(`[WW LOG] ${this.server === 'silver' ? 'Silver' : 'Gold'} PvP saved-result-card reinspection COMPLETE: no archived screenshots need rereading.`);
-            return;
-        }
-
-        console.log(`[WW LOG] Rechecking ${cards.length} saved PvP scouting screenshot(s) with updated OCR.`);
-        const channel = await this.getChannel();
-        let refreshed = 0;
-        let failed = 0;
-        for (const [index, row] of cards.entries()) {
-            if (this.stopped) break;
-            try {
-                const message = await channel.messages.fetch(row.message_id);
-                const saved = await this.enqueue(() => this.saveMessage(message, { regroup: true }));
-                if (saved) refreshed++;
-            } catch (error) {
-                failed++;
-                console.warn(`[WW LOG] Could not reread PvP scout message ${row.message_id}: ${error.message}`);
-            }
-            if ((index + 1) % 25 === 0) {
-                console.log(`[WW LOG] PvP result-card refresh processed ${index + 1} of ${cards.length} saved message(s).`);
-            }
-        }
-        if (refreshed) {
-            // Finish grouping even if shutdown was requested halfway through this pass.
-            await this.enqueue(() => this.rebuildGroups());
-        }
-        if (this.stopped) {
-            console.log(`[WW LOG] PvP result-card refresh INTERRUPTED: ${refreshed} of ${cards.length} saved message(s) reread. Remaining messages may be retried on restart.`);
-            return;
-        }
-        const remaining = await this.store.pendingReviewCount();
-        console.log(`[WW LOG] PvP result-card refresh COMPLETE for this startup: ${refreshed} of ${cards.length} saved message(s) reread, ${failed} failed; ${remaining} still need human review.`);
     }
 
     async buildRecord(message) {
@@ -420,10 +379,11 @@ class PvpScoutIngestor {
         };
     }
 
-    async saveMessage(message, { regroup = false } = {}) {
+    async saveMessage(message, { regroup = false, deferReview = false } = {}) {
         if (this.stopped || !message?.id || String(message.channelId || message.channel?.id || '') !== this.channelId) return null;
         if (!canArchiveMessage(message, this.client.user?.id)) return null;
         const record = await this.buildRecord(message);
+        record.deferReview = deferReview && !message.author?.bot && !message.webhookId;
         if (this.stopped) return null;
         const saved = await this.store.saveMessage(record);
         if (!regroup) await this.assignLiveGroup(saved);
@@ -463,7 +423,7 @@ class PvpScoutIngestor {
         const saved = await this.enqueueMessage(message, async () => {
             let row;
             try {
-                row = await this.saveMessage(message);
+                row = await this.saveMessage(message, { deferReview: true });
             } catch (error) {
                 // Later events cannot certify a gap left by this failed message.
                 this.catchupReady = false;
@@ -497,7 +457,10 @@ class PvpScoutIngestor {
         const row = await this.store.getMessage(saved.message_id);
         if (!row || row.review_status !== 'pending' || row.is_deleted) return;
         const age = Date.now() - messageTimestamp(row.created_at);
-        if (age < -5 * 60 * 1000 || age > EDIT_REVIEW_WINDOW_MS) return;
+        const correction = await this.store.getCorrectionWindow(row.message_id);
+        if (correction?.status === 'waiting') return;
+        // Persisted overdue windows can be escalated after a long bot outage.
+        if (!correction && (age < -5 * 60 * 1000 || age > EDIT_REVIEW_WINDOW_MS)) return;
         const groupedWithoutName = String(row.root_message_id || row.message_id) !== String(row.message_id)
             && !row.opponent_ign && !hasImageEvidence(row.attachments) && [
                 'Could not identify the opponent IGN in the message or screenshot.',
@@ -562,17 +525,79 @@ class PvpScoutIngestor {
         }
     }
 
+    async recheckCorrection(messageId) {
+        const row = await this.store.getMessage(messageId);
+        if (!row || row.is_deleted) return;
+        let message;
+        try { message = await (await this.getChannel()).messages.fetch(messageId); }
+        catch (error) {
+            if (Number(error.code) !== 10008) throw error;
+            await this.store.markDeleted(messageId, this.channelId);
+            return;
+        }
+        const attachments = [...(message.attachments?.values?.() || [])].map(attachmentRecord);
+        const savedHash = contentHash({ content: row.archive_message_content ?? row.message_content,
+            attachments: row.archive_attachments ?? row.attachments });
+        if (savedHash !== contentHash({ content: message.content, attachments })) await this.handleUpdate(message);
+    }
+
+    editSnapshot(message) {
+        if (!message) return null;
+        const snapshot = Object.create(Object.getPrototypeOf(message), Object.getOwnPropertyDescriptors(message));
+        if (message.attachments?.values) snapshot.attachments = new Map([...message.attachments.values()]
+            .map(attachment => [attachment.id, { ...attachment }]));
+        return snapshot;
+    }
+
+    async logMemberEdit(result) {
+        if (!this.store.auditLogger?.memberEdited || !result.saved || !result.logBefore || !result.logAfter
+            || result.message.author?.bot || result.message.webhookId) return result;
+        const before = scoutVersion(result.logBefore), after = scoutVersion(result.logAfter);
+        before.content = String(result.logBefore.archive_message_content ?? before.content);
+        // Attachment URL refreshes and duplicate gateway events are not author edits.
+        if (before.contentHash === after.contentHash) return result;
+        const saved = await this.store.getMessage(result.saved.message_id);
+        const root = saved?.root_message_id && String(saved.root_message_id) !== String(saved.message_id)
+            ? await this.store.getMessage(saved.root_message_id) : saved;
+        let failed = after.reviewStatus === 'pending';
+        if (!result.stagedEdit && root) {
+            const sources = await this.store.sourcesForRoots([String(root.message_id)], this.channelId);
+            let outcome;
+            for (const source of sources.filter(source => String(source.author_id) === String(after.authorId))) {
+                const candidate = feedbackOutcome(source, root, await this.store.getEditReview(source.message_id));
+                if (candidate?.reaction === '👎') { outcome = candidate; break; }
+                if (candidate) outcome = candidate;
+            }
+            const missingTeam = root.opponent_ign && !sources.some(source => String(source.team_text || '').trim()
+                || hasImageEvidence(source.attachments));
+            failed = outcome?.reaction === '👎' || Boolean(missingTeam);
+            after.reviewStatus = failed ? 'pending' : saved?.review_status || after.reviewStatus;
+            after.reviewReason = failed ? outcome?.reason || saved?.review_reason || root.review_reason
+                || 'The scout report names an opponent but contains no Pokémon team information or screenshot.' : null;
+        }
+        this.store.auditLogger.memberEdited({ messageId: after.messageId,
+            reportId: String(saved?.root_message_id || after.messageId), server: this.server,
+            authorId: after.authorId, authorUsername: after.authorUsername, sourceUrl: after.sourceUrl,
+            before, after, awaitingApproval: result.stagedEdit, failed });
+        return result;
+    }
+
     async handleUpdate(message) {
+        message = this.editSnapshot(message);
         const result = await this.enqueueMessage(message, async () => {
             let current = message;
-            if (current?.partial) current = await current.fetch().catch(() => null);
+            if (current?.partial) current = this.editSnapshot(await current.fetch().catch(() => null));
             if (!current || !canArchiveMessage(current, this.client.user?.id)) return null;
             const previous = await this.store.getMessage(current.id);
+            const previousEdit = previous ? await this.store.getEditReview(current.id) : null;
+            const logBefore = previousEdit?.status === 'pending' ? previousEdit.after : previous;
             const messageAge = previous ? Date.now() - messageTimestamp(previous.created_at) : Infinity;
+            const activeCorrection = previous && await this.store.getCorrectionWindow(current.id);
             const isRecentScout = previous && !previous.is_deleted
                 && ['scout', 'review'].includes(previous.classification)
                 && previous.review_status !== 'not_scout'
-                && messageAge >= -5 * 60 * 1000 && messageAge <= EDIT_REVIEW_WINDOW_MS;
+                && (messageAge >= -5 * 60 * 1000 && messageAge <= EDIT_REVIEW_WINDOW_MS
+                    || activeCorrection?.status === 'waiting' || activeCorrection?.status === 'escalated');
             if (isRecentScout) {
                 const proposal = await this.buildRecord(current);
                 if (this.stopped) return null;
@@ -590,17 +615,17 @@ class PvpScoutIngestor {
                     && !latest.staffOverrides?.locked && !latest.staffOverrides?.hidden
                     && existingEdit?.status !== 'pending' && !protectedGroup;
                 if (retry) {
-                    const saved = await this.store.saveMessage(proposal);
+                    const saved = await this.store.saveMessage({ ...proposal, deferReview: true });
                     await this.rebuildGroups();
-                    return { saved, message: current, stagedEdit: false };
+                    return this.logMemberEdit({ saved, message: current, stagedEdit: false, logBefore, logAfter: proposal });
                 }
                 const edit = await this.store.stageEditReview(latest || previous, proposal);
-                return { saved: latest || previous, message: current, edit, stagedEdit: true };
+                return this.logMemberEdit({ saved: latest || previous, message: current, edit, stagedEdit: Boolean(edit), logBefore, logAfter: proposal });
             }
             if (previous) await this.store.expirePendingEditReview?.(previous.message_id);
-            const saved = await this.saveMessage(current, { regroup: true });
+            const saved = await this.saveMessage(current, { regroup: true, deferReview: true });
             if (saved) await this.rebuildGroups();
-            return { saved, message: current, stagedEdit: false };
+            return this.logMemberEdit({ saved, message: current, stagedEdit: false, logBefore, logAfter: saved });
         });
         if (!result) return null;
         if (result.stagedEdit) {
@@ -691,7 +716,8 @@ class PvpScoutIngestor {
                     const saved = await this.enqueue(async () => {
                         if (this.stopped || await this.store.getMessage(message.id)) return null;
                         if (this.stopped) return null;
-                        return this.saveMessage(message, { regroup: true });
+                        return this.saveMessage(message, { regroup: true,
+                            deferReview: Date.now() - messageTimestamp(message.createdAt || message.createdTimestamp) <= EDIT_REVIEW_WINDOW_MS });
                     });
                     if (saved) count++;
                 }

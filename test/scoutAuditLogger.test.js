@@ -111,3 +111,57 @@ test('publication and diagnostic logs share the action queue and configured chan
     assert.equal(sent[0].embeds[0].toJSON().title, '✅ Scout Report Published');
     assert.equal(sent[1].content, '<@owner>');
 });
+
+
+const { memberEditPayload, scoutTextDiff } = require('../features/pvp-scouting/ScoutAuditLogger.js');
+
+test('member edit logs show the exact text diff, confidence, reason and shared suggestions without mentions', () => {
+    const { reviewSuggestions } = require('../features/pvp-scouting/ScoutFeedbackText.js');
+    const before = { content: 'Xihoi22222\nGliscor: Toxic', ign: 'Xihoi22222', ignConfidence: 0.86, ignSource: 'first_line' };
+    const after = { ...before, content: 'Xiho0i22222\nGliscor: Toxic', ign: 'Xiho0i22222', ignConfidence: 0.99,
+        reviewStatus: 'pending', reviewReason: 'Message and screenshot spell the IGN differently.' };
+    const payload = memberEditPayload({ before, after, failed: true, server: 'silver', authorId: '123', authorUsername: 'Member',
+        reportId: '111', messageId: '222', sourceUrl: 'https://discord.com/channels/1/2/222', timestamp: '2026-10-08T12:00:00Z' });
+    const embed = payload.embeds[0].toJSON();
+    assert.equal(embed.color, 0xED4245); assert.match(embed.description, /Silver.*\n.*Failed validation/u);
+    assert.equal(scoutTextDiff(before.content, after.content), '- Xihoi22222\n+ Xiho0i22222');
+    assert.match(embed.fields.find(f => f.name === 'Message changes').value, /- Xihoi22222\n\+ Xiho0i22222/u);
+    assert.equal(embed.fields.find(f => f.name === 'IGN confidence').value, '86.0% → 99.0%');
+    assert.match(embed.fields.find(f => f.name === 'Validation reason').value, /spell the IGN differently/u);
+    assert.equal(embed.fields.find(f => f.name === 'Bot suggestions').value,
+        reviewSuggestions({ reason: after.reviewReason }).map(v => `- ${v}`).join('\n'));
+    assert.deepEqual(payload.allowedMentions, { parse: [] });
+    assert.equal(JSON.parse(payload.files[1].attachment.toString()).before.content, before.content);
+});
+
+test('success is green while successfully parsed edits requiring approval are yellow', () => {
+    const base = { before: { content: 'Old' }, after: { content: 'New', classification: 'scout', reviewStatus: 'not_required' },
+        reportId: '111', messageId: '222', server: 'gold' };
+    const success = memberEditPayload(base).embeds[0].toJSON();
+    assert.equal(success.color, 0x57F287); assert.match(success.description, /Successfully validated/u);
+    assert.equal(success.fields.find(f => f.name === 'Bot suggestions').value, 'No corrections needed.');
+    const pending = memberEditPayload({ ...base, awaitingApproval: true }).embeds[0].toJSON();
+    assert.equal(pending.color, 0xFEE75C); assert.match(pending.description, /awaiting officer approval/u);
+    assert.match(pending.fields.find(f => f.name === 'Bot suggestions').value, /officer must approve/u);
+});
+
+test('large edit diffs fit Discord embeds and keep the complete diff and data attached', () => {
+    const before = { content: 'old '.repeat(2000) }, after = { content: 'new '.repeat(2000), reviewReason: 'Reason '.repeat(500), reviewStatus: 'pending' };
+    const payload = memberEditPayload({ before, after, reportId: '111', messageId: '222' });
+    const embed = payload.embeds[0].toJSON();
+    assert.ok(embed.fields.every(f => f.value.length <= 1024));
+    assert.ok(embed.title.length + embed.description.length + embed.footer.text.length
+        + embed.fields.reduce((n, f) => n + f.name.length + f.value.length, 0) < 6000);
+    assert.equal(payload.files.at(-1).attachment.toString(), scoutTextDiff(before.content, after.content));
+    assert.equal(JSON.parse(payload.files[1].attachment.toString()).after.content, after.content);
+});
+
+test('all member edit attempts share the configured scout log queue', async () => {
+    const sent = [], channel = { guildId: 'guild', async send(p) { sent.push(p); } };
+    const logger = new ScoutAuditLogger({ guildId: 'guild', channelId: 'log', client: { channels: { cache: new Map([['log', channel]]) } } });
+    logger.memberEdited({ before: { content: 'one' }, after: { content: 'two', reviewStatus: 'pending' }, messageId: '222', reportId: '111' });
+    logger.memberEdited({ before: { content: 'two' }, after: { content: 'three', reviewStatus: 'not_required' }, messageId: '222', reportId: '111' });
+    await logger.flush(); assert.equal(sent.length, 2);
+    assert.deepEqual(sent.map(p => p.embeds[0].toJSON().color), [0xED4245, 0x57F287]);
+    assert.ok(sent.every(p => p.allowedMentions.parse.length === 0));
+});

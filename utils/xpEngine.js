@@ -2,7 +2,7 @@
 // Utility - XP Engine
 // ==========================
 const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
-const { getXpForNextLevel, getTotalXpForLevel, getLevelFromTotalXp } = require('./xpMath');
+const { getTotalXpForLevel, getLevelFromTotalXp } = require('./xpMath');
 const { fetchTrackById, fetchRewardsByIds, getXpTypeFromTrackInfo, reportXpDatabaseError } = require('./xpDbHelper');
 const xpSettings = require('../config/xpConfig');
 

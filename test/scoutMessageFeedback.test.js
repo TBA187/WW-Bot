@@ -23,6 +23,7 @@ function scout(patch = {}) {
 function fixture(patch = {}) {
     const rows = new Map([[ID, scout(patch)]]);
     const states = new Map();
+    const windows = new Map();
     const jobs = new Map();
     const messages = new Map();
     const sent = [], removed = [], edited = [], deleted = [], reacted = [];
@@ -57,6 +58,25 @@ function fixture(patch = {}) {
             }
         } } };
     const store = {
+        async reserveCorrectionWindow(id) {
+            if (!windows.has(String(id))) windows.set(String(id), { message_id: String(id), channel_id: CHANNEL,
+                started_at_ms: null, due_at_ms: null, status: 'waiting' });
+        },
+        async startCorrectionWindow(id, started, duration) {
+            await this.reserveCorrectionWindow(id); const window = windows.get(String(id));
+            if (window.status === 'waiting' && window.started_at_ms == null) {
+                window.started_at_ms = started; window.due_at_ms = started + duration;
+            }
+            return { ...window };
+        },
+        async getCorrectionWindow(id) { return windows.get(String(id)) || null; },
+        async pendingCorrectionWindows() { return [...windows.values()].filter(w => w.status !== 'resolved'); },
+        async resolveCorrectionWindow(id) { const w = windows.get(String(id)); if (w) w.status = 'resolved'; },
+        async escalateCorrectionWindow(id, now) {
+            const w = windows.get(String(id)), row = rows.get(String(id));
+            if (!w || w.status !== 'waiting' || w.due_at_ms > now || row?.review_status !== 'pending' || row.is_deleted) return false;
+            w.status = 'escalated'; return true;
+        },
         async getMessage(id) { return rows.get(String(id)) || null; },
         async sourcesForRoots(ids) {
             return [...rows.values()].filter(row => ids.includes(row.root_message_id) && !row.is_deleted)
@@ -101,7 +121,7 @@ function fixture(patch = {}) {
         }
     };
     const makeFeedback = options => new ScoutMessageFeedback({ client, store, channelId: CHANNEL, ...options });
-    return { rows, states, jobs, messages, sent, removed, edited, deleted, reacted, message, source, client, store,
+    return { rows, states, jobs, windows, messages, sent, removed, edited, deleted, reacted, message, source, client, store,
         feedback: makeFeedback(), makeFeedback, setEdit: value => { pendingEdit = value; } };
 }
 
@@ -232,6 +252,7 @@ function feedbackClock(t) {
     t.mock.timers.enable(['setTimeout']);
     return { async advance(ms, feedback) {
         now += ms; t.mock.timers.tick(ms); await feedback.drain();
+        await Promise.allSettled([...feedback.corrections.running.values()]);
     } };
 }
 
@@ -308,7 +329,7 @@ test('a bare IGN waits, then explains the missing team; a follow-up removes that
     await clock.advance(60_000, f.feedback);
     assert.equal(f.states.get(ID).reaction, '👎');
     assert.match(f.sent[0].content, /contains no Pokémon team information/u);
-    assert.deepEqual(alerts, [ID]);
+    assert.deepEqual(alerts, []);
     const replyId = String(BigInt(ID) + 1n);
     const row = parsedRow(replyId, 'Gliscor: Toxic', { root_message_id: ID, created_at: new Date(Date.now()) });
     f.rows.set(replyId, row);
@@ -334,7 +355,7 @@ test('an earlier failed fragment makes the final message fail, rather than appro
     await clock.advance(60_000, f.feedback);
     assert.deepEqual(f.reacted, [{ id: lastId, emoji: '👎' }]);
     assert.match(f.sent[0].content, /Check Pokémon spelling: Glissor/u);
-    assert.deepEqual(alerts, [badId]);
+    assert.deepEqual(alerts, []);
     f.rows.get(badId).review_status = 'confirmed';
     await f.feedback.refreshReport(badId);
     assert.equal(f.states.get(lastId).reaction, '👍', 'officer action on an earlier fragment refreshes the final reaction');
@@ -717,7 +738,7 @@ test('Add Scout Report submissions keep officer alerts without reacting to the b
 
 function editFixture(row, pendingEdit = null) {
     let currentRow = scout(row), saves = 0, staged = 0, grouped = 0, feedback = 0;
-    const store = { async getMessage() { return currentRow; }, async getEditReview() { return pendingEdit; },
+    const store = { async getMessage() { return currentRow; }, async getCorrectionWindow() { return null; }, async getEditReview() { return pendingEdit; },
         async saveMessage(proposal) { saves++; currentRow = scout({ review_status: proposal.reviewStatus }); return currentRow; },
         async stageEditReview() { staged++; return { message_id: ID, revision: 1 }; } };
     const ingestor = new PvpScoutIngestor({ client: { user: { id: BOT } }, store, channelId: CHANNEL, ocr: {},
@@ -794,4 +815,194 @@ test('feedback database queries are scoped to the source and channel', async () 
     assert.deepEqual(calls[2].params, [CHANNEL, ID]);
     assert.deepEqual(calls[3].params, [ID, CHANNEL]);
     await assert.rejects(store.saveMessageFeedback(ID, { reaction: '❓' }), /Invalid scout feedback reaction/u);
+});
+
+
+test('failed reports get thumbs down now and enter staff review only one hour later', async t => {
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', review_reason: 'Verify the opponent IGN.',
+        attachments: [{ id: 'image', contentType: 'image/png' }] });
+    const alerts = []; f.feedback.onReview = async id => { alerts.push(id); };
+    const started = Date.now();
+    await f.feedback.observeMessage(f.message);
+    assert.equal(f.states.get(ID).reaction, '👎');
+    assert.equal(f.windows.get(ID).status, 'waiting');
+    assert.equal(f.windows.get(ID).due_at_ms, started + 3_600_000);
+    assert.deepEqual(alerts, []);
+    assert.match(f.sent[0].content, /1 hour after the first 👎/u);
+    assert.doesNotMatch(f.sent[0].content, /so it was sent to the review queue/u);
+    await clock.advance(3_599_999, f.feedback); assert.deepEqual(alerts, []);
+    await clock.advance(1, f.feedback);
+    assert.deepEqual(alerts, [ID]); assert.equal(f.windows.get(ID).status, 'escalated');
+    await f.feedback.stop();
+});
+
+test('failed edits keep the original deadline and a successful edit cancels escalation', async t => {
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    const alerts = []; f.feedback.onReview = async id => { alerts.push(id); };
+    await f.feedback.observeMessage(f.message); const deadline = f.windows.get(ID).due_at_ms;
+    await clock.advance(30 * 60_000, f.feedback);
+    f.rows.get(ID).review_reason = 'Check Pokémon spelling: Glissor.';
+    await f.feedback.observeMessage(f.message);
+    assert.equal(f.windows.get(ID).due_at_ms, deadline); assert.equal(f.sent.length, 1);
+    assert.match(f.edited.at(-1).content, /Check Pokémon spelling/u);
+    f.rows.get(ID).review_status = 'not_required'; f.rows.get(ID).review_reason = null;
+    await f.feedback.observeMessage(f.message);
+    assert.equal(f.states.get(ID).reaction, '👍'); assert.equal(f.windows.get(ID).status, 'resolved');
+    await clock.advance(31 * 60_000, f.feedback); assert.deepEqual(alerts, []);
+    await f.feedback.stop();
+});
+
+test('correction windows survive restarts without resetting their deadline', async t => {
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    const alerts = [];
+    await f.feedback.observeMessage(f.message); const deadline = f.windows.get(ID).due_at_ms;
+    await clock.advance(40 * 60_000, f.feedback); await f.feedback.stop();
+    const restarted = f.makeFeedback({ onReview: async id => { alerts.push(id); } });
+    await restarted.restorePending(); assert.equal(f.windows.get(ID).due_at_ms, deadline);
+    await clock.advance(20 * 60_000 - 1, restarted); assert.deepEqual(alerts, []);
+    await clock.advance(1, restarted); assert.deepEqual(alerts, [ID]);
+    await restarted.stop();
+});
+
+test('an offline successful edit is reread before the overdue report can reach officers', async t => {
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    const alerts = [];
+    await f.feedback.observeMessage(f.message); await f.feedback.stop();
+    let reread = 0;
+    const restarted = f.makeFeedback({ onReview: async id => { alerts.push(id); }, recheck: async () => {
+        reread++; f.rows.get(ID).review_status = 'not_required';
+    } });
+    await restarted.restorePending(); await clock.advance(25 * 60 * 60_000, restarted);
+    assert.equal(reread, 1); assert.deepEqual(alerts, []); assert.equal(f.windows.get(ID).status, 'resolved');
+    await restarted.stop();
+});
+
+test('a crash before the first feedback reaction resumes the reserved correction window', async t => {
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    await f.store.reserveCorrectionWindow(ID);
+    const alerts = []; f.feedback.onReview = async id => { alerts.push(id); };
+    await f.feedback.restorePending();
+    assert.equal(f.states.get(ID).reaction, '👎'); assert.equal(f.windows.get(ID).due_at_ms, Date.now() + 3_600_000);
+    await clock.advance(3_600_000, f.feedback); assert.deepEqual(alerts, [ID]);
+    await f.feedback.stop();
+});
+
+test('deleted reports cancel their correction window without notifying officers', async t => {
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    const alerts = []; f.feedback.onReview = async id => { alerts.push(id); };
+    await f.feedback.observeMessage(f.message); f.rows.get(ID).is_deleted = true;
+    await f.feedback.remove(ID); await clock.advance(3_600_000, f.feedback);
+    assert.deepEqual(alerts, []); assert.equal(f.windows.get(ID).status, 'resolved');
+    await f.feedback.stop();
+});
+
+test('a database outage at the deadline retries and does not lose the review', async t => {
+    t.mock.method(console, 'warn', () => {});
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    const alerts = []; f.feedback.onReview = async id => { alerts.push(id); };
+    await f.feedback.observeMessage(f.message);
+    const get = f.store.getCorrectionWindow; f.store.getCorrectionWindow = async () => { throw new Error('MySQL offline'); };
+    await clock.advance(3_600_000, f.feedback); assert.deepEqual(alerts, []);
+    f.store.getCorrectionWindow = get;
+    await clock.advance(60_000, f.feedback); assert.deepEqual(alerts, [ID]);
+    await f.feedback.stop();
+});
+
+test('the correction deadline waits for an in-flight edit before escalating', async t => {
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    const alerts = []; f.feedback.onReview = async id => { alerts.push(id); };
+    await f.feedback.observeMessage(f.message); f.feedback.beginMessage(f.message);
+    await clock.advance(3_600_000, f.feedback); assert.deepEqual(alerts, []);
+    f.rows.get(ID).review_status = 'not_required'; f.feedback.endMessage(f.message);
+    await clock.advance(60_000, f.feedback); assert.deepEqual(alerts, []);
+    assert.equal(f.windows.get(ID).status, 'resolved'); await f.feedback.stop();
+});
+
+
+function memberEditLogFixture() {
+    let row = scout({ message_content: 'original bad report', review_status: 'pending',
+        review_reason: 'Verify the opponent IGN.', ign_confidence: 0.4, ign_source: 'first_line' }), proposal = null;
+    const logs = [];
+    const store = { auditLogger: { memberEdited(event) { logs.push(structuredClone(event)); } },
+        async getMessage() { return { ...row }; }, async getCorrectionWindow() { return null; },
+        async getEditReview() { return proposal; }, async sourcesForRoots() { return [{ ...row }]; },
+        async saveMessage(record) {
+            row = { ...row, message_content: record.content, review_status: record.reviewStatus,
+                review_reason: record.reviewReason, classification: record.classification,
+                opponent_ign: record.ign, ign_normalized: record.ignNormalized, team_text: record.teamText,
+                ign_confidence: record.ignConfidence, ign_source: record.ignSource };
+            return { ...row };
+        },
+        async stageEditReview(before, after) {
+            proposal = { message_id: ID, status: 'pending', after };
+            row.review_status = 'pending'; row.review_reason = 'An officer must approve the changes.';
+            return proposal;
+        } };
+    const ingestor = new PvpScoutIngestor({ client: { user: { id: BOT } }, store, channelId: CHANNEL, server: 'silver', ocr: {},
+        feedback: { async observeMessage() {}, async refreshReport() {}, async drain() {} } });
+    ingestor.rebuildGroups = async () => {}; ingestor.notifyEditReview = async () => {};
+    ingestor.buildRecord = async message => ({ messageId: ID, channelId: CHANNEL, authorId: 'member', authorUsername: 'Member',
+        content: message.content, sourceUrl: 'https://discord.com/channels/1/2/' + ID,
+        attachments: [], teamText: 'Gliscor: Toxic', ign: 'Blacku', ignNormalized: 'blacku',
+        ignConfidence: message.content.startsWith('bad') ? 0.5 : 0.98, ignSource: 'first_line',
+        classification: 'scout', reviewStatus: message.content.startsWith('bad') ? 'pending' : 'not_required',
+        reviewReason: message.content.startsWith('bad') ? 'Verify the opponent IGN.' : null });
+    const message = { id: ID, channelId: CHANNEL, author: { id: 'member', bot: false }, attachments: new Map(), content: 'bad first edit' };
+    return { ingestor, store, logs, message };
+}
+
+test('every failed member edit and the final successful correction log their own reason, confidence and before/after', async () => {
+    const f = memberEditLogFixture();
+    await f.ingestor.handleUpdate(f.message);
+    f.message.content = 'bad second edit'; await f.ingestor.handleUpdate(f.message);
+    f.message.content = 'good final edit'; await f.ingestor.handleUpdate(f.message);
+    assert.equal(f.logs.length, 3); assert.deepEqual(f.logs.map(log => log.failed), [true, true, false]);
+    assert.deepEqual(f.logs.map(log => log.after.content), ['bad first edit', 'bad second edit', 'good final edit']);
+    assert.equal(f.logs[1].before.content, 'bad first edit');
+    assert.equal(f.logs[0].after.reviewReason, 'Verify the opponent IGN.');
+    assert.equal(f.logs[2].after.ignConfidence, .98); assert.equal(f.logs[2].server, 'silver');
+});
+
+test('rapid edits to Discord’s mutable cached message retain each gateway revision', async () => {
+    const f = memberEditLogFixture(), build = f.ingestor.buildRecord;
+    let release; const wait = new Promise(resolve => { release = resolve; });
+    f.ingestor.buildRecord = async message => { await wait; return build(message); };
+    const first = f.ingestor.handleUpdate(f.message);
+    f.message.content = 'good second edit'; const second = f.ingestor.handleUpdate(f.message);
+    release(); await Promise.all([first, second]);
+    assert.deepEqual(f.logs.map(log => log.after.content), ['bad first edit', 'good second edit']);
+    assert.equal(f.logs[1].before.content, 'bad first edit');
+});
+
+test('successive protected edit logs compare against the previous proposed edit and suppress duplicate events', async () => {
+    const f = memberEditLogFixture(); f.message.content = 'good published report';
+    await f.ingestor.handleUpdate(f.message);
+    f.message.content = 'good first proposed edit'; await f.ingestor.handleUpdate(f.message);
+    f.message.content = 'good second proposed edit'; await f.ingestor.handleUpdate(f.message);
+    await f.ingestor.handleUpdate(f.message);
+    assert.equal(f.logs.length, 3); assert.equal(f.logs[2].before.content, 'good first proposed edit');
+    assert.equal(f.logs[2].after.content, 'good second proposed edit'); assert.equal(f.logs[2].awaitingApproval, true);
+    assert.equal(f.logs[2].failed, false);
+});
+
+test('live parser failures reserve a hidden correction window before the archive row can enter the queue', async () => {
+    const queries = []; const store = new PvpScoutStore({ channelId: CHANNEL, db: { async query(sql) { queries.push(sql); return [{ affectedRows: 1 }]; } } });
+    store.schemaReady = true; store.getMessage = async () => null;
+    await store.saveMessage({ messageId: ID, channelId: CHANNEL, content: 'bad report', reviewStatus: 'pending', deferReview: true });
+    assert.match(queries[0], /INSERT IGNORE INTO pvp_scout_correction_windows/u);
+    assert.match(queries[1], /INSERT INTO pvp_scout_messages/u);
+});
+
+
+test('timer recovery retries if MySQL is temporarily unavailable on startup', async t => {
+    t.mock.method(console, 'warn', () => {});
+    const clock = feedbackClock(t), f = fixture({ review_status: 'pending', attachments: [{ contentType: 'image/png' }] });
+    await f.feedback.observeMessage(f.message); await f.feedback.stop();
+    const pending = f.store.pendingCorrectionWindows;
+    f.store.pendingCorrectionWindows = async () => { throw new Error('Database restarting'); };
+    const alerts = [], restarted = f.makeFeedback({ onReview: async id => { alerts.push(id); } });
+    await restarted.restorePending(); f.store.pendingCorrectionWindows = pending;
+    await clock.advance(60_000, restarted); await restarted.corrections.restore();
+    await clock.advance(59 * 60_000, restarted); assert.deepEqual(alerts, [ID]);
+    await restarted.stop();
 });

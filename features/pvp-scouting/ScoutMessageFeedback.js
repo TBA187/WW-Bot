@@ -2,6 +2,8 @@
 'use strict';
 
 const { Routes } = require('discord.js');
+const { ScoutCorrectionWindow } = require('./ScoutCorrectionWindow.js');
+const { reviewFeedbackText } = require('./ScoutFeedbackText.js');
 const { hasImageEvidence } = require('./PvpScoutParser.js');
 const { teamLineSpecies } = require('./PokemonTeamParser.js');
 
@@ -34,42 +36,6 @@ function feedbackOutcome(row, root = row, edit = null) {
     return { reaction: DOWN, reason: 'Could not identify the opponent IGN in the message or screenshot.' };
 }
 
-function reviewFeedbackText(outcome) {
-    const rawReason = outcome.reason || 'The opponent or team could not be verified confidently.';
-    const needsApproval = Boolean(outcome.edit) || /officer must approve/iu.test(rawReason);
-    const reason = String(rawReason).replace(/([\\*_~`|>])/gu, '\\$1').slice(0, 900);
-    const suggestions = [];
-    if (needsApproval) {
-        suggestions.push('An officer must approve changes to an already published or reviewed scout.');
-        if (outcome.edit?.after?.reviewReason) suggestions.push('Also check the opponent IGN and team details in your edited message.');
-    } else {
-        if (/IGN|opponent|unlabeled|name/iu.test(rawReason)) {
-            suggestions.push('Put the opponent’s exact IGN on the first line, for example `Opponent IGN: PlayerName`.');
-        }
-        if (/different|multiple|spell.*differ/iu.test(rawReason)) {
-            suggestions.push('Make sure the text and screenshots identify the same opponent. Use a separate scout for each opponent.');
-        }
-        if (/author|guild member/iu.test(rawReason)) {
-            suggestions.push('Identify which name is the opponent, especially when the screenshot also shows your own IGN.');
-        }
-        if (/screenshot|image|preview/iu.test(rawReason)) {
-            suggestions.push('Use a clear screenshot with the opponent IGN visible.');
-        }
-        if (/Pokémon|pokemon|team member|details|spam/iu.test(rawReason) || !suggestions.length) {
-            suggestions.push('Put each Pokémon on its own line, followed by its moves, item, or other scouting details.');
-        }
-    }
-    return `⚠️ **This Scout Report needs review.**\n`
-        + (needsApproval ? 'Your edited scout is awaiting officer approval.\n'
-            : "The scout message couldn't be confidently verified, so it was sent to the review queue.\n")
-        + `\n**Reason:** ${reason}\n\n**What to improve:**\n`
-        + suggestions.map(suggestion => `- ${suggestion}`).join('\n')
-        + '\n\nPlease edit **your original scout message** with these changes, and your scout report will be processed again. '
-        + 'You don’t need to reply to this bot message.\n'
-        + 'Once your scout report has been successfully validated'
-        + (needsApproval ? ' and any required officer review has been completed' : '')
-        + ' and added to the `/scout` command, this reply will be deleted and the 👎 reaction will be replaced with 👍.';
-}
 
 function missingMessage(error) { return Number(error?.code) === 10008; }
 
@@ -98,7 +64,7 @@ function feedbackRun(sources, messageId) {
 
 class ScoutMessageFeedback {
     constructor({ client, store, channelId, stopped = () => false, onReview = async () => {},
-        onPublished = async () => {}, diagnostics = null }) {
+        onPublished = async () => {}, recheck = async () => {}, diagnostics = null }) {
         this.client = client;
         this.store = store;
         this.channelId = String(channelId);
@@ -112,6 +78,15 @@ class ScoutMessageFeedback {
         this.inFlight = new Map();
         // Retain a just-sent reply if its database write fails, so retrying won't send another.
         this.unsaved = new Map();
+        this.corrections = new ScoutCorrectionWindow({ store, onReview: id => this.onReview(id), recheck,
+            recover: id => this.refreshReport(id, null, true),
+            needsReview: async id => {
+                const context = await this.reportContext(id);
+                if (!context) return false;
+                const outcome = feedbackOutcome(context.row, context.root, await this.store.getEditReview(id));
+                return outcome?.reaction === DOWN && !outcome.edit;
+            },
+            busy: () => this.inFlight.size > 0, stopped: () => this.stopped() || this.closing });
     }
 
     enqueue(messageId, task) {
@@ -168,6 +143,7 @@ class ScoutMessageFeedback {
     }
 
     async restorePending() {
+        await this.corrections.restore();
         const jobs = await this.store.pendingMessageFeedback(this.channelId);
         for (const job of jobs) this.armTimer(job);
     }
@@ -216,7 +192,7 @@ class ScoutMessageFeedback {
             }
             // Reactions belong to the final message, and remain absent while the author is typing.
             await this.clearRunFeedback(run, message, true);
-            await this.store.ensureReportTeamPresence(rootId, sources.some(hasTeamInformation), this.channelId);
+            await this.store.ensureReportTeamPresence(rootId, sources.some(hasTeamInformation), this.channelId, true);
             const complete = completeSingleMessage(latest);
             const job = await this.store.scheduleMessageFeedback(rootId, latest.author_id, latest.message_id,
                 Date.now() + (complete ? 0 : QUIET_PERIOD_MS), this.channelId);
@@ -256,17 +232,12 @@ class ScoutMessageFeedback {
                 this.armTimer(next);
                 return;
             }
-            await this.store.ensureReportTeamPresence(context.rootId, context.sources.some(hasTeamInformation), this.channelId);
+            await this.store.ensureReportTeamPresence(context.rootId, context.sources.some(hasTeamInformation), this.channelId, true);
             const root = await this.store.getMessage(context.rootId);
             const outcome = await this.reportOutcome(context.sources, latest, root);
             if (this.authorBusy(current.author_id)) {
                 this.armTimer(current, QUIET_PERIOD_MS);
                 return;
-            }
-            if (outcome?.reaction === DOWN && !outcome.edit && !/officer must approve/iu.test(outcome.reason || '')) {
-                await this.onReview(outcome.reviewMessageId).catch(error => {
-                    console.warn(`[WW LOG] Could not notify officers about scout ${outcome.reviewMessageId}: ${error.message}`);
-                });
             }
             if (outcome?.reaction === UP && (await this.state(latest.message_id))?.reaction !== UP
                 && await this.store.claimPublicationLog(current)) {
@@ -362,7 +333,8 @@ class ScoutMessageFeedback {
         const row = await this.store.getMessage(messageId);
         if (!row || String(row.channel_id) !== this.channelId) return null;
         const age = Date.now() - new Date(row.created_at).getTime();
-        if (!state && (!Number.isFinite(age) || age < -5 * 60 * 1000 || age > NEW_FEEDBACK_WINDOW_MS)) return null;
+        if (!state && (!Number.isFinite(age) || age < -5 * 60 * 1000 || age > NEW_FEEDBACK_WINDOW_MS)
+            && !(await this.store.getCorrectionWindow(messageId))) return null;
         const rootId = String(row.root_message_id || row.message_id);
         const root = rootId === String(messageId) ? row : await this.store.getMessage(rootId);
         if (!state && rootId === String(messageId) && !['scout', 'review'].includes(row.classification)) return null;
@@ -381,13 +353,24 @@ class ScoutMessageFeedback {
         }
         if (message.author?.bot || message.webhookId) return rootId;
         if (!outcome) {
+            await this.corrections.resolve(messageId);
             await this.clear(messageId, state, message);
             return rootId;
         }
         const opposite = outcome.reaction === UP ? DOWN : UP;
         if (state?.reaction === opposite || message.reactions?.cache.get(opposite)?.me) await this.removeOwnReaction(message, opposite);
         if (!message.reactions?.cache.get(outcome.reaction)?.me) await message.react(outcome.reaction);
+        // The deadline starts after the first successful thumbs-down reaction.
+        if (outcome.reaction === DOWN && !outcome.edit && !/officer must approve/iu.test(outcome.reason || '')) {
+            const window = await this.corrections.start(outcome.reviewMessageId);
+            outcome.dueAtMs = Number(window?.due_at_ms) || null;
+            outcome.escalated = window?.status === 'escalated';
+        }
         if (outcome.reaction === UP) {
+            for (const source of sources) {
+                const edit = await this.store.getEditReview(source.message_id);
+                if (feedbackOutcome(source, root, edit)?.reaction !== DOWN) await this.corrections.resolve(source.message_id);
+            }
             await this.deleteReply(messageId, state);
             await this.saveState(messageId, { reaction: UP, feedback_message_id: null });
         } else {
@@ -427,7 +410,10 @@ class ScoutMessageFeedback {
     }
 
     remove(messageId) {
-        return this.enqueue(messageId, async () => this.clear(messageId, await this.state(messageId)));
+        return this.enqueue(messageId, async () => {
+            await this.corrections.resolve(messageId);
+            await this.clear(messageId, await this.state(messageId));
+        });
     }
 
     async drain() {
@@ -438,6 +424,7 @@ class ScoutMessageFeedback {
         this.closing = true;
         for (const timer of this.timers.values()) clearTimeout(timer);
         this.timers.clear();
+        await this.corrections.stop();
         await this.drain();
     }
 }

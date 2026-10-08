@@ -18,10 +18,10 @@ test('Gold, Silver and roster initialize the exact checked-in definitions once p
     await Promise.all([gold.ensureSchema(), silver.ensureSchema(), roster.ensureSchema()]);
     const expected = [...fs.readFileSync(path.join(__dirname, '../sql/create_pvp_scout_tables.sql'), 'utf8')
         .matchAll(/CREATE TABLE IF NOT EXISTS `[^`]+`[^;]+;/gu)].map(match => match[0]);
-    assert.equal(calls.length, 10);
+    assert.equal(calls.length, expected.length);
     assert.deepEqual([...calls].sort(), expected.sort());
     await Promise.all([gold.ensureSchema(), silver.ensureSchema(), roster.ensureSchema()]);
-    assert.equal(calls.length, 10);
+    assert.equal(calls.length, expected.length);
     const otherCalls = [];
     await ensureScoutTables({ async query(sql) { otherCalls.push(sql); } }, ['pvp_scout_messages']);
     assert.equal(otherCalls.length, 1);

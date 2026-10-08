@@ -7,7 +7,6 @@ const { setImmediate: yieldToEvents } = require('node:timers/promises');
 const { writeJsonIfChanged } = require('../../utils/jsonFile.js');
 const { ensureScoutTables } = require('./ScoutSchema.js');
 const { extractScoutData, hasImageEvidence, IGN_DISPLAY_NAMES, nameFromResultLine } = require('./PvpScoutParser.js');
-const { SCAN_VERSION } = require('./PvpScoutOcr.js');
 const { buildReviewLearning } = require('./ScoutReviewLearning.js');
 const { reportContextSpecies, splitScoutText } = require('./PokemonTeamParser.js');
 
@@ -25,6 +24,10 @@ function publicLookupWhere(ignNormalized) {
 // This also applies when the combined report still needs an opponent name.
 const PENDING_REVIEW_WHERE = `
     m.channel_id = ? AND m.review_status = 'pending' AND m.is_deleted = 0
+    AND NOT EXISTS (
+        SELECT 1 FROM pvp_scout_correction_windows c
+        WHERE c.message_id = m.message_id AND c.channel_id = m.channel_id AND c.status = 'waiting'
+    )
     AND NOT (
         m.root_message_id IS NOT NULL AND m.message_id <> m.root_message_id
         AND m.opponent_ign IS NULL
@@ -276,7 +279,8 @@ class PvpScoutStore {
                 'pvp_scout_feedback_pending',
                 'pvp_scout_review_events',
                 'pvp_scout_review_alerts',
-                'pvp_scout_edit_reviews'
+                'pvp_scout_edit_reviews',
+                'pvp_scout_correction_windows'
             ]);
             this.schemaReady = true;
             return true;
@@ -298,6 +302,12 @@ class PvpScoutStore {
             === sourceFingerprint(record.content, record.attachments);
         const preserve = sameSource || previous?.staffOverrides?.locked || previous?.staffOverrides?.hidden ? 1 : 0;
         const preservedDecision = "(review_status IN ('confirmed','corrected','not_scout') OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(staff_overrides_json, '$.locked')), 'false') = 'true')";
+        // Hide a new parser failure before inserting it into the archive. Historical
+        // rows and protected officer edits retain their existing review behavior.
+        if (record.deferReview && record.reviewStatus === 'pending'
+            && !previous?.reviewed_by_id && !previous?.staffOverrides?.locked && !previous?.staffOverrides?.hidden) {
+            await this.reserveCorrectionWindow(record.messageId);
+        }
         const hash = contentHash(record);
         const params = [
             String(record.messageId), String(record.channelId || this.channelId),
@@ -703,6 +713,57 @@ class PvpScoutStore {
         return updated;
     }
 
+    async reserveCorrectionWindow(messageId, channelId = this.channelId) {
+        await this.ensureSchema();
+        await this.db.query(`INSERT IGNORE INTO pvp_scout_correction_windows (message_id, channel_id, status)
+            SELECT ?, ?, IF(EXISTS (SELECT 1 FROM pvp_scout_review_alerts
+                WHERE message_id = ? AND channel_id = ?), 'escalated', 'waiting')`,
+        [String(messageId), String(channelId), String(messageId), String(channelId)]);
+    }
+
+    async getCorrectionWindow(messageId, channelId = this.channelId) {
+        await this.ensureSchema();
+        const [rows] = await this.db.query(`SELECT * FROM pvp_scout_correction_windows
+            WHERE message_id = ? AND channel_id = ?`, [String(messageId), String(channelId)]);
+        return rows[0] || null;
+    }
+
+    async startCorrectionWindow(messageId, startedAtMs, durationMs, channelId = this.channelId) {
+        await this.reserveCorrectionWindow(messageId, channelId);
+        await this.db.query(`UPDATE pvp_scout_correction_windows
+            SET started_at_ms = ?, due_at_ms = ?
+            WHERE message_id = ? AND channel_id = ? AND status = 'waiting' AND started_at_ms IS NULL`,
+        [Number(startedAtMs), Number(startedAtMs) + Number(durationMs), String(messageId), String(channelId)]);
+        return this.getCorrectionWindow(messageId, channelId);
+    }
+
+    async pendingCorrectionWindows(channelId = this.channelId) {
+        await this.ensureSchema();
+        const [rows] = await this.db.query(`SELECT c.* FROM pvp_scout_correction_windows c
+            LEFT JOIN pvp_scout_review_alerts a ON a.message_id = c.message_id AND a.channel_id = c.channel_id
+            WHERE c.channel_id = ? AND (c.status = 'waiting'
+                OR c.status = 'escalated' AND a.alert_message_id IS NULL)`, [String(channelId)]);
+        return rows;
+    }
+
+    async resolveCorrectionWindow(messageId, channelId = this.channelId) {
+        await this.ensureSchema();
+        await this.db.query(`UPDATE pvp_scout_correction_windows SET status = 'resolved'
+            WHERE message_id = ? AND channel_id = ? AND status <> 'resolved'`, [String(messageId), String(channelId)]);
+    }
+
+    async escalateCorrectionWindow(messageId, nowMs, channelId = this.channelId) {
+        await this.ensureSchema();
+        const [result] = await this.db.query(`UPDATE pvp_scout_correction_windows c
+            INNER JOIN pvp_scout_messages m ON m.message_id = c.message_id AND m.channel_id = c.channel_id
+            SET c.status = 'escalated'
+            WHERE c.message_id = ? AND c.channel_id = ? AND c.status = 'waiting' AND c.due_at_ms <= ?
+              AND m.review_status = 'pending' AND m.is_deleted = 0 AND m.reviewed_by_id IS NULL
+              AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(m.staff_overrides_json, '$.locked')), 'false') <> 'true'`,
+        [String(messageId), String(channelId), Number(nowMs)]);
+        return Number(result.affectedRows || 0) > 0;
+    }
+
     async getMessageFeedback(messageId, channelId = this.channelId) {
         await this.ensureSchema();
         const [rows] = await this.db.query(`
@@ -753,8 +814,18 @@ class PvpScoutStore {
         return Number(result.affectedRows || 0) > 0;
     }
 
-    async ensureReportTeamPresence(rootId, hasInformation, channelId = this.channelId) {
+    async ensureReportTeamPresence(rootId, hasInformation, channelId = this.channelId, deferReview = false) {
         await this.ensureSchema();
+        if (!hasInformation && deferReview) {
+            // Reserve only when this update is about to create a fresh failure.
+            await this.db.query(`INSERT IGNORE INTO pvp_scout_correction_windows (message_id, channel_id)
+                SELECT message_id, channel_id FROM pvp_scout_messages
+                WHERE message_id = ? AND channel_id = ? AND review_status = 'not_required'
+                  AND classification = 'scout' AND opponent_ign IS NOT NULL AND is_deleted = 0
+                  AND reviewed_by_id IS NULL
+                  AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(staff_overrides_json, '$.locked')), 'false') <> 'true'`,
+            [String(rootId), String(channelId)]);
+        }
         const [result] = await this.db.query(hasInformation ? `
             UPDATE pvp_scout_messages SET review_status = 'not_required', review_reason = NULL
             WHERE channel_id = ? AND message_id = ? AND review_status = 'pending' AND review_reason = ?
@@ -1223,24 +1294,6 @@ class PvpScoutStore {
         return rows.map(normalizeMessageRow);
     }
 
-    async savedResultCardsToReinspect(channelId = this.channelId) {
-        await this.ensureSchema();
-        const [rows] = await this.db.query(`
-            SELECT * FROM pvp_scout_messages
-            WHERE channel_id = ? AND is_deleted = 0
-              AND review_status IN ('pending','not_required')
-              AND classification IN ('scout','review')
-              AND COALESCE(ign_source, '') <> 'member_submission'
-            ORDER BY message_id ASC
-        `, [String(channelId)]);
-        return rows.map(normalizeMessageRow).filter(row => {
-            if (row.reviewed_by_id) return false;
-            if (!hasImageEvidence(row.attachments)) return false;
-            return !row.ocrResults?.length
-                || row.ocrResults.some(result => Number(result.scanVersion || 0) < SCAN_VERSION);
-        });
-    }
-
     async applyStaffReview(messageId, reviewerId, action, correction = {},
         { allowPreviouslyReviewed = false, logAction = true, requirePending = false } = {}) {
         await this.ensureSchema();
@@ -1256,7 +1309,10 @@ class PvpScoutStore {
                 WHERE message_id = ? AND channel_id = ? AND is_deleted = 0 FOR UPDATE
             `, [id, this.channelId]);
             const before = rows[0];
-            if (requirePending && (!before || before.review_status !== 'pending')) {
+            const [windows] = requirePending ? await connection.query(`
+                SELECT status FROM pvp_scout_correction_windows WHERE message_id = ? AND channel_id = ? FOR UPDATE
+            `, [id, this.channelId]) : [[]];
+            if (requirePending && (!before || before.review_status !== 'pending' || windows[0]?.status === 'waiting')) {
                 const error = new Error('This scout review is no longer pending. Reopen /scout-review before acting.');
                 error.code = 'SCOUT_REVIEW_STALE';
                 throw error;
@@ -1371,6 +1427,7 @@ module.exports = {
     PvpScoutStore,
     MISSING_TEAM_REASON,
     contentHash,
+    scoutVersion,
     decode,
     normalizeMessageRow
 };

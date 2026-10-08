@@ -190,7 +190,8 @@ Before enabling the monitor in production, run `sql/create_guild_applications_ta
 PvP scouting:
 
 - `/scout in_game_name:<name>` opens an opponent's scout history with teams, PvP ratings, contributors, screenshots, notes, and links to the original reports.
-- Scout reports are automatically parsed from the configured scouting channels. Reports that cannot be confidently validated are sent to the officer review queue.
+- Scout reports are automatically parsed from the configured Gold and Silver scouting channels. A new report that cannot be validated receives 👎 and correction suggestions. It stays out of `/scout-review` and the officer channel for **one hour after its first 👎**. Failed edits keep the original deadline; a successful correction cancels it. Unresolved reports enter the officer review queue and trigger one officer alert after the deadline.
+- Correction deadlines are saved in `pvp_scout_correction_windows` and resumed after restarts. The bot rechecks the Discord message before escalation, including edits made while it was offline.
 - Same-author follow-up messages and screenshots can be grouped into the same report. Edits to unresolved scouts automatically retry validation.
 - `/scout-review` allows Leaders, Admins, and Officers to review, correct, approve, reject, or export reports that require manual review.
 - `/scout-settings` allows staff to search and manage published scout reports, sources, friendly players, and current/former guild members.

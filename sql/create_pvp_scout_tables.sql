@@ -156,3 +156,15 @@ CREATE TABLE IF NOT EXISTS `pvp_scout_member_seed` (
   `seeded_at` datetime(3) NOT NULL DEFAULT current_timestamp(3),
   PRIMARY KEY (`guild_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Author Scout Message correction window.
+CREATE TABLE IF NOT EXISTS `pvp_scout_correction_windows` (
+  `message_id` varchar(32) NOT NULL,
+  `channel_id` varchar(32) NOT NULL,
+  `started_at_ms` bigint unsigned DEFAULT NULL,
+  `due_at_ms` bigint unsigned DEFAULT NULL,
+  `status` enum('waiting','escalated','resolved') NOT NULL DEFAULT 'waiting',
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  PRIMARY KEY (`message_id`,`channel_id`),
+  KEY `idx_scout_correction_due` (`channel_id`,`status`,`due_at_ms`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

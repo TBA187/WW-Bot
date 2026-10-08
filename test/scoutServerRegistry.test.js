@@ -29,21 +29,6 @@ function registryFixture() {
     return { registry, calls };
 }
 
-test('completed screenshot reinspection logs identify their archive', async t => {
-    const messages = [];
-    t.mock.method(console, 'log', message => messages.push(message));
-    for (const server of ['gold', 'silver']) {
-        const ingestor = new PvpScoutIngestor({ server,
-            store: { savedResultCardsToReinspect: async () => [] }, ocr: {},
-            feedback: { stop: async () => {} } });
-        await ingestor.reinspectLegacyResultCards();
-        await ingestor.stop();
-        await ingestor.reinspectLegacyResultCards();
-    }
-    assert.deepEqual(messages, ['Gold', 'Silver'].map(label =>
-        `[WW LOG] ${label} PvP saved-result-card reinspection COMPLETE: no archived screenshots need rereading.`));
-});
-
 test('bot-posted member submissions retain their server in edit-review snapshots', async t => {
     for (const server of ['gold', 'silver']) {
         const ingestor = new PvpScoutIngestor({ server, channelId: `${server}-channel`,
