@@ -1,5 +1,6 @@
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 const { announceEventWinner } = require('./utils/pvpEvent.js');
+const { setInteractionContext, interactionErrorCode } = require('../../utils/interactionDiagnostics.js');
 // ----------------------
 // /pvp_crown
 // ----------------------
@@ -8,10 +9,8 @@ const {
     formatNowMinute,
     getLogChannel,
     refreshGuildMembers,
-    replyMissingMemberOption,
-    requireAnyRole,
-    requirePvpChannel,
-    stopIfOnCooldown
+    memberHasAnyRole,
+    requirePvpChannel
 } = require('./utils/pvpHelper.js');
 
 class PvpCrownKing {
@@ -43,15 +42,17 @@ class PvpCrownKing {
     }
 
     async execute(interaction) {
-        if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
+        setInteractionContext(interaction, { server: this.pvpServerName, phase: 'validation', crownSaved: false });
 
         // Check if user has Officer Role
-        if (!await requirePvpChannel(interaction, this.pvpKingChannelID, 'pvp_crown')) return;
-
+        if (interaction.channelId !== this.pvpKingChannelID) {
+            return requirePvpChannel(interaction, this.pvpKingChannelID, 'pvp_crown');
+        }
         const { guild } = interaction;
-        const logChannel = getLogChannel(guild, this.logChannelID);
         const allowedRoles = [this.leaderRoleID, this.adminRoleID, this.officerRoleID, this.pvpWarriorRoleID];
-        if (!await requireAnyRole(interaction, allowedRoles)) return;
+        if (!memberHasAnyRole(interaction.member, allowedRoles)) {
+            return interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
+        }
 
         // Crown has slightly different rules than the normal "find one king" helper:
         // no current king is allowed, but multiple current kings must be fixed manually.
@@ -60,10 +61,19 @@ class PvpCrownKing {
             return interaction.reply({ content: '### ❌  PvP King role not found! Needs to be fixed manually!', flags: MessageFlags.Ephemeral });
         }
 
-        const newKing = await replyMissingMemberOption(interaction);
-        if (!newKing) return;
+        const newKing = interaction.options.getMember('user');
+        if (!newKing) {
+            return interaction.reply({ content: '### ❌  User not found.', flags: MessageFlags.Ephemeral });
+        }
+        setInteractionContext(interaction, { targetId: newKing.id });
+        if (this.onCooldown?.(interaction.user.id, 'crown', 2)) {
+            return interaction.reply({ content: '### ⏳ Slow down!', flags: MessageFlags.Ephemeral });
+        }
 
+        setInteractionContext(interaction, { phase: 'acknowledging crown' });
         await interaction.deferReply();
+        const logChannel = getLogChannel(guild, this.logChannelID);
+        setInteractionContext(interaction, { phase: 'checking King roles' });
         await refreshGuildMembers(interaction.guild, '/pvp_crown');
 
         const kings = kingRole.members;
@@ -84,11 +94,28 @@ class PvpCrownKing {
             });
         }
 
+        let crownSaved = false;
+        const failedUpdates = [];
+        const discordStep = async (label, work) => {
+            setInteractionContext(interaction, { phase: label });
+            try {
+                return await work();
+            } catch (error) {
+                failedUpdates.push(label);
+                // REST errors contain credentials and request bodies; log only safe identifiers.
+                console.warn(`[WW LOG] PvP ${label} failed; the crown is saved:`, {
+                    interactionId: interaction.id, code: interactionErrorCode(error)
+                });
+                return null;
+            }
+        };
         try {
             // IF New King Crowned, OR Current King defends their crown
             const oldKing = kings.first();
             const isDefense = oldKing && oldKing.id === newKing.id;
 
+            // A rejected storage call can have an uncertain commit outcome.
+            setInteractionContext(interaction, { phase: 'saving crown', crownSaved: undefined });
             const crownResult = await this.db.recordCrownEvent({
                 newKingId: newKing.id,
                 newKingName: newKing.displayName,
@@ -96,21 +123,20 @@ class PvpCrownKing {
                 oldKingName: oldKing?.displayName,
                 isDefense
             });
+            crownSaved = true;
+            setInteractionContext(interaction, { crownSaved: true });
 
             // Discord changes happen only after storage succeeds.
             if (!isDefense) {
-                if (oldKing) {
-                    // Remove old king, if role exists
-                    await oldKing.roles.remove(this.pvpKingRoleID).catch(console.error);
-
-                }
-
-                // Add role to new king
-                await newKing.roles.add(this.pvpKingRoleID).catch(console.error);
+                await discordStep('King role updates', async () => {
+                    // Preserve the old King if assigning the new King's role fails.
+                    await newKing.roles.add(this.pvpKingRoleID);
+                    if (oldKing) await oldKing.roles.remove(this.pvpKingRoleID);
+                });
 
                 // Add secondary role ONCE to all first-time PvP Kings
                 if (!newKing.roles.cache.has(this.pvpWarriorRoleID)) {
-                    await newKing.roles.add(this.pvpWarriorRoleID).catch(console.error);
+                    await discordStep('Warrior role update', () => newKing.roles.add(this.pvpWarriorRoleID));
                 }
 
                 const usersToNotify = (crownResult.usersToNotify ?? []).map(row => `<@${row.challenger_id}>`);
@@ -134,16 +160,14 @@ class PvpCrownKing {
                             .setFooter({ text: `WW PvP King System • ${this.pvpServerName}`, iconURL: 'attachment://ww_logo.png' })
                             .setTimestamp();
 
-                        await pvpKingChannel.send({
+                        await discordStep('cooldown notification', () => pvpKingChannel.send({
                             content: usersToNotify.join(' '),
                             embeds: [pvpKingCdEmbed],
                             files: [logoFile]
-                        });
+                        }));
                     }
                 }
             }
-
-            //currentKingId = newKing.id;
 
             // Get current King's Win Streak
             const stats = crownResult.stats;
@@ -172,17 +196,13 @@ class PvpCrownKing {
                     { name: 'New King', value: `👑\u2002 <@${newKing.id}>\u2002👑`, inline: true });
             }
 
-            const crownMessage = await interaction.followUp({
+            const crownMessage = await discordStep('public crown response', () => interaction.editReply({
                 embeds: [crownEmbed],
                 files: [attachment]
-            });
+            }));
 
             // Event announcements cannot roll back an already saved crown.
-            try {
-                await announceEventWinner(this.eventConfig, interaction, newKing);
-            } catch (err) {
-                console.warn('[WW LOG] PvP event announcement failed; the crown is saved:', err);
-            }
+            await discordStep('event announcement', () => announceEventWinner(this.eventConfig, interaction, newKing));
 
             // Log Event to Log Channel
             if (logChannel) {
@@ -192,7 +212,8 @@ class PvpCrownKing {
                         `- Server: **${this.pvpServerName}** ${this.pvpServerEmoji}\n` +
                         `- Event Type: **${isDefense ? 'Defense 🛡️' : 'Crown 👑'}**\n` +
                         `- Target Member: <@${newKing.id}>\n` +
-                        `### [🔗 Jump to ${isDefense ? 'Defense Message 🛡️' : 'Crown Message 👑'}](${crownMessage.url})`
+                        (crownMessage?.url ? `### [🔗 Jump to ${isDefense ? 'Defense Message 🛡️' : 'Crown Message 👑'}](${crownMessage.url})`
+                            : '- Public response could not be published; the result is saved.')
                     )
                     .setColor(isDefense ? 0x9b59b6 : this.pvpServerColor)
                     .setThumbnail(newKing.displayAvatarURL())
@@ -206,16 +227,18 @@ class PvpCrownKing {
                     );
                 }
 
-                await logChannel.send({
+                await discordStep('crown audit log', () => logChannel.send({
                     embeds: [crownEmbedLog],
                     files: [attachment]
-                });
+                }));
             }
 
             // Log to History Thread
-            try {
+            await discordStep('history thread entry', async () => {
                 const historyThread = await interaction.guild.channels.fetch(this.historyThreadID);
-                if (!(historyThread instanceof ThreadChannel)) return;
+                if (!(historyThread instanceof ThreadChannel)) {
+                    throw Object.assign(new Error('PvP history thread is unavailable.'), { code: 'PVP_HISTORY_UNAVAILABLE' });
+                }
 
                 const crownEmbedEntry = new EmbedBuilder()
                     .setDescription(`### 👑\u2002<@${newKing.id}> ${isDefense ? 'defended' : 'conquered'} the PvP Throne in ${this.pvpServerName}!\u2002${isDefense ? '🛡️' : '⚔️'}`)
@@ -232,14 +255,21 @@ class PvpCrownKing {
                     embeds: [crownEmbedEntry],
                     files: [attachment]
                 });
-            } catch (e) {
-                console.error(e);
+            });
+            if (failedUpdates.length) {
+                await discordStep('saved-result warning', () => interaction.editReply({
+                    content: `### ⚠️ The PvP result is saved, but some Discord updates failed (${failedUpdates.join(', ')}).\n`
+                        + 'Do not run `/pvp_crown` again for this battle. Officers should check the King roles and `/pvp_history`.'
+                }));
             }
+            setInteractionContext(interaction, { phase: failedUpdates.length ? 'saved with Discord update failures' : 'complete' });
         } catch (err) {
-            console.error(err);
-            const message = err.code === 'PVP_DATABASE_UNAVAILABLE'
-                ? '### ⚠️ Database is currently unavailable. Please try again later.'
-                : '### ⚠️ Database error during Crowning. No PvP King changes were applied.';
+            console.error(`[WW LOG] PvP crown failed; ${crownSaved ? 'the crown is saved' : 'save status is uncertain'}:`, {
+                interactionId: interaction.id, code: interactionErrorCode(err)
+            });
+            const message = crownSaved
+                ? '### ⚠️ The PvP result is saved, but Discord updates were incomplete. Do not run `/pvp_crown` again for this battle. Officers should check the King roles and `/pvp_history`.'
+                : '### ⚠️ Could not confirm that the PvP result was saved. Check `/pvp_history` before retrying.';
             if (interaction.replied || interaction.deferred) {
                 return interaction.editReply({ content: message });
             }

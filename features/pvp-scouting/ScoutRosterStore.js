@@ -25,11 +25,18 @@ function profileFor(member) {
     };
 }
 
-function profileChanged(row, profile) {
-    return row.username !== profile.username
-        || (row.server_nickname || null) !== profile.nickname
-        || (row.server_nickname_normalized || null) !== (profile.nicknameNormalized || null)
-        || (row.global_name || null) !== profile.globalName;
+function profileChanges(row, profile, includeGlobalName = true) {
+    if (!row) return [];
+    const fields = [
+        ['username', row.username, profile.username],
+        ['server nickname', row.server_nickname || null, profile.nickname],
+        ['nickname lookup key', row.server_nickname_normalized || null, profile.nicknameNormalized || null]
+    ];
+    // Friendly-list rows do not store global names. Comparing an absent column
+    // with Discord's global name would falsely refresh them on every startup.
+    if (includeGlobalName) fields.push(['global display name', row.global_name || null, profile.globalName]);
+    return fields.filter(([, before, after]) => before !== after)
+        .map(([field, before, after]) => ({ field, before: before ?? null, after }));
 }
 
 function ignAliases(value) {
@@ -89,7 +96,7 @@ class ScoutRosterStore {
     }
 
     async seedCurrentGuildMembers(guild, roleId) {
-        if (!guild?.id || !roleId) return { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: false };
+        if (!guild?.id || !roleId) return { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: false, profileUpdates: [] };
         const guildId = String(guild.id);
         if (this.seedPromises.has(guildId)) return this.seedPromises.get(guildId);
         const task = (async () => {
@@ -103,7 +110,7 @@ class ScoutRosterStore {
                 [guildId]
             );
             const [friends] = await this.db.query(
-                'SELECT discord_id, username, server_nickname, server_nickname_normalized FROM pvp_scout_friendly_list WHERE guild_id = ? AND discord_id IS NOT NULL',
+                'SELECT discord_id, ign, username, server_nickname, server_nickname_normalized FROM pvp_scout_friendly_list WHERE guild_id = ? AND discord_id IS NOT NULL',
                 [guildId]
             );
             const savedMembers = new Map(rows.map(row => [String(row.discord_id), row]));
@@ -114,13 +121,18 @@ class ScoutRosterStore {
                 profiles.push(row);
                 savedFriends.set(id, profiles);
             }
-            const result = { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded };
+            const result = { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded, profileUpdates: [] };
             for (const member of members.values()) {
                 const profile = profileFor(member);
                 const row = savedMembers.get(profile.discordId);
                 const current = member.roles.cache.has(String(roleId));
-                const changedProfile = Boolean(row && profileChanged(row, profile))
-                    || (savedFriends.get(profile.discordId) || []).some(friend => profileChanged(friend, profile));
+                const changes = [];
+                const memberChanges = profileChanges(row, profile);
+                if (memberChanges.length) changes.push({ list: 'member list', fields: memberChanges });
+                for (const friend of savedFriends.get(profile.discordId) || []) {
+                    const fields = profileChanges(friend, profile, false);
+                    if (fields.length) changes.push({ list: 'friendly list', ign: friend.ign, fields });
+                }
                 if (current && (!row || row.status !== 'current')) {
                     await this.saveMember(member, guildId, 'current');
                     if (row) result.restored++;
@@ -128,10 +140,13 @@ class ScoutRosterStore {
                 } else if (!current && row?.status === 'current') {
                     await this.saveMember(member, guildId, 'former');
                     result.former++;
-                } else if (changedProfile) {
+                } else if (changes.length) {
                     await this.updateMemberProfile(member, guildId);
                 }
-                if (changedProfile) result.updated++;
+                if (changes.length) {
+                    result.updated++;
+                    result.profileUpdates.push({ discordId: profile.discordId, username: profile.username, changes });
+                }
             }
             for (const row of rows) {
                 if (row.status !== 'current' || members.has(String(row.discord_id))) continue;

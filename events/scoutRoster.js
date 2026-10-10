@@ -25,10 +25,20 @@ module.exports = {
                     result.added && `${result.added} added`,
                     result.restored && `${result.restored} restored`,
                     result.former && `${result.former} marked former`,
-                    result.updated && `${result.updated} profile(s) updated`
+                    result.updated && `${result.updated} saved profile(s) refreshed`
                 ].filter(Boolean);
                 if (changes.length) {
-                    console.log(`[WW LOG] Scout member list ${result.alreadySeeded ? 'reconciled' : 'initialized'}; ${changes.join(', ')}.`);
+                    console.log(`[WW LOG] Scout startup: ${result.alreadySeeded ? 'reconciled' : 'initialized'} MySQL member/friendly lists from Discord (guild ${guildId}); ${changes.join(', ')}. Local data files are not used for this check.`);
+                    for (const update of result.profileUpdates || []) {
+                        const details = update.changes.map(change => {
+                            const list = change.list === 'friendly list'
+                                ? `friendly list (IGN ${JSON.stringify(change.ign)})` : change.list;
+                            const fields = change.fields.map(({ field, before, after }) =>
+                                `${field} ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+                            return `${list}: ${fields.join(', ')}`;
+                        });
+                        console.log(`[WW LOG] Scout profile saved to MySQL for ${JSON.stringify(update.username)} (Discord ID ${update.discordId}): ${details.join('; ')}.`);
+                    }
                 }
             } catch (error) {
                 if (stopped()) return;

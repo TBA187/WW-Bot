@@ -81,8 +81,20 @@ test('startup catches offline role changes and profiles while retaining historic
             member('ordinary', 'Visitor'), member('friend-only', 'NewFriend')]
     });
     f.store.memberNamesCache = { stale: true };
-    assert.deepEqual(await f.store.seedCurrentGuildMembers(f.guild, 'member-role'),
+    const { profileUpdates, ...counts } = await f.store.seedCurrentGuildMembers(f.guild, 'member-role');
+    assert.deepEqual(counts,
         { added: 1, restored: 1, former: 2, updated: 3, alreadySeeded: true });
+    assert.deepEqual(profileUpdates.map(update => update.discordId), ['former-profile', 'profile', 'friend-only']);
+    assert.deepEqual(profileUpdates[1].changes, [
+        { list: 'member list', fields: [
+            { field: 'server nickname', before: 'OldCurrent', after: 'NewCurrent' },
+            { field: 'nickname lookup key', before: 'oldcurrent', after: 'newcurrent' }
+        ] },
+        { list: 'friendly list', ign: 'FriendlyIgn', fields: [
+            { field: 'server nickname', before: 'OldCurrent', after: 'NewCurrent' },
+            { field: 'nickname lookup key', before: 'oldcurrent', after: 'newcurrent' }
+        ] }
+    ]);
     assert.equal(f.state.fetches, 1);
     assert.equal(f.state.rows.get('role-lost').status, 'former');
     assert.equal(f.state.rows.get('left').status, 'former');
@@ -109,7 +121,7 @@ test('unchanged seeded startup still fetches members and performs no writes', as
     const cached = { unchanged: true };
     f.store.memberNamesCache = cached;
     assert.deepEqual(await f.store.seedCurrentGuildMembers(f.guild, 'member-role'),
-        { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: true });
+        { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: true, profileUpdates: [] });
     assert.equal(f.state.fetches, 1);
     assert.deepEqual(f.state.writes, []);
     assert.equal(f.store.memberNamesCache, cached);
@@ -119,12 +131,12 @@ test('first initialization writes the seed once and later startups reconcile', a
     const f = fixture({ seeded: false,
         members: [member('holder', 'Holder', true), member('visitor', 'Visitor')] });
     assert.deepEqual(await f.store.seedCurrentGuildMembers(f.guild, 'member-role'),
-        { added: 1, restored: 0, former: 0, updated: 0, alreadySeeded: false });
+        { added: 1, restored: 0, former: 0, updated: 0, alreadySeeded: false, profileUpdates: [] });
     assert.equal(f.state.rows.size, 1);
     assert.equal(f.state.seeded, true);
     f.state.writes.length = 0;
     assert.deepEqual(await f.store.seedCurrentGuildMembers(f.guild, 'member-role'),
-        { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: true });
+        { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: true, profileUpdates: [] });
     assert.equal(f.state.fetches, 2);
     assert.deepEqual(f.state.writes, []);
 });
@@ -139,6 +151,86 @@ test('failed full-member fetch propagates without changing membership and allows
     assert.equal(f.store.seedPromises.size, 0);
     f.guild.members.fetch = originalFetch;
     assert.equal((await f.store.seedCurrentGuildMembers(f.guild, 'member-role')).former, 0);
+});
+
+for (const memberListed of [true, false]) {
+    test(`a linked friend with a global name stays unchanged across startups (${memberListed ? 'also a member' : 'friend only'})`, async () => {
+        const live = member('linked', 'Same', memberListed);
+        live.user.globalName = 'Discord Display Name';
+        const f = fixture({
+            rows: memberListed ? [{ ...saved('linked', 'Same'), global_name: live.user.globalName }] : [],
+            friends: [{ ...saved('linked', 'Same'), ign: 'ManualIgn' }], members: [live]
+        });
+        const cached = { unchanged: true };
+        f.store.memberNamesCache = cached;
+        for (let startup = 0; startup < 2; startup++) {
+            assert.deepEqual(await f.store.seedCurrentGuildMembers(f.guild, 'member-role'),
+                { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: true, profileUpdates: [] });
+        }
+        assert.deepEqual(f.state.writes, []);
+        assert.equal(f.state.friends[0].ign, 'ManualIgn');
+        assert.equal(f.store.memberNamesCache, cached);
+        assert.equal(f.store.friendlyIgnRevision, 0);
+    });
+}
+
+test('actual global display-name changes are saved once and reported only for the member list', async () => {
+    const live = member('linked', 'Same', true);
+    live.user.globalName = 'New display name';
+    const f = fixture({
+        rows: [{ ...saved('linked', 'Same'), global_name: 'Old display name' }],
+        friends: [{ ...saved('linked', 'Same'), ign: 'ManualIgn' }], members: [live]
+    });
+    const result = await f.store.seedCurrentGuildMembers(f.guild, 'member-role');
+    assert.equal(result.updated, 1);
+    assert.deepEqual(result.profileUpdates, [{ discordId: 'linked', username: 'user-linked', changes: [
+        { list: 'member list', fields: [{ field: 'global display name', before: 'Old display name', after: 'New display name' }] }
+    ] }]);
+    assert.equal(f.state.rows.get('linked').global_name, 'New display name');
+    assert.equal(f.state.friends[0].ign, 'ManualIgn');
+    f.state.writes.length = 0;
+    assert.equal((await f.store.seedCurrentGuildMembers(f.guild, 'member-role')).updated, 0);
+    assert.deepEqual(f.state.writes, []);
+});
+
+test('stale linked friends are counted once per member and identify each affected IGN and field', async () => {
+    const live = member('linked', 'Same', true);
+    live.user.globalName = 'Display name';
+    const f = fixture({
+        rows: [{ ...saved('linked', 'Same'), global_name: live.user.globalName }],
+        friends: [{ ...saved('linked', 'Same'), username: 'old-username', ign: 'FirstIgn' },
+            { ...saved('linked', 'OldNick'), ign: 'SecondIgn' }], members: [live]
+    });
+    const result = await f.store.seedCurrentGuildMembers(f.guild, 'member-role');
+    assert.equal(result.updated, 1);
+    assert.deepEqual(result.profileUpdates, [{ discordId: 'linked', username: 'user-linked', changes: [
+        { list: 'friendly list', ign: 'FirstIgn', fields: [{ field: 'username', before: 'old-username', after: 'user-linked' }] },
+        { list: 'friendly list', ign: 'SecondIgn', fields: [
+            { field: 'server nickname', before: 'OldNick', after: 'Same' },
+            { field: 'nickname lookup key', before: 'oldnick', after: 'same' }
+        ] }
+    ] }]);
+    assert.deepEqual(f.state.friends.map(row => row.ign), ['FirstIgn', 'SecondIgn']);
+    f.state.writes.length = 0;
+    assert.equal((await f.store.seedCurrentGuildMembers(f.guild, 'member-role')).updated, 0);
+    assert.deepEqual(f.state.writes, []);
+});
+
+test('removed nickname and display name are saved and recorded as null', async () => {
+    const f = fixture({
+        rows: [{ ...saved('linked', 'OldNick'), global_name: 'Old display name' }],
+        members: [member('linked', null, true)]
+    });
+    const result = await f.store.seedCurrentGuildMembers(f.guild, 'member-role');
+    assert.equal(result.updated, 1);
+    assert.deepEqual(result.profileUpdates[0].changes[0].fields, [
+        { field: 'server nickname', before: 'OldNick', after: null },
+        { field: 'nickname lookup key', before: 'oldnick', after: null },
+        { field: 'global display name', before: 'Old display name', after: null }
+    ]);
+    assert.equal(f.state.rows.get('linked').server_nickname, null);
+    assert.equal(f.state.rows.get('linked').global_name, null);
+    assert.equal(f.state.rows.get('linked').status, 'current');
 });
 
 for (const [label, profile, expected] of [
@@ -184,8 +276,29 @@ test('startup logs meaningful reconciliation changes and stays quiet when unchan
         assert.deepEqual(logs, []);
         result = { added: 1, restored: 2, former: 3, updated: 4, alreadySeeded: true };
         await handlers.get('ready')();
-        assert.deepEqual(logs, ['[WW LOG] Scout member list reconciled; 1 added, 2 restored, 3 marked former, 4 profile(s) updated.']);
+        assert.deepEqual(logs, ['[WW LOG] Scout startup: reconciled MySQL member/friendly lists from Discord (guild guild); 1 added, 2 restored, 3 marked former, 4 saved profile(s) refreshed. Local data files are not used for this check.']);
     } finally {
         console.log = originalLog;
     }
+});
+
+test('startup logs the MySQL source, member ID and saved old/new values, then stays quiet on the next startup', async t => {
+    const live = member('linked', 'Same', true);
+    live.user.globalName = 'New display name\nwith a newline';
+    const f = fixture({ rows: [{ ...saved('linked', 'Same'), global_name: 'Old display name' }],
+        friends: [{ ...saved('linked', 'Same'), username: 'old-user', ign: 'ManualIgn' }], members: [live] });
+    const handlers = new Map();
+    const client = { guilds: { cache: new Map([['guild', f.guild]]) },
+        once(event, callback) { handlers.set('ready', callback); }, on() {} };
+    rosterEvent.register(client, { guildId: 'guild', guildMemberRoleID: 'member-role', scoutRosterStore: f.store });
+    const logs = [];
+    t.mock.method(console, 'log', value => logs.push(value));
+    await handlers.get('ready')();
+    assert.deepEqual(logs, [
+        '[WW LOG] Scout startup: reconciled MySQL member/friendly lists from Discord (guild guild); 1 saved profile(s) refreshed. Local data files are not used for this check.',
+        '[WW LOG] Scout profile saved to MySQL for "user-linked" (Discord ID linked): member list: global display name "Old display name" -> "New display name\\nwith a newline"; friendly list (IGN "ManualIgn"): username "old-user" -> "user-linked".'
+    ]);
+    logs.length = 0;
+    await handlers.get('ready')();
+    assert.deepEqual(logs, []);
 });

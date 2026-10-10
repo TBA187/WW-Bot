@@ -56,6 +56,7 @@ test('actual index startup cannot restore stores, register commands, login or st
         './db/db-conn.js': db,
         './utils/abortable.js': abortHelpers,
         './utils/discordDiagnostics.js': require('../utils/discordDiagnostics.js'),
+        './utils/interactionDiagnostics.js': require('../utils/interactionDiagnostics.js'),
         './commands/pvp-king/utils/pvpKingStorage.js': FakeStore,
         './events/giveaways.js': { createGiveawayStore: () => new FakeStore() },
         './features/pro-notifications/NotificationStore.js': FakeStore,

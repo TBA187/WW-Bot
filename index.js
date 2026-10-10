@@ -19,7 +19,8 @@ const { ScoutServerRegistry } = require('./features/pvp-scouting/ScoutServerRegi
 const { ScoutRosterStore } = require('./features/pvp-scouting/ScoutRosterStore.js');
 const { ScoutServerSettings } = require('./features/pvp-scouting/ScoutServerSettings.js');
 const { ScoutAuditLogger } = require('./features/pvp-scouting/ScoutAuditLogger.js');
-const { DiscordDiagnosticLogger } = require('./utils/discordDiagnostics.js');
+const { DiscordDiagnosticLogger, redactDiagnostic } = require('./utils/discordDiagnostics.js');
+const { InteractionDiagnostics } = require('./utils/interactionDiagnostics.js');
 const { writeJsonIfChanged } = require('./utils/jsonFile.js');
 const { XpStore } = require('./utils/xpStore.js');
 const { configureXpRecovery } = require('./utils/xpEngine.js');
@@ -330,6 +331,7 @@ const botDiagnostics = new DiscordDiagnosticLogger({ consoleObject: console,
     send: event => scoutAuditLogger.diagnostic(event),
     secrets: Object.entries(process.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|API_KEY/iu.test(key)).map(([, value]) => value) });
 botDiagnostics.install();
+const interactionDiagnostics = new InteractionDiagnostics({ rest: client.rest });
 const scoutServers = new ScoutServerRegistry({ client, db, config: appConfig,
     rosterStore: scoutRosterStore, auditLogger: scoutAuditLogger, diagnostics: botDiagnostics,
     dataPath: path.join(__dirname, 'data') });
@@ -636,6 +638,7 @@ async function shutdown(signal, exitCode = 0) {
         guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop(), xpCleanup
     ]);
     botDiagnostics.stop();
+    interactionDiagnostics.stop();
     client.destroy();
     await abortable(scoutAuditLogger.flush(), { timeoutMs: 2000, timeoutCode: 'SCOUT_LOG_SHUTDOWN_TIMEOUT' }).catch(() => {});
     await abortable(cleanup, { timeoutMs: 3000, timeoutCode: 'SHUTDOWN_CLEANUP_TIMEOUT' }).catch(() => {});
@@ -738,7 +741,7 @@ client.on('guildCreate', async (guild) => {
 // Discord Interactions
 client.on('interactionCreate', async interaction => {
     if (lifecycle.stopping) return;
-    const receivedAge = Math.max(0, Date.now() - (interaction.createdTimestamp || Date.now()));
+    interactionDiagnostics.track(interaction);
     try {
         // Autocomplete Handling
         if (interaction.isAutocomplete()) {
@@ -859,19 +862,18 @@ client.on('interactionCreate', async interaction => {
     } catch (err) {
         const interactionErrorCode = Number(err?.code || err?.rawError?.code);
         if (interactionErrorCode === 10062 || interactionErrorCode === 40060) {
-            const age = Date.now() - interaction.createdTimestamp;
-            const reason = interactionErrorCode === 10062 ? 'expired before acknowledgement' : 'was already acknowledged';
-            console.warn(`[WW LOG] Discord interaction ${reason}: ${interaction.customId || interaction.commandName || 'unknown'} (id ${interaction.id}, ${receivedAge} ms old on arrival, ${age} ms old after the API request).`);
+            const reason = interactionDiagnostics.errorReason(interaction, interactionErrorCode);
+            console.warn(interactionDiagnostics.describe(interaction, reason));
             return;
         }
         // Discord REST error objects contain the full interaction URL and token.
         // Keep diagnostics without printing that token into console logs.
-        console.error('Interaction error:', {
+        console.error(interactionDiagnostics.describe(interaction, 'failed'), {
             command: interaction.customId || interaction.commandName || 'unknown',
             interactionId: interaction.id,
             code: err?.code || err?.rawError?.code || null,
-            message: err?.message || String(err),
-            stack: err?.stack || null
+            message: redactDiagnostic(err?.message || String(err), botDiagnostics.secrets),
+            stack: err?.stack ? redactDiagnostic(err.stack, botDiagnostics.secrets) : null
         });
         // Autocomplete interactions don't have reply/editReply methods
         if (interaction.isAutocomplete()) {
@@ -879,7 +881,7 @@ client.on('interactionCreate', async interaction => {
         }
         if (interaction.deferred || interaction.replied) {
             interaction.editReply({ content: '⚠️ Something went wrong!' }).catch(() => { });
-        } else {
+        } else if (interactionDiagnostics.canAcknowledge(interaction)) {
             interaction.reply({ content: '⚠️ Something went wrong!', flags: MessageFlags.Ephemeral }).catch(() => { });
         }
     }

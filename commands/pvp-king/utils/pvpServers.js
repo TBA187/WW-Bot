@@ -73,8 +73,10 @@ function wrapPvpServerCommand(Command) {
         }
 
         async execute(interaction) {
-            const command = await this.commandFor(interaction);
-            if (command) return command.execute(interaction);
+            // Route valid commands synchronously so they can acknowledge in the same turn.
+            const command = this.commands.get(interaction.channelId);
+            if (command && this.channelIds.includes(interaction.channelId)) return command.execute(interaction);
+            await requirePvpChannel(interaction, this.channelIds, this.name);
         }
     };
 }

@@ -238,6 +238,135 @@ test('Silver crown and delayed reverse update only Silver role, stats, and histo
     assert.equal((await f.stores.silver.latestHistory()).king_id, 'silver-king');
 });
 
+test('crown starts acknowledgement synchronously and waits for acceptance before fetching members or saving', async t => {
+    const f = fixture(t); await seed(f);
+    const i = f.interaction('silver');
+    let acknowledged = false, accept;
+    const gate = new Promise(resolve => { accept = resolve; });
+    i.deferReply = () => { acknowledged = true; return gate.then(() => { i.deferred = true; }); };
+    const fetch = t.mock.method(i.guild.members, 'fetch');
+    const write = t.mock.method(f.stores.silver, 'recordCrownEvent');
+    const pending = load('pvp_crown', f.config).execute(i);
+    assert.equal(acknowledged, true, 'initial request starts before execute returns its promise');
+    assert.equal(fetch.mock.calls.length, 0);
+    assert.equal(write.mock.calls.length, 0);
+    accept(); await pending;
+    assert.equal(fetch.mock.calls.length, 1);
+    assert.equal(write.mock.calls.length, 1);
+    assert.match(body(i), /conquered/u);
+});
+
+test('an expired crown acknowledgement leaves both stores, roles, cooldowns and messages untouched', async t => {
+    const f = fixture(t); await seed(f);
+    const before = Object.fromEntries(Object.entries(f.stores).map(([server, store]) => [server, store.serializeState()]));
+    const i = f.interaction('silver');
+    i.deferReply = async () => { throw Object.assign(new Error('Unknown interaction'), { code: 10062 }); };
+    const fetch = t.mock.method(i.guild.members, 'fetch');
+    await assert.rejects(load('pvp_crown', f.config).execute(i), error => error.code === 10062);
+    assert.equal(fetch.mock.calls.length, 0);
+    for (const [server, store] of Object.entries(f.stores)) assert.deepEqual(store.serializeState(), before[server]);
+    assert.equal(f.roles.get(f.config.pvpKingSilverRoleID).members.first().id, 'silver-king');
+    assert.equal(f.members.get('target').roles.cache.has(f.config.pvpKingSilverRoleID), false);
+    assert.deepEqual(i.responses, []);
+    assert.ok([...f.sent.values()].every(messages => messages.length === 0));
+});
+
+test('unauthorized and incomplete crowns give private responses without deferring or consuming the crown cooldown', async t => {
+    const f = fixture(t); await seed(f);
+    const cooldown = t.mock.method(f.config, 'onCooldown', () => false);
+    const command = load('pvp_crown', f.config);
+    const denied = f.interaction('silver', 'target');
+    const deniedDefer = t.mock.method(denied, 'deferReply');
+    await command.execute(denied);
+    assert.equal(deniedDefer.mock.calls.length, 0);
+    assert.match(body(denied), /No permission/u);
+    assert.equal(denied.responses[0].flags, MessageFlags.Ephemeral);
+    const missing = f.interaction('silver');
+    missing.options.getMember = () => null;
+    await command.execute(missing);
+    assert.match(body(missing), /User not found/u);
+    assert.equal(missing.deferred, undefined);
+    assert.equal(missing.responses[0].flags, MessageFlags.Ephemeral);
+    assert.equal(cooldown.mock.calls.length, 0);
+});
+
+test('a crown storage failure reports uncertainty without changing roles or publishing a victory', async t => {
+    const f = fixture(t); await seed(f);
+    const before = f.stores.silver.serializeState();
+    t.mock.method(f.stores.silver, 'recordCrownEvent', async () => {
+        throw Object.assign(new Error('private-database-details'), { code: 'PVP_DATABASE_UNAVAILABLE' });
+    });
+    const errors = t.mock.method(console, 'error', () => {});
+    const i = f.interaction('silver'); await load('pvp_crown', f.config).execute(i);
+    assert.deepEqual(f.stores.silver.serializeState(), before);
+    assert.equal(f.roles.get(f.config.pvpKingSilverRoleID).members.first().id, 'silver-king');
+    assert.match(body(i), /Could not confirm.*saved/u);
+    assert.match(body(i), /Check.*pvp_history.*before retrying/u);
+    assert.doesNotMatch(body(i), /conquered|No PvP King changes were applied/u);
+    assert.ok([...f.sent.values()].every(messages => messages.length === 0));
+    assert.ok(!JSON.stringify(errors.mock.calls).includes('private-database-details'));
+});
+
+test('a failed public crown response still saves the result and publishes event, audit and history entries', async t => {
+    const f = fixture(t); await seed(f);
+    const e = eventFixture(f, 'gold', { targetStreak: 1 });
+    const i = e.interaction(), edit = i.editReply;
+    i.editReply = async payload => {
+        if (payload.embeds) throw Object.assign(new Error('Discord unavailable'), { code: 50027 });
+        return edit(payload);
+    };
+    const warnings = t.mock.method(console, 'warn', () => {});
+    await load('pvp_crown', f.config).execute(i);
+    assert.equal((await f.stores.gold.latestHistory()).king_id, 'target');
+    assert.equal((await f.stores.gold.latestHistory()).total_wins_after, 1);
+    assert.equal(e.messages.length, 1, 'event winner check still runs');
+    assert.equal(f.sent.get('log').length, 1);
+    assert.equal(f.sent.get(f.config.historyThreadID).length, 1);
+    assert.match(body(i), /result is saved/u);
+    assert.match(body(i), /Do not run.*pvp_crown.*again/u);
+    assert.doesNotMatch(body(i), /No PvP King changes were applied/u);
+    assert.equal(warnings.mock.calls.length, 1);
+});
+
+test('a failed crown audit log cannot prevent the history entry or invite a duplicate crown', async t => {
+    const f = fixture(t); await seed(f);
+    f.client.channels.cache.get('log').send = async () => { throw Object.assign(new Error('Missing permissions'), { code: 50013 }); };
+    t.mock.method(console, 'warn', () => {});
+    const i = f.interaction('silver'); await load('pvp_crown', f.config).execute(i);
+    assert.equal((await f.stores.silver.latestHistory()).total_wins_after, 1);
+    assert.equal(f.sent.get(f.config.historySilverThreadID).length, 1);
+    assert.match(body(i), /crown audit log/u);
+    assert.match(body(i), /Do not run.*pvp_crown.*again/u);
+});
+
+test('failure to assign a new King preserves the old King role and reports that the result needs Discord repair', async t => {
+    const f = fixture(t); await seed(f);
+    const target = f.members.get('target'), add = target.roles.add;
+    target.roles.add = async roleId => {
+        if (roleId === f.config.pvpKingSilverRoleID) throw Object.assign(new Error('Missing permissions'), { code: 50013 });
+        return add(roleId);
+    };
+    t.mock.method(console, 'warn', () => {});
+    const i = f.interaction('silver'); await load('pvp_crown', f.config).execute(i);
+    assert.equal(f.roles.get(f.config.pvpKingSilverRoleID).members.first().id, 'silver-king');
+    assert.equal(target.roles.cache.has(f.config.pvpKingSilverRoleID), false);
+    assert.equal((await f.stores.silver.latestHistory()).king_id, 'target');
+    assert.equal(f.sent.get(f.config.historySilverThreadID).length, 1);
+    assert.match(body(i), /King role updates/u);
+    assert.match(body(i), /Officers should check the King roles/u);
+    assert.match(body(i), /Do not run.*pvp_crown.*again/u);
+});
+
+test('a missing history thread reports a saved result that needs repair instead of silently succeeding', async t => {
+    const f = fixture(t); await seed(f);
+    f.client.channels.cache.delete(f.config.historySilverThreadID);
+    t.mock.method(console, 'warn', () => {});
+    const i = f.interaction('silver'); await load('pvp_crown', f.config).execute(i);
+    assert.equal((await f.stores.silver.latestHistory()).king_id, 'target');
+    assert.match(body(i), /history thread entry/u);
+    assert.match(body(i), /result is saved/u);
+});
+
 test('cooldown notification toggles and expiry pings stay in their own server', async t => {
     const f = fixture(t);
     await seed(f);
