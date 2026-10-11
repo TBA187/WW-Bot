@@ -1,9 +1,9 @@
 // Reads Discord-hosted screenshots in memory and finds result cards before running OCR.
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
 const sharp = require('sharp');
+const { ocrWorkerPoolFor, configureImageMemory } = require('../../utils/runtimeMemoryOcr.js');
+configureImageMemory(sharp);
 const { candidateFromOcr, closeIgnSpelling, nameFromResultLine, normalizeIgn,
     opponentFromBattleBanner } = require('./PvpScoutParser.js');
 
@@ -361,30 +361,8 @@ class PvpScoutOcr {
     constructor(options = {}) {
         this.sharp = options.sharp || sharp;
         this.fetch = options.fetch || globalThis.fetch;
-        this.workerFactory = options.workerFactory || null;
-        this.worker = options.worker || null;
-        this.workerPromise = null;
-        this.cachePath = options.cachePath || path.join(process.cwd(), 'data', 'tesseract-cache');
+        this.workerPool = ocrWorkerPoolFor(options);
         this.maxImageBytes = options.maxImageBytes || MAX_IMAGE_BYTES;
-    }
-
-    async getWorker() {
-        if (this.worker) return this.worker;
-        if (!this.workerPromise) {
-            this.workerPromise = (async () => {
-                if (this.workerFactory) return this.workerFactory();
-                const { createWorker } = require('tesseract.js');
-                fs.mkdirSync(this.cachePath, { recursive: true });
-                return createWorker('eng', 1, { logger: () => {}, cachePath: this.cachePath });
-            })();
-        }
-        try {
-            this.worker = await this.workerPromise;
-            return this.worker;
-        } catch (error) {
-            this.workerPromise = null;
-            throw error;
-        }
     }
 
     async download(url) {
@@ -437,6 +415,10 @@ class PvpScoutOcr {
     }
 
     async analyzeAttachment(attachment, messageId, opponentIgn, context = {}) {
+        return this.workerPool.run(() => this.analyzeAttachmentQueued(attachment, messageId, opponentIgn, context));
+    }
+
+    async analyzeAttachmentQueued(attachment, messageId, opponentIgn, context = {}) {
         const base = {
             attachmentId: String(attachment.id || attachment.name || 'image'),
             name: attachment.name || 'scout-image',
@@ -457,7 +439,6 @@ class PvpScoutOcr {
             const width = metadata.width || 0;
             const height = metadata.height || 0;
             if (!width || !height) throw new Error('Image dimensions could not be read.');
-            const worker = await this.getWorker();
             const cardRect = await detectResultCardFrame(oriented, this.sharp, width, height);
             const readRegion = async (rect = null, { nameStrip = false, threshold = null, zoomTarget = 1200,
                 enhance = false, pixelated = false, pad = false } = {}) => {
@@ -486,7 +467,7 @@ class PvpScoutOcr {
                 });
                 const ocrBuffer = await pipeline.png().toBuffer();
                 // Tesseract.js v7 only includes text by default; blocks hold line positions.
-                const recognized = await worker.recognize(ocrBuffer,
+                const recognized = await this.workerPool.recognize(ocrBuffer,
                     nameStrip ? { tessedit_pageseg_mode: '6',
                         tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.- ' } : {},
                     { text: true, blocks: !nameStrip });
@@ -645,7 +626,7 @@ class PvpScoutOcr {
                 if (!bannerBands.some(band => band.top <= topBand.height * 0.35
                     && band.top + band.height >= topBand.height * 0.45)) bannerBands.unshift(topBand);
                 for (const band of bannerBands) {
-                    const banner = await worker.recognize(await this.sharp(oriented).extract(band).png().toBuffer(),
+                    const banner = await this.workerPool.recognize(await this.sharp(oriented).extract(band).png().toBuffer(),
                         { tessedit_pageseg_mode: '6' });
                     const bannerText = String(banner?.data?.text || '').trim();
                     const bannerResolution = opponentFromBattleBanner(bannerText, context);
@@ -694,10 +675,7 @@ class PvpScoutOcr {
     }
 
     async close() {
-        const worker = this.worker || (this.workerPromise ? await this.workerPromise.catch(() => null) : null);
-        if (worker?.terminate) await worker.terminate();
-        this.worker = null;
-        this.workerPromise = null;
+        await this.workerPool.close();
     }
 }
 

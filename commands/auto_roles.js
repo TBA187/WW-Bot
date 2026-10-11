@@ -109,6 +109,10 @@ class AutoRoles {
             return;
         }
 
+        // Default channels may need a REST fetch. Accept the command before
+        // that request so it cannot consume Discord's initial response window.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
         let targetChannel = interaction.options.getChannel('channel');
         if (targetChannel === null && selectedPanel.defaultChannelId !== null) {
             const fetchedChannel = interaction.client.channels.cache.get(selectedPanel.defaultChannelId)
@@ -120,14 +124,11 @@ class AutoRoles {
         }
 
         if (targetChannel === null) {
-            await interaction.reply({
-                content: 'Please choose a channel, or set `AUTO_ROLES_CHANNEL_ID` inside `events/auto_roles.js` for this panel.',
-                flags: MessageFlags.Ephemeral
+            await interaction.editReply({
+                content: 'Please choose a channel, or set `AUTO_ROLES_CHANNEL_ID` inside `events/auto_roles.js` for this panel.'
             });
             return;
         }
-
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         try {
             const message = await sendAutoRolePanel(targetChannel, selectedPanel);

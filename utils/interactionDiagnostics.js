@@ -55,7 +55,7 @@ class InteractionDiagnostics {
                     return original.apply(interaction, args);
                 }
                 const start = this.clock();
-                const acknowledgement = { method, localDelayMs: Math.max(0, start - state.receivedTick),
+                const acknowledgement = { method, startedTick: start, localDelayMs: Math.max(0, start - state.receivedTick),
                     startAge: state.receivedAge + Math.max(0, start - state.receivedTick),
                     responses: 0, retries: 0, rateLimits: 0, retryAfterMs: 0 };
                 state.acknowledgement = acknowledgement;
@@ -86,10 +86,34 @@ class InteractionDiagnostics {
         }
     }
 
+    recordTransportTiming(event) {
+        const ack = this.active.get(event.interactionId);
+        if (!ack) return;
+        if (event.stage === 'created') {
+            ack.transport = {
+                dispatchDelayMs: ack.transport?.dispatchDelayMs ?? Math.max(0, this.clock() - ack.startedTick),
+                attempts: (ack.transport?.attempts || 0) + 1,
+                createdElapsedMs: Math.max(0, Number(event.elapsedMs) || 0)
+            };
+        }
+        const transport = ack.transport;
+        if (!transport) return;
+        if (event.stage === 'sent') {
+            transport.sentElapsedMs = Math.max(0, Number(event.elapsedMs) || 0);
+            transport.socketWaitMs = Math.max(0, transport.sentElapsedMs - transport.createdElapsedMs);
+            transport.reusedConnection = event.reusedConnection;
+            transport.family = ['IPv4', 'IPv6'].includes(event.family) ? event.family : undefined;
+        } else if (event.stage === 'headers' && transport.socketWaitMs !== undefined) {
+            transport.headersWaitMs = Math.max(0, (Number(event.elapsedMs) || 0) - transport.sentElapsedMs);
+        }
+        if (event.pool) transport.pending = Math.max(0, Number(event.pool.pending) || 0);
+    }
+
     describe(interaction, reason) {
         const state = states.get(interaction);
         const ack = state?.acknowledgement;
         const context = state?.context || {};
+        const transport = ack?.transport;
         const ms = value => Math.round(value || 0);
         const fields = [
             `id ${interaction.id}`, `channel ${interaction.channelId || 'unknown'}`, `caller ${interaction.user?.id || 'unknown'}`,
@@ -99,6 +123,12 @@ class InteractionDiagnostics {
                 `${ms(ack.endAge)} ms old after acknowledgement`, `${ms(ack.eventLoopActiveMs)} ms event loop active while awaiting`,
                 `HTTP ${ack.httpStatus || 'unknown'}`, `${ack.responses} HTTP response(s)`, `${ack.retries} transport/server retry(s)`,
                 `${ack.rateLimits} rate limit(s)`, `${ms(ack.retryAfterMs)} ms requested rate-limit wait`] : []),
+            ...(transport ? [`${ms(transport.dispatchDelayMs)} ms preparing initial HTTP request`,
+                ...(transport.attempts > 1 ? [`socket/response timings from HTTP attempt ${transport.attempts}`] : []),
+                ...(transport.socketWaitMs !== undefined ? [`${ms(transport.socketWaitMs)} ms waiting for HTTP socket`] : ['HTTP request not sent']),
+                ...(transport.headersWaitMs !== undefined ? [`${ms(transport.headersWaitMs)} ms awaiting HTTP headers`] : []),
+                ...(transport.reusedConnection !== undefined ? [`${transport.reusedConnection ? 'reused' : 'new'} ${transport.family || 'HTTP'} connection`] : []),
+                ...(transport.pending !== undefined ? [`${transport.pending} queued callback request(s)`] : [])] : []),
             ...(ack?.errorCode ? [`code ${ack.errorCode}`] : []),
             ...(context.phase ? [`phase ${context.phase}`] : [])
         ];

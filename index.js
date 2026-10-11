@@ -21,6 +21,9 @@ const { ScoutServerSettings } = require('./features/pvp-scouting/ScoutServerSett
 const { ScoutAuditLogger } = require('./features/pvp-scouting/ScoutAuditLogger.js');
 const { DiscordDiagnosticLogger, redactDiagnostic } = require('./utils/discordDiagnostics.js');
 const { InteractionDiagnostics } = require('./utils/interactionDiagnostics.js');
+const { createDiscordTransport } = require('./utils/discordTransport.js');
+const { RuntimeHealth } = require('./utils/runtimeHealth.js');
+const { sharedOcrWorkerPool } = require('./utils/runtimeMemoryOcr.js');
 const { writeJsonIfChanged } = require('./utils/jsonFile.js');
 const { XpStore } = require('./utils/xpStore.js');
 const { configureXpRecovery } = require('./utils/xpEngine.js');
@@ -55,6 +58,10 @@ if (!token || !clientId) {
 }
 
 // Initialize Client
+let interactionDiagnostics;
+const discordTransport = createDiscordTransport({
+    onTiming: event => interactionDiagnostics?.recordTransportTiming(event)
+});
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -66,8 +73,10 @@ const client = new Client({
         GatewayIntentBits.GuildMessageReactions,
         GatewayIntentBits.GuildVoiceStates
     ],
-    partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction]
+    partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction],
+    rest: { makeRequest: discordTransport.makeRequest }
 });
+const runtimeHealth = new RuntimeHealth({ client, ocrSnapshot: () => sharedOcrWorkerPool.snapshot() });
 
 // Map with DB Guild Settings where Key = guild_id, Value = { xp_enabled: false, ... }
 const guildSettingsCache = new Map();
@@ -331,7 +340,7 @@ const botDiagnostics = new DiscordDiagnosticLogger({ consoleObject: console,
     send: event => scoutAuditLogger.diagnostic(event),
     secrets: Object.entries(process.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|API_KEY/iu.test(key)).map(([, value]) => value) });
 botDiagnostics.install();
-const interactionDiagnostics = new InteractionDiagnostics({ rest: client.rest });
+interactionDiagnostics = new InteractionDiagnostics({ rest: client.rest });
 const scoutServers = new ScoutServerRegistry({ client, db, config: appConfig,
     rosterStore: scoutRosterStore, auditLogger: scoutAuditLogger, diagnostics: botDiagnostics,
     dataPath: path.join(__dirname, 'data') });
@@ -625,6 +634,7 @@ async function shutdown(signal, exitCode = 0) {
     if (shutdownStarted) return;
     shutdownStarted = true;
     lifecycle.stop();
+    runtimeHealth.stop();
     console.log(`[WW LOG] ${signal} received. Shutting down cleanly...`);
     // Cancel timers before closing the database and Discord connection.
     client.cooldownNotifier?.stop?.();
@@ -635,7 +645,8 @@ async function shutdown(signal, exitCode = 0) {
     client.giveawayLoop?.stop?.();
     require('./tasks/proNotifications.js').stop?.();
     const cleanup = Promise.allSettled([
-        guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop(), xpCleanup
+        guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop(), xpCleanup,
+        discordTransport.stop()
     ]);
     botDiagnostics.stop();
     interactionDiagnostics.stop();
@@ -657,6 +668,8 @@ client.once(Events.ClientReady, async () => {
     if (lifecycle.stopping) return;
     botDiagnostics.start();
     console.log(`[WW LOG] Logged in as ${client.user.tag}`);
+    runtimeHealth.start();
+    void discordTransport.startWarmup();
 
     // TO-DO: ADD "Lazy Load" - Instead of checking all guilds at startup, check for the guild
     // only when an event happens. If the settings aren't in the cache, fetch/create them then.

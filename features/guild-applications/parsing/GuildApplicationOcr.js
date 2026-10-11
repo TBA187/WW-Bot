@@ -2,8 +2,8 @@
 
 // Uses trainer-card screenshots as a fallback when the forum text does not give us a reliable IGN.
 const sharp = require('sharp');
-const fs = require('fs');
-const path = require('path');
+const { ocrWorkerPoolFor, configureImageMemory } = require('../../../utils/runtimeMemoryOcr.js');
+configureImageMemory(sharp);
 const { MAX_OCR_IMAGES } = require('../constants.js');
 
 function normalizeIdentity(value) {
@@ -50,32 +50,12 @@ function prioritizeImagesFromOcr(imageUrls, ocrOutput) {
 class GuildApplicationOcr {
     constructor(options = {}) {
         this.sharp = options.sharp || sharp;
-        this.workerFactory = options.workerFactory || null;
-        this.worker = options.worker || null;
-        this.workerPromise = null;
-        this.queue = Promise.resolve();
+        this.workerPool = ocrWorkerPoolFor(options);
         this.maxImages = options.maxImages || MAX_OCR_IMAGES;
-        this.cachePath = options.cachePath || path.join(process.cwd(), 'data', 'tesseract-cache');
     }
 
     enqueue(task) {
-        const pending = this.queue.then(task, task);
-        this.queue = pending.catch(() => {});
-        return pending;
-    }
-
-    async getWorker() {
-        if (this.worker) return this.worker;
-        if (!this.workerPromise) {
-            this.workerPromise = (async () => {
-                if (this.workerFactory) return this.workerFactory();
-                const { createWorker } = require('tesseract.js');
-                fs.mkdirSync(this.cachePath, { recursive: true });
-                return createWorker('eng', 1, { logger: () => {}, cachePath: this.cachePath });
-            })();
-        }
-        this.worker = await this.workerPromise;
-        return this.worker;
+        return this.workerPool.run(task);
     }
 
     async preprocessCrop(buffer) {
@@ -108,8 +88,7 @@ class GuildApplicationOcr {
     }
 
     async recognizeBuffer(buffer) {
-        const worker = await this.getWorker();
-        const result = await worker.recognize(buffer);
+        const result = await this.workerPool.recognize(buffer);
         return result?.data?.text || result?.text || '';
     }
 
@@ -166,11 +145,7 @@ class GuildApplicationOcr {
     }
 
     async close() {
-        await this.queue.catch(() => {});
-        const worker = this.worker || (this.workerPromise ? await this.workerPromise.catch(() => null) : null);
-        if (worker?.terminate) await worker.terminate();
-        this.worker = null;
-        this.workerPromise = null;
+        await this.workerPool.close();
     }
 }
 

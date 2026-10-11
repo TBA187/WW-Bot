@@ -10,6 +10,7 @@ const { ScoutMessageFeedback, feedbackOutcome } = require('./ScoutMessageFeedbac
 const { contentHash, scoutVersion } = require('./PvpScoutStore.js');
 
 const HISTORY_PAGE_SIZE = 100;
+const CATCHUP_PROGRESS_INTERVAL_MS = 30_000;
 const FOLLOW_UP_WINDOW_MS = 15 * 60 * 1000;
 const IMMEDIATE_FOLLOW_UP_WINDOW_MS = 2 * 60 * 1000;
 const EDIT_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -204,10 +205,14 @@ class PvpScoutIngestor {
             onPublished: async event => { this.store.auditLogger?.published(event); } });
     }
 
+    get logPrefix() {
+        return `[WW LOG] [PvP Scout] ${this.server === 'silver' ? 'Silver' : 'Gold'}:`;
+    }
+
     enqueue(task) {
         const pending = this.queue.then(task, task);
         this.queue = pending.catch(error => {
-            console.error('[WW LOG] PvP scouting ingestion task failed:', error);
+            console.error(`${this.logPrefix} Ingestion failed:`, error);
         });
         return pending;
     }
@@ -222,35 +227,39 @@ class PvpScoutIngestor {
     async start() {
         if (this.started) return;
         if (!this.channelId) {
-            console.warn(`[WW LOG] ${this.server === 'silver' ? 'Silver' : 'Gold'} PvP scouting is disabled because ${this.server === 'silver' ? 'pvpScoutingSilverChannelID' : 'pvpScoutingGoldChannelID'} is not configured.`);
+            console.warn(`${this.logPrefix} Disabled: ${this.server === 'silver' ? 'pvpScoutingSilverChannelID' : 'pvpScoutingGoldChannelID'} missing.`);
             return;
         }
         this.started = true;
         while (!this.stopped) {
             try {
                 await this.store.ensureSchema();
+                const refreshStartedAt = Date.now();
+                console.log(`${this.logPrefix} Archive refresh started (saved OCR).`);
                 this.store.autocomplete('', this.channelId).catch(error => {
-                    console.warn(`[WW LOG] Could not preload PvP scout autocomplete: ${error.message}`);
+                    console.warn(`${this.logPrefix} Autocomplete preload failed: ${error.message}`);
                 });
-                const updatedRecords = await this.enqueue(async () => {
+                const { updatedRecords, archivedMessages } = await this.enqueue(async () => {
                     const updated = await this.store.refreshAutomaticRecords();
-                    await this.rebuildGroups();
-                    return updated;
+                    const grouped = await this.rebuildGroups();
+                    return { updatedRecords: updated, archivedMessages: grouped };
                 });
                 await this.store.autocomplete('', this.channelId).catch(error => {
-                    console.warn(`[WW LOG] Could not refresh PvP scout autocomplete: ${error.message}`);
+                    console.warn(`${this.logPrefix} Autocomplete refresh failed: ${error.message}`);
                 });
                 if (updatedRecords) {
                     const pending = await this.store.pendingReviewCount();
-                    console.log(`[WW LOG] PvP scout archive refreshed from saved messages: ${updatedRecords} record(s) updated; ${pending} still need review.`);
+                    console.log(`${this.logPrefix} Review queue: ${pending} pending.`);
                 }
+                if (this.stopped) return;
+                console.log(`${this.logPrefix} Archive ready: ${archivedMessages} messages, ${updatedRecords} updated (${((Date.now() - refreshStartedAt) / 1000).toFixed(1)}s).`);
                 this.failureCount = 0;
                 this.startCatchup();
                 return;
             } catch (error) {
                 this.failureCount++;
                 const delayMs = Math.min(5000, 1000 * (2 ** Math.min(this.failureCount - 1, 3)));
-                console.warn(`[WW LOG] PvP scouting storage is unavailable (${error.message}); retrying startup in ${Math.ceil(delayMs / 1000)}s.`);
+                console.warn(`${this.logPrefix} Storage unavailable (${error.message}); retrying in ${Math.ceil(delayMs / 1000)}s.`);
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
         }
@@ -312,7 +321,7 @@ class PvpScoutIngestor {
         const memberContextPromise = this.rosterStore?.ocrMemberContext(
             String(message.guildId || message.guild?.id || this.guildId), message.author?.id
         ).catch(error => {
-            console.warn(`[WW LOG] Could not load scout member-name context: ${error.message}`);
+            console.warn(`${this.logPrefix} Member-name lookup failed: ${error.message}`);
             return { memberNames: [], authorNames: [] };
         }) || Promise.resolve({ memberNames: [], authorNames: [] });
         const memberContext = await memberContextPromise;
@@ -436,7 +445,7 @@ class PvpScoutIngestor {
                 } catch (error) {
                     this.catchupReady = false;
                     this.catchupFailureRevision++;
-                    console.warn(`[WW LOG] Could not save PvP scout catch-up checkpoint: ${error.message}. Startup will retry from the previous checkpoint.`);
+                    console.warn(`${this.logPrefix} Checkpoint save failed: ${error.message}; retry on restart.`);
                 }
             }
             return row;
@@ -445,7 +454,7 @@ class PvpScoutIngestor {
         // keep their officer notification without treating them as public feedback.
         if (saved?.ign_source === 'member_submission' && saved.review_status === 'pending') {
             await this.notifyNewReview(saved).catch(error => {
-                console.warn(`[WW LOG] Could not notify officers about scout ${saved.message_id}: ${error.message}`);
+                console.warn(`${this.logPrefix} Review alert failed for ${saved.message_id}: ${error.message}`);
             });
         }
         if (saved) await this.feedback.observeMessage(message);
@@ -631,7 +640,7 @@ class PvpScoutIngestor {
         if (result.stagedEdit) {
             if (result.edit) {
                 await this.notifyEditReview(result.edit).catch(error => {
-                    console.warn(`[WW LOG] Could not notify officers about edited scout ${result.saved.message_id}: ${error.message}`);
+                    console.warn(`${this.logPrefix} Edit review alert failed for ${result.saved.message_id}: ${error.message}`);
                 });
             }
         }
@@ -656,12 +665,14 @@ class PvpScoutIngestor {
     async rebuildGroups() {
         await this.store.resetRootLinks(this.channelId);
         let cursor = null;
+        let count = 0;
         const state = { roots: new Map(), messageRoots: new Map(), previous: null };
         const promotions = [];
         // Retain the state across pages and finish after resetting links.
         while (true) {
             const rows = await this.store.listMessagesAfter(cursor, 500, this.channelId);
             if (!rows.length) break;
+            count += rows.length;
             const links = [];
             for (let index = 0; index < rows.length; index += 20) {
                 await yieldToEvents();
@@ -674,6 +685,7 @@ class PvpScoutIngestor {
             if (rows.length < 500) break;
         }
         for (const promotion of promotions) await this.store.promoteRootIgn(promotion.rootMessageId, promotion.sourceMessageId);
+        return count;
     }
 
     startCatchup() {
@@ -683,10 +695,10 @@ class PvpScoutIngestor {
             // Resume saved timers after missed follow-ups have been archived and grouped.
             if (this.stopped) return;
             try { await this.feedback.restorePending?.(); }
-            catch (error) { console.warn(`[WW LOG] Could not resume pending scout feedback: ${error.message}`); }
+            catch (error) { console.warn(`${this.logPrefix} Pending feedback restore failed: ${error.message}`); }
         }).catch(error => {
             this.catchupReady = false;
-            if (!this.stopped) console.warn(`[WW LOG] PvP scout catch-up paused: ${error.message}. It will retry from the saved checkpoint on the next startup.`);
+            if (!this.stopped) console.warn(`${this.logPrefix} Catch-up paused: ${error.message}; retry on restart.`);
         });
         return this.catchupPromise;
     }
@@ -698,8 +710,17 @@ class PvpScoutIngestor {
         const cursor = await this.store.getCatchupCursor(this.channelId);
         if (this.stopped) return;
         const channel = await this.getChannel();
-        if (!cursor) console.log('[WW LOG] Initializing PvP scout catch-up checkpoint; checking history for missing messages.');
-        let before, newestId, count = 0;
+        if (this.stopped) return;
+        const startedAt = Date.now();
+        let lastProgressAt = startedAt;
+        if (!cursor) console.log(`${this.logPrefix} Catch-up started (full history; no checkpoint).`);
+        let before, newestId, count = 0, checked = 0, pages = 0;
+        const reportProgress = () => {
+            const now = Date.now();
+            if (this.stopped || now - lastProgressAt < CATCHUP_PROGRESS_INTERVAL_MS) return;
+            lastProgressAt = now;
+            console.log(`${this.logPrefix} Catch-up progress: ${checked} checked, ${count} new, ${pages} page${pages === 1 ? '' : 's'} (${((now - startedAt) / 1000).toFixed(1)}s).`);
+        };
         // Walk backward to the checkpoint instead of trusting the highest archived
         // ID: newer live events may already be saved beyond an unprocessed gap.
         try {
@@ -707,11 +728,13 @@ class PvpScoutIngestor {
                 const messages = await channel.messages.fetch({ limit: HISTORY_PAGE_SIZE, cache: false,
                     ...(before ? { before } : {}) });
                 if (this.stopped) return;
+                pages++;
                 const ordered = [...messages.values()].sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
                 if (!ordered.length) break;
                 newestId ||= ordered.at(-1).id;
                 for (const message of ordered) {
                     if (this.stopped) return;
+                    checked++;
                     if (cursor && BigInt(message.id) <= BigInt(cursor)) continue;
                     const saved = await this.enqueue(async () => {
                         if (this.stopped || await this.store.getMessage(message.id)) return null;
@@ -720,7 +743,9 @@ class PvpScoutIngestor {
                             deferReview: Date.now() - messageTimestamp(message.createdAt || message.createdTimestamp) <= EDIT_REVIEW_WINDOW_MS });
                     });
                     if (saved) count++;
+                    reportProgress();
                 }
+                reportProgress();
                 const oldestId = ordered[0].id;
                 if (cursor && BigInt(oldestId) <= BigInt(cursor) || ordered.length < HISTORY_PAGE_SIZE) break;
                 if (before && BigInt(oldestId) >= BigInt(before)) throw new Error('Discord message history did not advance.');
@@ -736,7 +761,10 @@ class PvpScoutIngestor {
             if (newestId) await this.store.saveCatchupCursor(newestId, this.channelId);
             this.catchupReady = failureRevision === this.catchupFailureRevision;
         });
-        if (count && !this.stopped) console.log(`[WW LOG] PvP scout catch-up archived ${count} missed message(s).`);
+        if (this.stopped) return;
+        const summary = `${checked} checked, ${count} new, ${pages} page${pages === 1 ? '' : 's'} (${((Date.now() - startedAt) / 1000).toFixed(1)}s)`;
+        if (this.catchupReady) console.log(`${this.logPrefix} Catch-up complete: ${summary}.`);
+        else console.warn(`${this.logPrefix} Catch-up finished: ${summary}; checkpoint paused after a live archive failure; retry on restart.`);
     }
 }
 

@@ -8,7 +8,8 @@
     "mysql2": "^3.23.1",
     "sharp": "^0.35.5",
     "tesseract.js": "^7.0.0",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "undici": "^6.29.0"
   },
   "name": "discord-bot",
   "version": "1.0.0",

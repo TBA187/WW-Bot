@@ -1012,6 +1012,9 @@ async function sendColorPreview(interaction, style, source = null) {
         return;
     }
 
+    // Removing the previous preview and rendering the PNG can both take time.
+    // Reserve the private response before either operation starts.
+    await deferHidden(interaction);
     await deletePreviousColorPreview(interaction);
 
     const previewPng = await makeColorPreviewPng(style);

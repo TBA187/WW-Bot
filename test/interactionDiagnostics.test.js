@@ -134,3 +134,60 @@ test('initial error recovery stops at the Discord deadline and cannot acknowledg
     await accepted.interaction.deferReply();
     assert.equal(accepted.tracker.canAcknowledge(accepted.interaction), false);
 });
+
+test('callback timings distinguish socket setup from Discord response wait without copying paths', async () => {
+    const f = fixture();
+    f.interaction.deferReply = async () => {
+        f.advance(4);
+        f.tracker.recordTransportTiming({ interactionId: 'unrelated', stage: 'created' });
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'created' });
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'sent', elapsedMs: 800,
+            reusedConnection: false, family: 'IPv4', pool: { connected: 1, pending: 0 } });
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'headers', elapsedMs: 3500,
+            path: '/interactions/123/private-token/callback', pool: { pending: 0 } });
+        f.advance(3500); f.response('123', 404);
+        throw Object.assign(new Error('Unknown interaction'), { code: 10062 });
+    };
+    f.tracker.track(f.interaction);
+    await assert.rejects(f.interaction.deferReply());
+    const message = f.tracker.describe(f.interaction, 'expired before acknowledgement');
+    assert.match(message, /4 ms preparing initial HTTP request/);
+    assert.match(message, /800 ms waiting for HTTP socket/);
+    assert.match(message, /2700 ms awaiting HTTP headers/);
+    assert.match(message, /new IPv4 connection/);
+    assert.doesNotMatch(message, /private-token|\/interactions\//);
+    f.tracker.recordTransportTiming({ interactionId: '123', stage: 'created' });
+    assert.equal(f.tracker.active.size, 0);
+});
+
+test('HTTP phases exclude body preparation from socket wait and preserve initial preparation across retries', async () => {
+    const f = fixture();
+    f.interaction.deferReply = async () => {
+        f.advance(100);
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'created', elapsedMs: 100 });
+        f.advance(50);
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'sent', elapsedMs: 150 });
+        f.advance(850);
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'headers', elapsedMs: 1000 });
+        f.response('123', 500);
+        const first = f.tracker.describe(f.interaction, 'in progress');
+        assert.match(first, /100 ms preparing initial HTTP request/);
+        assert.match(first, /50 ms waiting for HTTP socket/);
+        assert.match(first, /850 ms awaiting HTTP headers/);
+        f.advance(27);
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'created', elapsedMs: 20 });
+        f.advance(50);
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'sent', elapsedMs: 70 });
+        f.advance(100);
+        f.tracker.recordTransportTiming({ interactionId: '123', stage: 'headers', elapsedMs: 170 });
+        f.response('123', 204, 1);
+    };
+    f.tracker.track(f.interaction);
+    await f.interaction.deferReply();
+    const message = f.tracker.describe(f.interaction, 'finished');
+    assert.match(message, /100 ms preparing initial HTTP request/);
+    assert.match(message, /timings from HTTP attempt 2/);
+    assert.match(message, /50 ms waiting for HTTP socket/);
+    assert.match(message, /100 ms awaiting HTTP headers/);
+    assert.match(message, /1 transport\/server retry/);
+});

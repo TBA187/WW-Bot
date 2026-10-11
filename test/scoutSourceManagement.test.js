@@ -299,7 +299,7 @@ function catchupFixture(count = 3, cursor = ROOT) {
         state.archived.set(message.id, row);
         return row;
     };
-    ingestor.rebuildGroups = async () => { state.grouped++; };
+    ingestor.rebuildGroups = async () => { state.grouped++; return state.archived.size; };
     ingestor.notifyNewReview = async () => assert.fail('No historical notification');
     return { ingestor, store, channel, messages, state, id };
 }
@@ -342,7 +342,8 @@ test('first checkpoint checks all history once rather than trusting newer archiv
 });
 
 test('failed history fetch keeps the checkpoint and resumes without duplicating already saved messages', async t => {
-    t.mock.method(console, 'log', () => {});
+    const logs = [];
+    t.mock.method(console, 'log', line => logs.push(line));
     const f = catchupFixture(105);
     const fetch = f.channel.messages.fetch;
     f.channel.messages.fetch = async options => {
@@ -354,6 +355,7 @@ test('failed history fetch keeps the checkpoint and resumes without duplicating 
     assert.equal(f.state.cursor, ROOT);
     assert.equal(f.ingestor.catchupReady, false);
     assert.equal(f.state.grouped, 1, 'saved portions must still be grouped');
+    assert.ok(!logs.some(line => line.includes('Catch-up complete')), 'a failed scan must not claim completion');
     f.channel.messages.fetch = fetch;
     await f.ingestor.catchUpMessages();
     assert.equal(f.state.created.length, 105);
@@ -393,7 +395,9 @@ test('a failed live save prevents later live messages from advancing past the ga
 });
 
 test('a live failure during the scan leaves later live checkpoint updates paused', async t => {
-    t.mock.method(console, 'log', () => {});
+    const logs = [], warnings = [];
+    t.mock.method(console, 'log', line => logs.push(line));
+    t.mock.method(console, 'warn', line => warnings.push(line));
     t.mock.method(console, 'error', () => {});
     const f = catchupFixture(105);
     const fetch = f.channel.messages.fetch, save = f.ingestor.saveMessage;
@@ -408,6 +412,9 @@ test('a live failure during the scan leaves later live checkpoint updates paused
     await f.ingestor.catchUpMessages();
     assert.equal(f.state.cursor, f.id(105));
     assert.equal(f.ingestor.catchupReady, false);
+    assert.ok(!logs.some(line => line.includes('Catch-up complete')));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /\[PvP Scout\] Gold:.*checkpoint paused/u);
 });
 
 test('live messages advance the durable checkpoint only after their save succeeds', async () => {
@@ -436,7 +443,8 @@ test('checkpoint failures preserve the saved live report but pause further advan
 });
 
 test('shutdown during a catch-up save cannot advance the checkpoint', async t => {
-    t.mock.method(console, 'log', () => {});
+    const logs = [];
+    t.mock.method(console, 'log', line => logs.push(line));
     const f = catchupFixture();
     const save = f.ingestor.saveMessage;
     f.ingestor.saveMessage = async message => {
@@ -448,6 +456,50 @@ test('shutdown during a catch-up save cannot advance the checkpoint', async t =>
     assert.equal(f.state.created.length, 1);
     assert.deepEqual(f.state.writes, []);
     assert.equal(f.ingestor.catchupReady, false);
+    assert.ok(!logs.some(line => line.includes('Catch-up complete')));
+});
+
+test('startup reports completion for both archives even when every historical message is already saved', async t => {
+    const logs = [];
+    t.mock.method(console, 'log', line => logs.push(line));
+    for (const server of ['gold', 'silver']) {
+        const f = catchupFixture();
+        f.ingestor.server = server;
+        for (const message of f.messages) f.state.archived.set(message.id, { reviewed: true });
+        f.store.ensureSchema = async () => {};
+        f.store.autocomplete = async () => [];
+        f.store.refreshAutomaticRecords = async () => 0;
+        f.ingestor.feedback = { async restorePending() {}, async stop() {} };
+        await f.ingestor.start();
+        await f.ingestor.catchupPromise;
+        assert.deepEqual(f.state.created, [], 'saved messages must not be ingested or scanned again');
+        assert.equal(f.ingestor.catchupReady, true);
+        const label = server === 'silver' ? 'Silver' : 'Gold';
+        assert.ok(logs.some(line => line.includes(`[PvP Scout] ${label}: Archive ready: 3 messages, 0 updated`)));
+        assert.ok(logs.some(line => line.includes(`[PvP Scout] ${label}: Catch-up complete: 3 checked, 0 new, 1 page (`)));
+        await f.ingestor.stop();
+    }
+});
+
+test('long history scans report completed work at most every thirty seconds and finish with elapsed time', async t => {
+    const logs = [];
+    t.mock.method(console, 'log', line => logs.push(line));
+    let now = 1000;
+    t.mock.method(Date, 'now', () => now);
+    const f = catchupFixture(6);
+    const save = f.ingestor.saveMessage;
+    f.ingestor.saveMessage = async message => {
+        const row = await save(message);
+        now += 12_000;
+        return row;
+    };
+    await f.ingestor.catchUpMessages();
+    const progress = logs.filter(line => line.includes('Catch-up progress'));
+    assert.equal(progress.length, 2);
+    assert.match(progress[0], /3 checked, 3 new, 1 page \(36\.0s\)/u);
+    assert.match(progress[1], /6 checked, 6 new, 1 page \(72\.0s\)/u);
+    assert.match(logs.at(-1), /Catch-up complete:.*6 new, 1 page \(72\.0s\)/u);
+    assert.equal(f.state.cursor, f.id(6));
 });
 
 test('durable checkpoint SQL uses the channel and numeric message ID without moving backward', async () => {

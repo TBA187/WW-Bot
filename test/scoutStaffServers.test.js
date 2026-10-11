@@ -163,6 +163,21 @@ test('Silver review queue panels and correction modals serialize within Discord 
     assert.ok(modal.custom_id.length <= 100);
 });
 
+test('review correction opens its cached modal immediately without reading storage', async () => {
+    const command = new ScoutReview(config()), child = command.scoped.get('silver');
+    child.reviewRows.set(ID, reportSource());
+    child.store.getMessage = async () => { throw Error('Storage must not delay the modal acknowledgement'); };
+    const click = interaction(`pvp-scout-review:edit:${OWNER}:${ID}:0:silver`);
+    let acceptModal, modal;
+    const accepted = new Promise(resolve => { acceptModal = resolve; });
+    click.showModal = payload => { modal = payload.toJSON(); click.calls.push('modal'); return accepted; };
+    const pending = command.handleButton(click);
+    assert.deepEqual(click.calls, ['modal']);
+    assert.equal(modal.custom_id, `pvp-scout-review:modal:${OWNER}:${ID}:0:silver`);
+    assert.equal(click.deferred, undefined);
+    acceptModal(); await pending;
+});
+
 test('Silver report and source panels keep all controls and modal submissions scoped', async () => {
     const cfg = config(), reports = new ScoutReportManagerRegistry(cfg), manager = reports.forServer('silver');
     const root = reportSource(), sources = [root, ...Array.from({ length: 27 }, (_, index) =>

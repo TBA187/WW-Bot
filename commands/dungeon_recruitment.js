@@ -1030,9 +1030,11 @@ class DungeonRecruitment {
                 });
             }
 
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             let updatedCount = 0;
             let expiredCount = 0;
-            for (const run of openRuns) {
+            // A run may close while Discord is accepting the command.
+            for (const run of this.getOpenRuns()) {
                 const result = this.setRunReminders(run, enableAll);
                 if (result.expired) expiredCount += 1;
                 if (result.updated) updatedCount += 1;
@@ -1044,9 +1046,8 @@ class DungeonRecruitment {
                 ? `\n- ${expiredCount} Dungeon run(s) are older than 24 hours, so reminders stayed disabled.`
                 : '';
 
-            return interaction.reply({
-                content: `### ✅ Dungeon reminders updated\n- Reminders ${actionText} for **${updatedCount}** open Dungeon run(s).${expiredText}`,
-                flags: MessageFlags.Ephemeral
+            return interaction.editReply({
+                content: `### ✅ Dungeon reminders updated\n- Reminders ${actionText} for **${updatedCount}** open Dungeon run(s).${expiredText}`
             });
         }
 
@@ -1058,23 +1059,25 @@ class DungeonRecruitment {
             });
         }
 
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (run.closed || this.activeRuns.get(runId) !== run) {
+            return interaction.editReply({ content: '### ❌ That Dungeon recruitment is no longer open.' });
+        }
         const enableReminder = postReminder !== 'no';
         const result = this.setRunReminders(run, enableReminder);
         if (result.expired) {
             this.saveRuns();
-            return interaction.reply({
-                content: `### ⏳ Reminders cannot be re-enabled for **${this.formatDungeonName(run)}** because it is older than 24 hours.`,
-                flags: MessageFlags.Ephemeral
+            return interaction.editReply({
+                content: `### ⏳ Reminders cannot be re-enabled for **${this.formatDungeonName(run)}** because it is older than 24 hours.`
             });
         }
 
         this.saveRuns();
-        return interaction.reply({
+        return interaction.editReply({
             content:
                 `### ✅ Dungeon reminders updated\n` +
                 `- Dungeon: **${this.formatDungeonName(run)}** by <@${run.partyLeaderId}>\n` +
-                `- Reminders: **${enableReminder ? 'Enabled' : 'Disabled'}**`,
-            flags: MessageFlags.Ephemeral
+                `- Reminders: **${enableReminder ? 'Enabled' : 'Disabled'}**`
         });
     }
 
