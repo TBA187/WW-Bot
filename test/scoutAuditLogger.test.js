@@ -17,7 +17,7 @@ for (const [action, title] of [['edited','Scout Report Edited'], ['deleted','Sco
     test(`${action} audit includes officer, report/source IDs, timestamp, logo footer and before/after values`, () => {
         const payload = auditPayload(event(action)); const embed = payload.embeds[0].toJSON();
         assert.equal(embed.title, title); assert.match(embed.description, /<@291142291073269761>/u);
-        assert.match(embed.description, /Scout Report ID.*1350059044102078494/u);
+        assert.doesNotMatch(embed.description, /Scout Report ID/u);
         assert.match(embed.description, /Scout Message ID.*1350059044102078494/u);
         assert.equal(embed.timestamp, '2026-10-01T11:12:13.000Z');
         assert.equal(embed.footer.text, 'White Walkers • Message ID: 1350059044102078494');

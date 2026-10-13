@@ -1,6 +1,8 @@
 // Staff tools for checking uncertain imports and correcting saved scout details.
 'use strict';
 
+const { sameValue } = require('../features/pvp-scouting/ScoutChanges.js');
+
 const {
     ActionRowBuilder,
     AttachmentBuilder,
@@ -90,13 +92,12 @@ function editVersionText(value = {}) {
 function correctionSummary(before, after) {
     const changes = [];
     const name = value => canonicalIgn(value) || 'Not detected';
-    if (before.opponent_ign !== after.opponent_ign) changes.push(`IGN: **${name(before.opponent_ign)}** → **${name(after.opponent_ign)}**`);
-    if (before.rating !== after.rating) changes.push(`PvP rating: **${before.rating ?? 'None'}** → **${after.rating ?? 'None'}**`);
+    if (!sameValue('ign', before.opponent_ign, after.opponent_ign)) changes.push(`IGN: **${name(before.opponent_ign)}** → **${name(after.opponent_ign)}**`);
+    if (!sameValue('rating', before.rating, after.rating)) changes.push(`PvP rating: **${before.rating ?? 'None'}** → **${after.rating ?? 'None'}**`);
     if (String(before.team_text || '') !== String(after.team_text || '')) changes.push('Pokémon team updated');
     if (String(before.notes || '') !== String(after.notes || '')) changes.push('Additional notes updated');
     if (String(before.message_content || '') !== String(after.message_content || '')) changes.push('Source message text updated');
-    const images = row => (row.attachments || []).map(item => String(item.id || item.name || item.url || '')).sort();
-    if (JSON.stringify(images(before)) !== JSON.stringify(images(after))) {
+    if (!sameValue('attachments', before.attachments, after.attachments)) {
         changes.push(`Screenshots updated (${(before.attachments || []).length} → ${(after.attachments || []).length})`);
     }
     return changes.length ? changes.join('; ') + '.' : 'Existing scout details verified; no values needed changing.';

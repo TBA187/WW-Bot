@@ -1,6 +1,8 @@
 // Lets officers search, edit and delete published scout reports.
 'use strict';
 
+const { scoutIds } = require('./ScoutChanges.js');
+
 const { randomBytes } = require('node:crypto');
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, FileUploadBuilder, LabelBuilder, ModalBuilder,
     StringSelectMenuBuilder, MessageFlags } = require('discord.js');
@@ -105,7 +107,7 @@ class ScoutReportManager {
             if (image?.url) preview.setImage(image.url);
         }
         const info = new EmbedBuilder().setColor(0x5865F2).setTitle(`Edit ${this.server ? `${this.server === 'gold' ? 'Gold' : 'Silver'} ` : ''}Scout Report`)
-            .setDescription(`**Report ID:** \`${reportId}\`\n**Selected source:** \`${source.message_id}\` (${index + 1} of ${report.sources.length})\n`
+            .setDescription(scoutIds(reportId, source.message_id) + `\n**Selected source:** ${index + 1} of ${report.sources.length}\n`
                 + 'Choose the original source to change the opponent. Each continuation and reply can be edited separately. Reporter, posted date and message IDs come from the original Discord source.')
             .addFields({ name: 'PvP Rating', value: source.rating == null ? '*None*' : String(source.rating), inline: true },
                 { name: 'Stored source text', value: String(source.message_content || '*None*').slice(0, 1000), inline: false })
@@ -175,7 +177,7 @@ class ScoutReportManager {
         // Modal upload URLs expire. Keep a staff-channel copy whose attachment
         // URLs can be renewed without changing the original scout message.
         const message = await channel.send({
-            content: `**Scout screenshot uploads**\nReport ID: \`${session.reportId}\` • Source ID: \`${session.source.message_id}\`\n`
+            content: `**Scout screenshot uploads**\n${scoutIds(session.reportId, session.source.message_id)}\n`
                 + `Uploaded by <@${interaction.user.id}>. The saved edit is recorded separately in the scout action log.`,
             files, allowedMentions: { parse: [] }
         });

@@ -3,6 +3,7 @@
 
 const path = require('node:path');
 const { diffLines } = require('diff');
+const { sameValue, scoutIds, scoutIdFooter } = require('./ScoutChanges.js');
 const { reviewSuggestions } = require('./ScoutFeedbackText.js');
 const { AttachmentBuilder, EmbedBuilder, escapeMarkdown } = require('discord.js');
 
@@ -21,7 +22,7 @@ const LABELS = { ign: 'Opponent IGN', rating: 'PvP rating', teamText: 'Pokémon 
     attachments: 'Screenshots', reviewStatus: 'Review status', classification: 'Classification', rootMessageId: 'Scout Report ID' };
 
 function changesBetween(before = {}, after = {}) {
-    return Object.fromEntries(Object.keys(LABELS).filter(key => JSON.stringify(before[key] ?? null) !== JSON.stringify(after[key] ?? null))
+    return Object.fromEntries(Object.keys(LABELS).filter(key => Object.hasOwn(before, key) && Object.hasOwn(after, key) && !sameValue(key, before[key], after[key]))
         .map(key => [key, { before: before[key] ?? null, after: after[key] ?? null }]));
 }
 
@@ -39,15 +40,16 @@ function auditPayload(event, logoPath = path.join(__dirname, '../../images/ww_lo
     const sourceUrl = after.sourceUrl || before.sourceUrl;
     const embed = new EmbedBuilder().setColor(color).setTitle(title)
         .setDescription(`**Officer:** <@${event.actorId}> (\`${event.actorId}\`)\n**Opponent:** ${display(ign, 64)}\n`
-            + `**Scout Report ID:** \`${event.reportId}\`\n**Scout Message ID:** \`${event.messageId}\``
+            + scoutIds(event.reportId, event.messageId)
             + (sourceUrl ? `\n[Jump to scout message ↗️](${sourceUrl})` : ''))
         .setFooter({ text: `White Walkers • Message ID: ${event.messageId}`, iconURL: 'attachment://ww_logo.png' })
         .setTimestamp(event.timestamp ? new Date(event.timestamp) : new Date());
     const sources = event.sources || [];
     const changes = first.changes || changesBetween(before, after);
-    const entries = Object.entries(changes).filter(([key]) => LABELS[key]);
+    const entries = Object.entries(changes).filter(([key, change]) => LABELS[key] && !sameValue(key, change.before, change.after));
     for (const [key, change] of entries.slice(0, 5)) embed.addFields({ name: LABELS[key],
-        value: `**Before:** ${display(change.before)}\n**${event.action === 'edit_rejected' ? 'Proposed' : 'After'}:** ${display(change.after)}`, inline: false });
+        value: ['messageContent', 'teamText', 'notes'].includes(key) ? diffPreview(scoutTextDiff(change.before || '', change.after || ''))
+            : `**Before:** ${display(change.before)}\n**${event.action === 'edit_rejected' ? 'Proposed' : 'After'}:** ${display(change.after)}`, inline: false });
     if (event.action === 'deleted') embed.addFields({ name: 'Deleted report',
         value: `${sources.length} source(s) removed from \`/scout\`. The original Discord messages remain available.`, inline: false });
     if (sources.length > 1) embed.addFields({ name: 'Affected source IDs',
@@ -69,9 +71,9 @@ function publishedPayload(event, logoPath = path.join(__dirname, '../../images/w
         .setDescription(`The Scout Report for **${escapeMarkdown(event.ign)}** has been successfully validated and added to \`/scout\`.\n\n`
             + `**Scouted by:** ${contributors.slice(0, 20).join(', ') || '*Unknown member*'}`
             + (contributors.length > 20 ? ` and ${contributors.length - 20} more` : '') + '\n'
-            + `**Scout Report ID:** \`${event.reportId}\`\n**Latest Scout Message ID:** \`${event.messageId}\``
+            + scoutIds(event.reportId, event.messageId)
             + (event.sourceUrl ? `\n[**Jump to scout message ↗️**](${event.sourceUrl})` : ''))
-        .setFooter({ text: `WW • Scout Report ID: ${event.reportId}`, iconURL: 'attachment://ww_logo.png' })
+        .setFooter({ text: scoutIdFooter(event.reportId, event.messageId), iconURL: 'attachment://ww_logo.png' })
         .setTimestamp(event.timestamp ? new Date(event.timestamp) : new Date());
     if (event.rating != null) embed.addFields({ name: 'PvP Rating', value: String(event.rating), inline: true });
     embed.addFields({ name: 'Source messages', value: String(event.sources?.length || 1), inline: true });
@@ -85,31 +87,37 @@ function scoutTextDiff(before = '', after = '') {
             .map(line => `${part.removed ? '-' : '+'} ${line}`).join('\n')).join('\n');
 }
 
+function diffPreview(diff) {
+    const safe = diff.replace(/`/gu, 'ˋ');
+    return `\`\`\`diff\n${safe.slice(0, 940)}\n\`\`\`` + (safe.length > 940 ? '\nFull changes attached.' : '');
+}
+
 function memberEditPayload(event, logoPath = path.join(__dirname, '../../images/ww_logo.png')) {
     const before = event.before || {}, after = event.after || {};
     const ignored = ['ignored', 'not_scout'].includes(after.classification) || after.reviewStatus === 'not_scout';
     const failed = Boolean(event.failed) || after.reviewStatus === 'pending';
     const status = failed ? '❌ Failed validation' : ignored ? 'Not a scout report'
-        : event.awaitingApproval ? '⏳ Parsed successfully • awaiting officer approval' : '✅ Successfully validated';
+        : event.awaitingApproval ? '⏳ Parsed successfully • awaiting officer approval' : event.autoApproved ? '✅ Automatically approved • updated and published' : '✅ Successfully validated';
     const color = failed ? 0xED4245 : ignored ? 0x95A5A6 : event.awaitingApproval ? 0xFEE75C : 0x57F287;
     const diff = scoutTextDiff(before.content, after.content);
-    const preview = (diff || '(Message text unchanged; see attachment changes below.)').replace(/`/gu, 'ˋ');
     const attachmentNames = value => (value.attachments || []).map(a => `${a.id}: ${a.name || 'image'}`);
-    const attachmentsChanged = JSON.stringify(attachmentNames(before)) !== JSON.stringify(attachmentNames(after));
+    const attachmentsChanged = !sameValue('attachments', before.attachments, after.attachments);
     const confidence = value => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : 'Unavailable';
     const embed = new EmbedBuilder().setTitle('Scout Message Edited').setColor(color)
         .setDescription(`**Reporter:** ${display(event.authorUsername || after.authorUsername || 'Unknown', 128)}`
             + (event.authorId ? ` (\`${event.authorId}\`)` : '')
             + `\n**Server:** ${event.server === 'silver' ? 'Silver' : 'Gold'}\n**Status:** ${status}`
-            + `\n**Scout Report ID:** \`${event.reportId}\`\n**Scout Message ID:** \`${event.messageId}\``
+            + '\n' + scoutIds(event.reportId, event.messageId)
             + (event.sourceUrl ? `\n[Jump to scout message ↗️](${event.sourceUrl})` : ''))
-        .addFields({ name: 'Message changes', value: `\`\`\`diff\n${preview.slice(0, 940)}\n\`\`\``
-                + (preview.length > 940 ? '\nFull diff attached.' : ''), inline: false },
-            { name: 'Opponent IGN', value: `${display(before.ign, 64)} → ${display(after.ign, 64)}`, inline: true },
-            { name: 'IGN confidence', value: `${confidence(before.ignConfidence)} → ${confidence(after.ignConfidence)}`, inline: true },
-            { name: 'IGN detection source', value: `${display(before.ignSource, 100)} → ${display(after.ignSource, 100)}`, inline: false })
-        .setFooter({ text: `WW • Scout Report ID: ${event.reportId}`, iconURL: 'attachment://ww_logo.png' })
+        .setFooter({ text: scoutIdFooter(event.reportId, event.messageId), iconURL: 'attachment://ww_logo.png' })
         .setTimestamp(event.timestamp ? new Date(event.timestamp) : new Date());
+    if (diff) embed.addFields({ name: 'Message changes', value: diffPreview(diff), inline: false });
+    for (const [key, name, format] of [['ign', 'Opponent IGN', v => display(v, 64)],
+        ['ignConfidence', 'IGN confidence', confidence], ['ignSource', 'IGN detection source', v => display(v, 100)]]) {
+        if (!sameValue(key, before[key], after[key]) && format(before[key]) !== format(after[key]))
+            embed.addFields({ name, value: `${format(before[key])} → ${format(after[key])}`, inline: true });
+    }
+    if (event.safetyReason) embed.addFields({ name: 'Review safeguard', value: display(event.safetyReason, 850), inline: false });
     embed.addFields({ name: 'Validation reason', value: display(after.reviewReason || (failed
         ? 'The opponent or team could not be verified confidently.'
         : ignored ? 'This message is not recognized as a scout report.' : 'Validation passed.'), 850), inline: false });
@@ -118,7 +126,7 @@ function memberEditPayload(event, logoPath = path.join(__dirname, '../../images/
     embed.addFields({ name: 'Bot suggestions', value: suggestions.length
         ? suggestions.map(suggestion => `- ${suggestion}`).join('\n').slice(0, 1024)
         : ignored ? 'Submit an opponent IGN and Pokémon team details or a screenshot.' : 'No corrections needed.', inline: false });
-    if (before.rating !== after.rating) embed.addFields({ name: 'PvP rating', value: `${display(before.rating)} → ${display(after.rating)}`, inline: true });
+    if (!sameValue('rating', before.rating, after.rating)) embed.addFields({ name: 'PvP rating', value: `${display(before.rating)} → ${display(after.rating)}`, inline: true });
     if (attachmentsChanged) embed.addFields({ name: 'Attachments', value: `Before: ${display(attachmentNames(before), 350)}\nAfter: ${display(attachmentNames(after), 350)}`, inline: false });
     const files = [new AttachmentBuilder(logoPath, { name: 'ww_logo.png' }),
         new AttachmentBuilder(Buffer.from(JSON.stringify(event, null, 2)), { name: `scout-edit-${event.messageId}.json` })];
@@ -129,7 +137,7 @@ function memberEditPayload(event, logoPath = path.join(__dirname, '../../images/
 function diagnosticPayload(event, ownerId, logoPath = path.join(__dirname, '../../images/ww_logo.png')) {
     const warning = event.level === 'warn';
     const reportId = String(event.reportId || '').trim();
-    const footer = reportId && reportId !== 'N/A' ? `WW • Scout Report ID: ${reportId}`
+    const footer = reportId && reportId !== 'N/A' ? scoutIdFooter(reportId, event.messageId)
         : `WW • ${event.component || 'Bot runtime'}`;
     const embed = new EmbedBuilder().setColor(warning ? 0xFEE75C : 0xED4245)
         .setTitle(warning ? '⚠️ Bot Warning' : '❌ Bot Error')

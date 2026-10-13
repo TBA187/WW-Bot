@@ -47,7 +47,7 @@ function formatMemorySample({ memory, heapLimit, container, caches, peakRss, ocr
         ...(container ? [`container ${mib(container.used)}/${mib(container.limit)} MiB (${(100 * container.used / container.limit).toFixed(1)}%)`,
             ...(container.fileCache !== null ? [`container file cache ${mib(container.fileCache)} MiB`] : [])] : []),
         `Discord caches: ${caches.messages} messages, ${caches.members} members, ${caches.users} users`,
-        ...(ocr ? [`OCR: ${ocr.workers} worker(s), ${ocr.pending} queued/active task(s)${ocr.creating ? ', initializing' : ''}`] : [])
+        ...(ocr ? [`OCR: ${ocr.workers} worker(s), ${ocr.pending} queued/active task(s)${ocr.creating ? ', initializing' : ''}${ocr.processId ? `, isolated process ${ocr.processId}` : ''}`] : [])
     ];
     return `[RUNTIME MEMORY] ${fields.join('; ')}.`;
 }

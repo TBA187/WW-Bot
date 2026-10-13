@@ -1,6 +1,8 @@
 // Staff menus for attaching, separating and editing scout sources.
 'use strict';
 
+const { scoutIds } = require('./ScoutChanges.js');
+
 const { randomBytes } = require('node:crypto');
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ModalBuilder,
     StringSelectMenuBuilder, MessageFlags } = require('discord.js');
@@ -53,8 +55,8 @@ class ScoutSourceManager {
         const chunk = report.sources.slice(Math.floor(index / 25) * 25, Math.floor(index / 25) * 25 + 25);
         const embed = new EmbedBuilder().setTitle('Manage Scout Sources').setColor(0x5865F2)
             .setDescription('-# Move a reply to another report, edit it, delete it, or make it an independent scout. Moving the original moves all its sources. Deleting the original deletes its whole report. The scout reporter and posted date cannot be edited.\n'
-                + `**Opponent:** ${safe(report.root.opponent_ign || 'Not detected', 64)}\n**Report ID:** \`${report.root.message_id}\`\n`
-                + `**Selected source:** \`${source.message_id}\` (${index + 1} of ${report.sources.length})\n`
+                + `**Opponent:** ${safe(report.root.opponent_ign || 'Not detected', 64)}\n` + scoutIds(report.root.message_id, source.message_id) + '\n'
+                + `**Selected source:** ${index + 1} of ${report.sources.length}\n`
                 + `**Reporter:** ${safe(source.author_username || source.author_id, 128)}`)
             .addFields({ name: 'Stored scouting information', value: String(source.team_text || source.notes || source.message_content || '*None*').slice(0, 1000) })
             .setFooter({ text: `Report ID: ${report.root.message_id} • Source ID: ${source.message_id}` });

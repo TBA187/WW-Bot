@@ -1,6 +1,8 @@
 // Staff report management uses the same visibility rules as /scout.
 'use strict';
 
+const { sameValue } = require('./ScoutChanges.js');
+
 const crypto = require('node:crypto');
 const { cleanIgn, normalizeIgn } = require('./PvpScoutParser.js');
 const { decode, normalizeMessageRow } = require('./PvpScoutStore.js');
@@ -82,7 +84,7 @@ class ScoutReportAdminStore {
 
     async event(connection, before, after, reviewer, action) {
         const previous = snapshot(before), next = snapshot(after);
-        const changes = Object.fromEntries(Object.keys(next).filter(key => JSON.stringify(previous[key]) !== JSON.stringify(next[key]))
+        const changes = Object.fromEntries(Object.keys(next).filter(key => !sameValue(key, previous[key], next[key]))
             .map(key => [key, { before: previous[key], after: next[key] }]));
         await connection.query(`INSERT INTO pvp_scout_review_events
             (message_id, channel_id, action, reviewer_id, before_json, after_json, changes_json)

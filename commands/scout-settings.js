@@ -100,7 +100,7 @@ class ScoutSettings {
             .setDescription(
                 '**Choose a setting to manage:**\n' +
                 '- **Friendly List:** Add/edit/remove members from the **Friendly List**.\n' +
-                '  - Adding members or IGN\'s to the Friendly List will show a **/draw** recommendation in `/scout`\n' +
+                '  - Adding members or IGN\'s to the Friendly List will show a **/draw** recommendation in `/scout` for that player.\n' +
                 '- **Member List:** Add/edit/remove current/former guild members.\n' +
                 '  - Current/Former Guild Members are managed automatically by the bot. These members will show a **/draw** recommendation in `/scout`.\n' +
                 '- **Scout Reports:** Search and edit/delete submitted scout reports publicly shown in `/scout`'

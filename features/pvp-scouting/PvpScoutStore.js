@@ -1,6 +1,8 @@
 // Database access for archived messages, scout groups, catch-up checkpoints, and staff corrections.
 'use strict';
 
+const { sameValue } = require('./ScoutChanges.js');
+
 const crypto = require('crypto');
 const fs = require('node:fs');
 const { setImmediate: yieldToEvents } = require('node:timers/promises');
@@ -148,11 +150,8 @@ function reviewSnapshot(row) {
     return {
         messageId: String(row.message_id), sourceUrl: row.source_url,
         authorId: row.author_id, authorUsername: row.author_username,
-        messageContent: row.message_content,
-        attachments: decode(row.attachments_json, []).map(item => ({
-            id: item.id, name: item.name, contentType: item.contentType,
-            width: item.width, height: item.height
-        })),
+        createdAt: row.created_at, messageContent: row.message_content,
+        attachments: row.attachments,
         ocrResults: decode(row.ocr_json, []).map(item => ({
             text: item.text, focusedIgn: item.focusedIgn, focusedSource: item.focusedSource,
             focusedConfidence: item.focusedConfidence, teamLayoutStatus: item.teamLayoutStatus
@@ -378,6 +377,27 @@ class PvpScoutStore {
         return rows[0] ? normalizeMessageRow(rows[0]) : null;
     }
 
+    async isHistoricalEditBurst(previous, proposal) {
+        const before = scoutVersion(previous), after = scoutVersion(proposal);
+        if (before.contentHash === after.contentHash) return false;
+        const created = new Date(before.createdAt).getTime();
+        if (!Number.isFinite(created) || Date.now() - created <= 7 * 86400000) return false;
+        await this.ensureSchema();
+        // Count distinct reports, including pending attempts. Database timestamps
+        // retain the rolling window across restarts; exclude this report's retries.
+        const [rows] = await this.db.query(`
+            SELECT COUNT(DISTINCT COALESCE(m.root_message_id, m.message_id)) AS total
+            FROM pvp_scout_messages m
+            LEFT JOIN pvp_scout_edit_reviews e ON e.message_id = m.message_id AND e.channel_id = m.channel_id
+            WHERE m.channel_id = ? AND m.author_id = ?
+                AND m.created_at < DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL 7 DAY)
+                AND COALESCE(m.root_message_id, m.message_id) <> ?
+                AND (m.edited_at >= DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL 10 MINUTE)
+                    OR e.requested_at >= DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL 10 MINUTE))
+        `, [this.channelId, before.authorId, String(previous.root_message_id || before.messageId)]);
+        return Number(rows[0]?.total || 0) >= 2;
+    }
+
     async stageEditReview(beforeValue, afterValue) {
         await this.ensureSchema();
         const before = scoutVersion(beforeValue);
@@ -545,7 +565,7 @@ class PvpScoutStore {
                         reviewed_by_id = ?, reviewed_at = CURRENT_TIMESTAMP(3), team_layout_status = ?,
                         content_hash = ?, is_deleted = 0
                     WHERE message_id = ? AND channel_id = ?
-                `, [next.guildId, next.authorId, next.authorUsername, next.createdAt ? new Date(next.createdAt) : new Date(),
+                `, [next.guildId, next.authorId, next.authorUsername, new Date(current.created_at),
                     next.editedAt ? new Date(next.editedAt) : null, next.content, next.sourceUrl, next.replyToId,
                     json(next.attachments, []), json(next.ocrResults, []), next.classification,
                     next.ign, next.ignNormalized, next.ignConfidence, next.ignSource, next.rating,
@@ -1352,7 +1372,7 @@ class PvpScoutStore {
             const beforeData = reviewSnapshot(before);
             const afterData = reviewSnapshot(updated[0]);
             const changes = Object.fromEntries(Object.keys(afterData)
-                .filter(key => JSON.stringify(beforeData[key]) !== JSON.stringify(afterData[key]))
+                .filter(key => !sameValue(key, beforeData[key], afterData[key]))
                 .map(key => [key, { before: beforeData[key], after: afterData[key] }]));
             await connection.query(`
                 INSERT INTO pvp_scout_review_events

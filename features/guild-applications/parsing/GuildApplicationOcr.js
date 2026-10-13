@@ -52,6 +52,7 @@ class GuildApplicationOcr {
         this.sharp = options.sharp || sharp;
         this.workerPool = ocrWorkerPoolFor(options);
         this.maxImages = options.maxImages || MAX_OCR_IMAGES;
+        this.isolatedPipeline = !options.workerPool && !options.worker && !options.workerFactory && !options.sharp;
     }
 
     enqueue(task) {
@@ -109,6 +110,19 @@ class GuildApplicationOcr {
                 confidence: parserResult.ignConfidence,
                 output: null
             };
+        }
+
+        if (this.isolatedPipeline) {
+            const images = downloadedImages.filter(item => item?.buffer).slice(0, this.maxImages)
+                .map(({ buffer, url }) => ({ buffer, url }));
+            if (!images.length) return { ign: null, source: null, confidence: 0, output: [] };
+            try {
+                return await this.enqueue(() => this.workerPool.processImage('resolveGuild',
+                    { forumUsername: post.forumUsername, profileSlug: post.profileSlug }, parserResult, images, { maxImages: this.maxImages }));
+            } catch (error) {
+                return { ign: null, source: null, confidence: 0,
+                    output: images.map(image => ({ url: image.url, error: error?.message || 'Image could not be processed.' })) };
+            }
         }
 
         return this.enqueue(async () => {

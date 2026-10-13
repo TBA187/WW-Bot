@@ -9,11 +9,13 @@ const { setImmediate: yieldToEvents } = require('node:timers/promises');
 const { ScoutMessageFeedback, feedbackOutcome } = require('./ScoutMessageFeedback.js');
 const { contentHash, scoutVersion } = require('./PvpScoutStore.js');
 
+const { isSafeScoutTypo } = require('./ScoutEditPolicy.js');
+
+const EDIT_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1000;
 const HISTORY_PAGE_SIZE = 100;
 const CATCHUP_PROGRESS_INTERVAL_MS = 30_000;
 const FOLLOW_UP_WINDOW_MS = 15 * 60 * 1000;
 const IMMEDIATE_FOLLOW_UP_WINDOW_MS = 2 * 60 * 1000;
-const EDIT_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 function submittedScoutEmbed(message, botId) {
     if (!botId || String(message.author?.id) !== String(botId)) return null;
@@ -489,7 +491,7 @@ class PvpScoutIngestor {
                 content: `A new **Scout Report** submitted by **${username}** is awaiting review.\n`
                     + 'Use the `/scout-review` command to review the Scout Report.\n'
                     + `-# - Scout Message ID: ${row.message_id}\n`
-                    + `-# - Scout Report ID: ${reportId}\n`
+                    + (String(reportId) === String(row.message_id) ? '' : `-# - Scout Report ID: ${reportId}\n`)
                     + `- [**Jump to Scout Message**](${row.source_url})`,
                 allowedMentions: { parse: [] }
             });
@@ -507,8 +509,6 @@ class PvpScoutIngestor {
         const latest = await this.store.getEditReview(edit.message_id);
         if (!row || row.is_deleted || latest?.status !== 'pending'
             || Number(latest.revision) !== Number(edit.revision)) return;
-        const age = Date.now() - messageTimestamp(row.created_at);
-        if (age < -5 * 60 * 1000 || age > EDIT_REVIEW_WINDOW_MS) return;
         if (!await this.store.claimEditReviewAlert(edit.message_id, edit.revision)) return;
         let posted = false;
         try {
@@ -519,10 +519,10 @@ class PvpScoutIngestor {
                 .replace(/([\\*_~`|>])/gu, '\\$1').replace(/@/gu, '＠');
             const reportId = String(row.root_message_id || row.message_id);
             const message = await channel.send({
-                content: `A recent **Scout Report** was edited by **${username}** and is awaiting review.\n`
+                content: `A **Scout Report** was edited by **${username}** and is awaiting review.\n`
                     + 'Use the `/scout-review` command to review the updated Scout Report.\n'
                     + `-# - Scout Message ID: ${row.message_id}\n`
-                    + `-# - Scout Report ID: ${reportId}\n`
+                    + (String(reportId) === String(row.message_id) ? '' : `-# - Scout Report ID: ${reportId}\n`)
                     + `- [**Jump to Scout Message**](${row.source_url})`,
                 allowedMentions: { parse: [] }
             });
@@ -587,7 +587,7 @@ class PvpScoutIngestor {
         this.store.auditLogger.memberEdited({ messageId: after.messageId,
             reportId: String(saved?.root_message_id || after.messageId), server: this.server,
             authorId: after.authorId, authorUsername: after.authorUsername, sourceUrl: after.sourceUrl,
-            before, after, awaitingApproval: result.stagedEdit, failed });
+            before, after, awaitingApproval: result.stagedEdit, autoApproved: result.autoApproved, safetyReason: result.safetyReason, failed });
         return result;
     }
 
@@ -600,18 +600,14 @@ class PvpScoutIngestor {
             const previous = await this.store.getMessage(current.id);
             const previousEdit = previous ? await this.store.getEditReview(current.id) : null;
             const logBefore = previousEdit?.status === 'pending' ? previousEdit.after : previous;
-            const messageAge = previous ? Date.now() - messageTimestamp(previous.created_at) : Infinity;
-            const activeCorrection = previous && await this.store.getCorrectionWindow(current.id);
-            const isRecentScout = previous && !previous.is_deleted
+            const protectedScout = previous && !previous.is_deleted
                 && ['scout', 'review'].includes(previous.classification)
-                && previous.review_status !== 'not_scout'
-                && (messageAge >= -5 * 60 * 1000 && messageAge <= EDIT_REVIEW_WINDOW_MS
-                    || activeCorrection?.status === 'waiting' || activeCorrection?.status === 'escalated');
-            if (isRecentScout) {
+                && previous.review_status !== 'not_scout';
+            if (protectedScout) {
                 const proposal = await this.buildRecord(current);
                 if (this.stopped) return null;
-                // An unresolved parser failure can be fixed by its author. Published
-                // reports and officer decisions still require approval of any edits.
+                // Parser retries and verified spelling corrections may publish automatically.
+                // All other edits stay protected, including historical reports.
                 const latest = await this.store.getMessage(current.id);
                 const existingEdit = await this.store.getEditReview(current.id);
                 const root = latest?.root_message_id && String(latest.root_message_id) !== String(current.id)
@@ -623,13 +619,18 @@ class PvpScoutIngestor {
                 const retry = latest?.review_status === 'pending' && !latest.reviewed_by_id
                     && !latest.staffOverrides?.locked && !latest.staffOverrides?.hidden
                     && existingEdit?.status !== 'pending' && !protectedGroup;
-                if (retry) {
+                const burst = await this.store.isHistoricalEditBurst?.(latest || previous, proposal) || false;
+                const autoApproved = !burst && !protectedGroup && existingEdit?.status !== 'pending'
+                    && isSafeScoutTypo(latest || previous, proposal);
+                if ((retry && !burst) || autoApproved) {
                     const saved = await this.store.saveMessage({ ...proposal, deferReview: true });
                     await this.rebuildGroups();
-                    return this.logMemberEdit({ saved, message: current, stagedEdit: false, logBefore, logAfter: proposal });
+                    return this.logMemberEdit({ saved, message: current, stagedEdit: false, autoApproved, logBefore, logAfter: proposal });
                 }
                 const edit = await this.store.stageEditReview(latest || previous, proposal);
-                return this.logMemberEdit({ saved: latest || previous, message: current, edit, stagedEdit: Boolean(edit), logBefore, logAfter: proposal });
+                return this.logMemberEdit({ saved: latest || previous, message: current, edit, stagedEdit: Boolean(edit),
+                    safetyReason: burst ? 'Bulk edit safeguard: this member edited at least three reports older than one week within ten minutes.' : null,
+                    logBefore, logAfter: proposal });
             }
             if (previous) await this.store.expirePendingEditReview?.(previous.message_id);
             const saved = await this.saveMessage(current, { regroup: true, deferReview: true });

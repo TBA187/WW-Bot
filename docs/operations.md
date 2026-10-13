@@ -120,3 +120,23 @@ Maintenance runs at startup, rollover and every hour. Defaults retain the newest
 | `BOT_LOG_CLEANUP_TARGET_FREE_MIB` | `150` | Cleanup target, never lower than the trigger threshold. |
 
 Invalid values use defaults. Retention is at least one file; storage values are at least zero. Unrelated files are left alone. If file logging is unavailable, console logging continues.
+
+## OCR memory lifecycle
+
+Gold, Silver, and guild-application OCR use a shared queue and a lazily started helper process. The helper handles image downloading, preparation, and recognition using consistent Tesseract settings and parsing logic.
+- Automatically exits after 5 minutes of inactivity, 20 completed image jobs, or a process failure.
+- Releases native memory when exiting and restarts when needed.
+- Bot shutdown waits for active jobs and helper termination. The helper also exits if its parent process dies.
+- On Linux, memory usage is checked between jobs, with a threshold of 85% of the available memory limit, capped at 512 MiB (~435 MiB threshold).
+- When usage exceeds the threshold, the helper is released. If memory remains high, processing waits up to 5 seconds before continuing.
+- Active jobs are never interrupted or rejected due to memory usage.
+- Normal jobs have no intentional delay. Helper recycling limits retained memory but does not guarantee a fixed memory ceiling.
+- If container memory metrics are unavailable, idle and batch recycling remain active.
+- The helper uses MALLOC_ARENA_MAX=2 unless configured by the host.
+- On Linux/glibc, setting this variable before Node starts can also reduce memory fragmentation in the main process. See [Sharp's memory guidance](https://sharp.pixelplumbing.com/performance/).
+- RUNTIME MEMORY logs identify helper PIDs and report process memory. Container memory also includes the helper and file cache.
+Requires data/tesseract-cache/eng.traineddata:
+```
+node --expose-gc scripts/measure_ocr_memory.js --isolated
+```
+Runs five 1080p OCR cycles, measuring parent and helper memory without Discord, MySQL, or language-data downloads. Windows can verify process behavior, while Linux is required for representative allocator measurements.

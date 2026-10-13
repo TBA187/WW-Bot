@@ -196,3 +196,115 @@ test('Tesseract string rejections retain their message for contextual error repo
     assert.equal(terminated, true);
     assert.equal(pool.snapshot().workers, 0);
 });
+
+test('a burst of thirty Gold/Silver scout images queues downloads and image processing one at a time', async () => {
+    const firstStarted = deferred(), release = deferred();
+    let creates = 0, activeImages = 0, maxActiveImages = 0, downloads = 0;
+    const pool = new OcrWorkerPool({ idleTimeoutMs: 0, workerFactory: async () => {
+        creates++;
+        return { async recognize() { return { data: { text: 'Name: Rega', confidence: 90 } }; }, async terminate() {} };
+    } });
+    const image = await sharp({ create: { width: 100, height: 80, channels: 3, background: '#ffffff' } }).png().toBuffer();
+    const servers = [new PvpScoutOcr({ workerPool: pool }), new PvpScoutOcr({ workerPool: pool })];
+    for (const ocr of servers) {
+        const analyze = ocr.analyzeAttachmentQueued.bind(ocr);
+        ocr.analyzeAttachmentQueued = async (...args) => {
+            activeImages++;
+            maxActiveImages = Math.max(maxActiveImages, activeImages);
+            try { return await analyze(...args); }
+            finally { activeImages--; }
+        };
+        ocr.download = async () => {
+            if (++downloads === 1) { firstStarted.resolve(); await release.promise; }
+            return { buffer: image };
+        };
+    }
+    const jobs = Array.from({ length: 30 }, (_, i) => servers[i % 2].analyzeAttachment({ id: String(i), url: 'image' }, String(i)));
+    await firstStarted.promise;
+    assert.equal(downloads, 1, 'waiting reports must not predownload their images');
+    assert.equal(pool.snapshot().pending, 30);
+    release.resolve();
+    try {
+        const results = await Promise.all(jobs);
+        assert.equal(results.length, 30);
+        assert.equal(new Set(results.map(result => result.attachmentId)).size, 30);
+        assert.ok(results.every(result => result.error === null));
+        assert.equal(downloads, 30);
+        assert.equal(maxActiveImages, 1);
+        assert.equal(creates, 1);
+        assert.equal(pool.snapshot().pending, 0);
+    } finally { await pool.close(); }
+});
+
+test('thirty complete image jobs reuse helpers in batches without routine sleeps or losing order', async () => {
+    let created = 0, active = 0, peak = 0, terminated = 0;
+    const pool = new OcrWorkerPool({ idleTimeoutMs: 0, containerMemory: async () => null,
+        pause: async () => { throw new Error('Normal load must not sleep'); }, workerFactory: async () => {
+            created++;
+            return { async analyzeScout(id) {
+                active++; peak = Math.max(peak, active);
+                await new Promise(resolve => setImmediate(resolve));
+                active--; return id;
+            }, async terminate() { assert.equal(active, 0); terminated++; } };
+        } });
+    const results = await Promise.all(Array.from({ length: 30 }, (_, id) => pool.run(() => pool.processImage('analyzeScout', id))));
+    assert.deepEqual(results, Array.from({ length: 30 }, (_, id) => id));
+    assert.equal(peak, 1); assert.equal(created, 2); assert.equal(terminated, 1);
+    await pool.close(); assert.equal(terminated, 2);
+});
+
+test('memory pressure releases the old helper before checking whether a short pause is needed', async () => {
+    const calls = []; let high = false;
+    const pool = new OcrWorkerPool({ idleTimeoutMs: 0,
+        containerMemory: async () => ({ used: (high ? 440 : 250) * 1048576, limit: 512 * 1048576 }),
+        pause: async () => { throw new Error('Recycling already relieved pressure'); },
+        workerFactory: async () => { calls.push('create'); return {
+            async analyzeScout(id) { calls.push('scan'); return id; },
+            async terminate() { calls.push('terminate'); high = false; }
+        }; } });
+    await pool.run(() => pool.processImage('analyzeScout', 1));
+    high = true;
+    assert.equal(await pool.run(() => pool.processImage('analyzeScout', 2)), 2);
+    assert.deepEqual(calls, ['create', 'scan', 'terminate', 'create', 'scan']);
+    await pool.close();
+});
+
+test('sustained pressure adds at most five seconds and still processes the report', async () => {
+    const delays = [], logs = [];
+    const pool = new OcrWorkerPool({ idleTimeoutMs: 0,
+        containerMemory: async () => ({ used: 450 * 1048576, limit: 588.8 * 1048576 }),
+        pause: async ms => { delays.push(ms); }, log: text => logs.push(text),
+        workerFactory: async () => ({ async analyzeScout() { return 'completed'; }, async terminate() {} }) });
+    assert.equal(await pool.run(() => pool.processImage('analyzeScout')), 'completed');
+    assert.deepEqual(delays, [1000, 1000, 1000, 1000, 1000]);
+    assert.equal(logs.length, 1);
+    assert.equal(pool.snapshot().workers, 0, 'release immediately after a high-memory job');
+    await pool.close();
+});
+
+test('pressure pauses end early and unavailable metrics never prevent processing', async () => {
+    let high = true, pauses = 0;
+    const pool = new OcrWorkerPool({ idleTimeoutMs: 0,
+        containerMemory: async () => ({ used: (high ? 360 : 200) * 1048576, limit: 400 * 1048576 }),
+        pause: async () => { pauses++; high = false; }, log() {},
+        workerFactory: async () => ({ async analyzeScout() { return 'done'; }, async terminate() {} }) });
+    assert.equal(await pool.run(() => pool.processImage('analyzeScout')), 'done');
+    assert.equal(pauses, 1);
+    pool.containerMemory = async () => { throw new Error('Cannot read cgroup'); };
+    assert.equal(await pool.run(() => pool.processImage('analyzeScout')), 'done');
+    assert.equal(pauses, 1);
+    await pool.close();
+});
+
+test('production scout pipeline sends only attachment metadata and keeps download/decoding out of the parent', async () => {
+    const ocr = new PvpScoutOcr();
+    let request;
+    ocr.download = async () => { throw new Error('Parent must not download'); };
+    ocr.workerPool = { run: task => task(), processImage: async (...args) => { request = args; return { text: 'same result' }; } };
+    const attachment = { id: 'id', name: 'image.png', url: 'https://cdn.discordapp.com/image.png', client: { large: true } };
+    assert.deepEqual(await ocr.analyzeAttachment(attachment, 'message', 'Rega', { memberNames: [] }), { text: 'same result' });
+    assert.equal(request[0], 'analyzeScout');
+    assert.deepEqual(request[1], { id: 'id', name: 'image.png', url: attachment.url });
+    assert.equal(request[2], 'message');
+    assert.equal(request[3], 'Rega');
+});

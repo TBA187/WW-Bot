@@ -257,3 +257,22 @@ for (const accept of [true, false]) test(`author edit ${accept ? 'acceptance' : 
     await f.store.resolveEditReview(ROOT, OFFICER, accept);
     assert.equal(f.state.audits.length, 1);
 });
+
+test('accepting a typo preserves the posted date and screenshot URLs and logs only real differences', async () => {
+    const { scoutVersion } = require('../features/pvp-scouting/PvpScoutStore');
+    const { auditPayload } = require('../features/pvp-scouting/ScoutAuditLogger');
+    const original = raw();
+    const before = scoutVersion(original);
+    const proposed = { ...before, content: before.content.replace('Tornadus', 'Tornadus-Therian'), createdAt: null };
+    const f = fixture([{ ...original, review_status: 'pending' }]);
+    f.state.edit = { status: 'pending', before_json: JSON.stringify(before), after_json: JSON.stringify(proposed) };
+    await f.store.resolveEditReview(ROOT, OFFICER, true);
+    const saved = await f.store.getMessage(ROOT);
+    assert.equal(saved.created_at.getTime(), original.created_at.getTime());
+    const after = f.state.audits[0].sources[0].after;
+    assert.equal(after.createdAt.getTime(), original.created_at.getTime());
+    assert.equal(after.attachments[0].url, before.attachments[0].url);
+    const fields = auditPayload(f.state.audits[0]).embeds[0].toJSON().fields;
+    assert.deepEqual(fields.map(field => field.name), ['Stored message text']);
+    assert.match(fields[0].value, /^```diff/u);
+});

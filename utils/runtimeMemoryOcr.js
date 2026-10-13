@@ -1,7 +1,8 @@
 'use strict';
 
-const fs = require('node:fs');
+const { createOcrProcessWorker } = require('./ocrProcessWorker.js');
 const path = require('node:path');
+const { readContainerMemory } = require('./runtimeHealth.js');
 
 const OCR_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const configuredSharp = new WeakSet();
@@ -19,21 +20,9 @@ class OcrWorkerPool {
     constructor(options = {}) {
         this.worker = options.worker || null;
         this.workerPromise = null;
-        this.workerFactory = options.workerFactory || (async () => {
-            const { createWorker } = require('tesseract.js');
-            const cachePath = options.cachePath || path.join(process.cwd(), 'data', 'tesseract-cache');
-            fs.mkdirSync(cachePath, { recursive: true });
-            let initialized = false;
-            const worker = await createWorker('eng', 1, { logger: () => {}, cachePath, errorHandler: error => {
-                // Preserve Tesseract's fatal initialization behavior: v7 can
-                // otherwise leave createWorker pending after a startup error.
-                // Once ready, job rejections reach our contextual scan handlers
-                // without Tesseract rethrowing them as uncaught process errors.
-                if (!initialized) throw new Error(String(error));
-            } });
-            initialized = true;
-            return worker;
-        });
+        this.workerFactory = options.workerFactory || (() => createOcrProcessWorker({
+            cachePath: options.cachePath || path.join(process.cwd(), 'data', 'tesseract-cache')
+        }));
         // A directly injected worker cannot be recreated by a custom factory.
         this.idleTimeoutMs = options.idleTimeoutMs ?? (options.worker && !options.workerFactory ? 0 : OCR_IDLE_TIMEOUT_MS);
         this.setTimeout = options.setTimeout || setTimeout;
@@ -41,6 +30,11 @@ class OcrWorkerPool {
         this.queue = Promise.resolve();
         this.pending = 0;
         this.idleTimer = null;
+        this.completedImages = 0;
+        this.containerMemory = options.containerMemory || readContainerMemory;
+        this.pause = options.pause || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+        this.log = options.log || (message => console.warn(message));
+        this.maxBatchImages = options.maxBatchImages ?? 20;
     }
 
     clearIdleTimer() {
@@ -107,17 +101,57 @@ class OcrWorkerPool {
         }
     }
 
+    async releaseWorker() {
+        const worker = this.worker || (this.workerPromise ? await this.workerPromise.catch(() => null) : null);
+        this.worker = null;
+        this.workerPromise = null;
+        this.completedImages = 0;
+        if (worker?.terminate) await worker.terminate();
+    }
+
+    async memoryPressure() {
+        try {
+            const memory = await this.containerMemory();
+            // Respect a smaller host limit; use the user's 512 MiB budget even
+            // if the hosting panel/cgroup exposes a slightly larger allowance.
+            return Boolean(memory && memory.used >= Math.min(memory.limit, 512 * 1024 * 1024) * 0.85);
+        } catch { return false; }
+    }
+
+    // Called inside run(), so recycling never interrupts a scan or lets another
+    // feature start a second image pipeline. This is a soft guard, not a quota.
+    async processImage(action, ...args) {
+        if (this.completedImages >= this.maxBatchImages) await this.releaseWorker();
+        if (await this.memoryPressure()) {
+            await this.releaseWorker();
+            if (await this.memoryPressure()) {
+                this.log('[WW LOG] OCR memory pressure: briefly delaying the next image (up to 5 seconds).');
+                for (let attempt = 0; attempt < 5; attempt++) {
+                    await this.pause(1000);
+                    if (!await this.memoryPressure()) break;
+                }
+            }
+        }
+        const worker = await this.getWorker();
+        try {
+            const result = await worker[action](...args);
+            this.completedImages++;
+            // Release large native allocations promptly, even during a burst.
+            if (await this.memoryPressure()) await this.releaseWorker();
+            return result;
+        } catch (error) {
+            await this.releaseWorker();
+            throw error;
+        }
+    }
+
     close() {
-        return this.run(async () => {
-            const worker = this.worker || (this.workerPromise ? await this.workerPromise.catch(() => null) : null);
-            this.worker = null;
-            this.workerPromise = null;
-            if (worker?.terminate) await worker.terminate();
-        });
+        return this.run(() => this.releaseWorker());
     }
 
     snapshot() {
-        return { workers: this.worker ? 1 : 0, creating: Boolean(this.workerPromise), pending: this.pending };
+        return { workers: this.worker ? 1 : 0, creating: Boolean(this.workerPromise), pending: this.pending,
+            ...(this.worker?.processId ? { processId: this.worker.processId } : {}) };
     }
 }
 

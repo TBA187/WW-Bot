@@ -1,6 +1,8 @@
 // Save source edits, moves and deletions together with their change history.
 'use strict';
 
+const { sameValue } = require('./ScoutChanges.js');
+
 const { randomBytes } = require('node:crypto');
 const { normalizeMessageRow, contentHash } = require('./PvpScoutStore.js');
 const { cleanIgn, normalizeIgn, splitScoutText } = require('./PvpScoutParser.js');
@@ -73,7 +75,7 @@ class ScoutSourceAdminStore {
                 const a = snapshot(before), next = snapshot(after);
                 const movedReply = next.staffOverrides?.rootMessageId && next.staffOverrides.rootMessageId !== next.messageId;
                 const b = { ...next, ...(action === 'source_edited' && !movedReply ? {} : { managementAction: action }) };
-                const changes = Object.fromEntries(Object.keys(b).filter(key => JSON.stringify(a[key]) !== JSON.stringify(b[key]))
+                const changes = Object.fromEntries(Object.keys(b).filter(key => !sameValue(key, a[key], b[key]))
                     .map(key => [key, { before: a[key] ?? null, after: b[key] ?? null }]));
                 await connection.query(`INSERT INTO pvp_scout_review_events
                     (message_id, channel_id, action, reviewer_id, before_json, after_json, changes_json)

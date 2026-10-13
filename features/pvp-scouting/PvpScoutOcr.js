@@ -363,6 +363,7 @@ class PvpScoutOcr {
         this.fetch = options.fetch || globalThis.fetch;
         this.workerPool = ocrWorkerPoolFor(options);
         this.maxImageBytes = options.maxImageBytes || MAX_IMAGE_BYTES;
+        this.isolatedPipeline = !options.workerPool && !options.worker && !options.workerFactory && !options.sharp && !options.fetch;
     }
 
     async download(url) {
@@ -415,6 +416,19 @@ class PvpScoutOcr {
     }
 
     async analyzeAttachment(attachment, messageId, opponentIgn, context = {}) {
+        if (this.isolatedPipeline) {
+            try {
+                // Send metadata only. Download, decoding, crop generation and OCR
+                // all happen in the helper, after this image reaches the queue head.
+                const source = { id: attachment.id, name: attachment.name, url: attachment.url };
+                return await this.workerPool.run(() => this.workerPool.processImage('analyzeScout',
+                    source, messageId, opponentIgn, context, { maxImageBytes: this.maxImageBytes }));
+            } catch (error) {
+                return { attachmentId: String(attachment.id || attachment.name || 'image'), name: attachment.name || 'scout-image',
+                    url: attachment.url, text: null, lines: [], teamLayoutStatus: 'uncertain',
+                    error: error?.message || 'Image could not be processed.', teamLayoutReason: 'Image could not be confidently inspected.' };
+            }
+        }
         return this.workerPool.run(() => this.analyzeAttachmentQueued(attachment, messageId, opponentIgn, context));
     }
 
