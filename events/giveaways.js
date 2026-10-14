@@ -9,7 +9,7 @@ const {
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { writeJsonIfChanged } = require('../utils/jsonFile.js');
+const { readJsonObject, writeJsonIfChanged } = require('../utils/jsonFile.js');
 
 const DEFAULT_GIVEAWAY_COLOR = '#39FF14';
 const GIVEAWAY_ACTIVE = 'active';
@@ -41,6 +41,19 @@ const LOGO_ATTACHMENT_URL = 'attachment://ww_logo.png';
 const GIVEAWAY_RECOVERY_SWEEP_MS = 60 * 60 * 1000;
 const GIVEAWAY_MIN_RETRY_MS = 60 * 1000;
 const GIVEAWAY_END_LEASE_SECONDS = 300;
+const END_REQUEST_FIELDS = ['end_requested_at', 'end_requested_by_id', 'end_requested_by_name'];
+const SQL_END_REQUESTED_AT = "CAST(REPLACE(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(giveaways.giveaway_json, '$.end_requested_at')), 'T', ' '), 'Z', '') AS DATETIME(6))";
+const SQL_ENTRY_CUTOFF = `LEAST(giveaways.ends_at, COALESCE(${SQL_END_REQUESTED_AT}, giveaways.ends_at))`;
+const SQL_PENDING_ANNOUNCEMENT = "giveaways.status = 'ended' AND JSON_UNQUOTE(JSON_EXTRACT(giveaways.giveaway_json, '$.end_announcement_pending')) = 'true'";
+const SQL_HAS_END_DRAW = "EXISTS (SELECT 1 FROM giveaway_draws d WHERE d.giveaway_id = giveaways.giveaway_id AND d.draw_type = 'end')";
+const SQL_HAS_END_REQUEST = "NULLIF(JSON_UNQUOTE(JSON_EXTRACT(giveaways.giveaway_json, '$.end_requested_at')), 'null') IS NOT NULL";
+
+class GiveawayFinalizationDeferred extends Error {
+    constructor(message = 'Giveaway finalization is waiting for shared storage or its claim.') {
+        super(message);
+        this.code = 'GIVEAWAY_FINALIZATION_DEFERRED';
+    }
+}
 
 const RELATIVE_TIME_RE = /(\d+)\s*(d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)/gi;
 const COLOR_NAMES = {
@@ -120,6 +133,7 @@ function makeGiveawayId() {
 }
 
 function makeDrawId(giveawayId, drawType) {
+    if (drawType === 'end') return `${giveawayId}:end`;
     return `${giveawayId}:${drawType}:${Date.now()}:${crypto.randomBytes(3).toString('hex')}`;
 }
 
@@ -382,6 +396,7 @@ function wait(milliseconds) {
 }
 
 function giveawayNeedsRecoveryCache(giveaway, now = new Date()) {
+    if (giveaway?.status === GIVEAWAY_ENDED && giveaway.end_announcement_pending) return true;
     if (giveaway?.status === GIVEAWAY_ACTIVE) return true;
     if (giveaway?.status !== GIVEAWAY_ENDED) return false;
 
@@ -403,7 +418,28 @@ function mergeGiveawaySyncState(localGiveaway, mysqlGiveaway) {
 
     // Once MySQL has a final draw/deletion, a stale active fallback must never reopen it.
     if (mysqlRank > localRank || (mysqlRank > 0 && mysqlRank === localRank)) return clone(mysqlGiveaway);
-    return clone(localGiveaway);
+    if (localRank === 2) return { ...clone(mysqlGiveaway), status: GIVEAWAY_DELETED,
+        deleted_at: localGiveaway.deleted_at, end_announcement_pending: false };
+    const merged = clone(localGiveaway);
+    if (mysqlGiveaway.end_requested_at) {
+        for (const field of END_REQUEST_FIELDS) merged[field] = mysqlGiveaway[field] ?? null;
+        merged.ends_at = mysqlGiveaway.ends_at;
+    }
+    return merged;
+}
+
+function giveawayEntryCutoff(giveaway) {
+    const times = [giveaway.ends_at, giveaway.end_requested_at].map(parseDate).filter(Boolean);
+    return times.length ? new Date(Math.min(...times.map(date => date.getTime()))) : null;
+}
+
+function endAnnouncementPending(giveaway) {
+    return giveaway?.status === GIVEAWAY_ENDED && giveaway.end_announcement_pending === true;
+}
+
+function endDrawForGiveaway(draws, giveaway = {}) {
+    return draws.find(draw => draw.draw_id === giveaway.end_draw_id && draw.draw_type === 'end')
+        || draws.find(draw => draw.draw_type === 'end') || null;
 }
 
 class GiveawayStore {
@@ -422,6 +458,7 @@ class GiveawayStore {
         this.queueDepth = 0;
         this.syncPromise = null;
         this.mysqlOutage = false;
+        this.jsonRecoveryBlocked = false;
     }
 
     getJsonSource() {
@@ -485,10 +522,6 @@ class GiveawayStore {
         this.local = this.readJsonStore();
         if (this.storageMode === 'json') {
             this.local.source = JSON_SOURCES.JSON_ONLY;
-            this.local.pendingSync = false;
-            this.local.pendingSyncGiveawayIds = [];
-            this.local.pendingSyncEntryIds = [];
-            this.local.pendingSyncDrawIds = [];
             this.writeJsonStore();
             return false;
         }
@@ -508,22 +541,33 @@ class GiveawayStore {
 
     readJsonStore() {
         fs.mkdirSync(path.dirname(this.dataFile), { recursive: true });
-        if (!fs.existsSync(this.dataFile)) {
-            const empty = emptyJsonData(this.getJsonSource());
-            this.writeJsonData(empty);
-            return empty;
-        }
-
         try {
-            const parsed = JSON.parse(fs.readFileSync(this.dataFile, 'utf8'));
+            const isObject = value => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+            const isDictionary = value => isObject(value) && Object.values(value).every(isObject);
+            const parsed = readJsonObject(this.dataFile, value =>
+                ['giveaways', 'draws'].every(key => value[key] === undefined || isDictionary(value[key]))
+                && (value.entries === undefined || isObject(value.entries) && Object.values(value.entries).every(isDictionary))
+                && ['pendingSyncGiveawayIds', 'pendingSyncEntryIds', 'pendingSyncDrawIds']
+                    .every(key => value[key] === undefined || Array.isArray(value[key])
+                        && value[key].every(id => typeof id === 'string')));
+            this.jsonRecoveryBlocked = false;
+            if (!parsed) return emptyJsonData(this.getJsonSource());
+            // Older snapshots may mark the whole file pending without individual IDs.
+            const pending = parsed.pendingSync ? {
+                pendingSyncGiveawayIds: parsed.pendingSyncGiveawayIds ?? Object.keys(parsed.giveaways || {}),
+                pendingSyncEntryIds: parsed.pendingSyncEntryIds ?? Object.entries(parsed.entries || {})
+                    .flatMap(([id, entries]) => Object.keys(entries).map(userId => entryKey(id, userId))),
+                pendingSyncDrawIds: parsed.pendingSyncDrawIds ?? Object.keys(parsed.draws || {})
+            } : {};
             return {
                 ...emptyJsonData(parsed.source || this.getJsonSource()),
-                ...parsed,
+                ...parsed, ...pending,
                 version: STORAGE_VERSION
             };
         } catch (err) {
+            this.jsonRecoveryBlocked = true;
             console.error('[WW LOG] Failed to read giveaway JSON storage:', err);
-            return emptyJsonData(this.getJsonSource());
+            throw err;
         }
     }
 
@@ -533,6 +577,7 @@ class GiveawayStore {
     }
 
     writeJsonData(data) {
+        if (this.jsonRecoveryBlocked) throw new Error('Giveaway JSON recovery is paused until its original data is restored.');
         writeJsonIfChanged(this.dataFile, this.tempFile, data);
     }
 
@@ -576,8 +621,13 @@ class GiveawayStore {
         this.cache.draws.get(giveawayId).set(drawId, clone(draw));
     }
 
-    localSaveGiveaway(giveawayId, giveaway, pendingSync) {
+    localSaveGiveaway(giveawayId, giveaway, pendingSync, { authoritative = false } = {}) {
         const saved = { ...clone(giveaway), giveaway_id: giveawayId };
+        const current = this.local.giveaways[giveawayId];
+        if (!authoritative && current?.end_requested_at) {
+            for (const field of END_REQUEST_FIELDS) saved[field] = current[field] ?? null;
+            saved.ends_at = current.ends_at;
+        }
         this.local.giveaways[giveawayId] = saved;
         if (pendingSync) this.markPending('pendingSyncGiveawayIds', giveawayId);
         this.cacheGiveaway(saved);
@@ -595,7 +645,12 @@ class GiveawayStore {
         return clone(saved);
     }
 
-    localSaveDraw(drawId, draw, pendingSync) {
+    localSaveDraw(drawId, draw, pendingSync, { authoritative = false } = {}) {
+        if (draw.draw_type === 'end') {
+            const existing = endDrawForGiveaway(Object.values(this.local.draws || {})
+                .filter(item => String(item.giveaway_id) === String(draw.giveaway_id)));
+            if (existing && !authoritative) return clone(existing);
+        }
         const saved = { ...clone(draw), draw_id: drawId };
         this.local.draws[drawId] = saved;
         if (pendingSync) this.markPending('pendingSyncDrawIds', drawId);
@@ -609,41 +664,53 @@ class GiveawayStore {
         return this.saveGiveaway(giveawayId, { ...giveaway, giveaway_id: giveawayId });
     }
 
+    async requestEnd(giveawayId, actor) {
+        return this.enqueue(async () => {
+            const current = await this.getGiveawayUnlocked(giveawayId);
+            if (!current || current.status !== GIVEAWAY_ACTIVE || current.end_requested_at) return current;
+            return this.saveGiveawayUnlocked(giveawayId, { ...current, end_requested_at: utcNowIso(),
+                end_requested_by_id: String(actor.id), end_requested_by_name: actor.displayName || actor.username || null });
+        });
+    }
+
     async saveGiveaway(giveawayId, giveaway) {
-        return this.enqueue(async () => {
-            const saved = { ...clone(giveaway), giveaway_id: giveawayId };
-            if (this.storageMode === 'json') return this.localSaveGiveaway(giveawayId, saved, false);
-
-            try {
-                await this.syncPending();
-                await this.mysqlSaveGiveaway(giveawayId, saved);
-                this.clearPending('pendingSyncGiveawayIds', giveawayId);
-                return this.localSaveGiveaway(giveawayId, saved, false);
-            } catch (err) {
-                this.noteMysqlFailure(err);
-                return this.localSaveGiveaway(giveawayId, saved, true);
-            }
-        });
+        return this.enqueue(() => this.saveGiveawayUnlocked(giveawayId, giveaway));
     }
 
-    async updateGiveaway(giveawayId, fields, { requireMysql = false } = {}) {
+    async updateGiveaway(giveawayId, fields, options = {}) {
         return this.enqueue(async () => {
-            const giveaway = await this.getGiveawayUnlocked(giveawayId, { requireMysql });
+            const giveaway = await this.getGiveawayUnlocked(giveawayId, options);
             if (!giveaway) return null;
-            return this.saveGiveawayUnlocked(giveawayId, { ...giveaway, ...fields }, { requireMysql });
+            return this.saveGiveawayUnlocked(giveawayId, { ...giveaway, ...fields }, { ...options, expectedFields: fields });
         });
     }
 
-    async saveGiveawayUnlocked(giveawayId, giveaway, { requireMysql = false } = {}) {
+    async saveGiveawayUnlocked(giveawayId, giveaway, { requireMysql = false, claim = null, expectedFields = null } = {}) {
         const saved = { ...clone(giveaway), giveaway_id: giveawayId };
+        if (saved.status === GIVEAWAY_DELETED) saved.end_announcement_pending = false;
         if (this.storageMode === 'json') return this.localSaveGiveaway(giveawayId, saved, false);
         try {
             await this.syncPendingNow();
-            await this.mysqlSaveGiveaway(giveawayId, saved);
+            const confirmed = saved.last_rerolled_at && expectedFields?.last_rerolled_at
+                ? await this.mysqlApplyReroll(giveawayId, saved)
+                : await this.mysqlSaveGiveaway(giveawayId, saved, { claim });
+            if (!confirmed) throw new GiveawayFinalizationDeferred('The shared giveaway state could not be confirmed.');
+            if (requireMysql && expectedFields && !Object.entries(expectedFields).every(([key, value]) =>
+                JSON.stringify(confirmed[key]) === JSON.stringify(value))) {
+                throw new GiveawayFinalizationDeferred('The shared giveaway write was rejected or superseded.');
+            }
             this.clearPending('pendingSyncGiveawayIds', giveawayId);
-            return this.localSaveGiveaway(giveawayId, saved, false);
+            return this.localSaveGiveaway(giveawayId, confirmed, false, { authoritative: true });
         } catch (err) {
-            if (requireMysql) throw err;
+            if (requireMysql) {
+                const confirmed = await this.mysqlGetGiveaway(giveawayId).catch(() => null);
+                if (confirmed && expectedFields && Object.entries(expectedFields).every(([key, value]) =>
+                    JSON.stringify(confirmed[key]) === JSON.stringify(value))) {
+                    this.clearPending('pendingSyncGiveawayIds', giveawayId);
+                    return this.localSaveGiveaway(giveawayId, confirmed, false, { authoritative: true });
+                }
+                throw err;
+            }
             this.noteMysqlFailure(err);
             return this.localSaveGiveaway(giveawayId, saved, true);
         }
@@ -729,25 +796,31 @@ class GiveawayStore {
 
     async listDueGiveaways(now = new Date()) {
         let giveaways;
+        let confirmedDueIds = new Set();
         if (this.canUseMysql()) {
             try {
                 await this.syncPending();
                 const [rows] = await this.mysqlQuery(`
                     SELECT giveaway_json FROM giveaways
-                    WHERE status = ? AND ends_at <= UTC_TIMESTAMP(6)
+                    WHERE ((status = ? AND (${SQL_ENTRY_CUTOFF} <= UTC_TIMESTAMP(6) OR ${SQL_HAS_END_DRAW}))
+                        OR (${SQL_PENDING_ANNOUNCEMENT}))
                       AND (end_lease_expires_at IS NULL OR end_lease_expires_at <= UTC_TIMESTAMP(6))
                     ORDER BY ends_at ASC
                 `, [GIVEAWAY_ACTIVE]);
-                giveaways = mergeById('giveaway_id', rows.map(row => fromJson(row.giveaway_json, {})), this.pendingGiveaways());
+                const due = rows.map(row => fromJson(row.giveaway_json, {}));
+                confirmedDueIds = new Set(due.map(giveaway => String(giveaway.giveaway_id)));
+                giveaways = mergeById('giveaway_id', due, this.pendingGiveaways());
             } catch (err) {
                 this.noteMysqlFailure(err);
             }
         }
-        if (!giveaways) giveaways = await this.listGiveaways(GIVEAWAY_ACTIVE);
+        if (!giveaways) giveaways = await this.listGiveaways('all');
         return giveaways.filter(giveaway => {
-            const endsAt = parseDate(giveaway.ends_at);
-            return giveaway.status === GIVEAWAY_ACTIVE && endsAt && endsAt <= now;
-        }).sort((a, b) => parseDate(a.ends_at) - parseDate(b.ends_at));
+            const cutoff = giveawayEntryCutoff(giveaway);
+            const localEnd = endDrawForGiveaway(Object.values(this.local.draws || {}).filter(draw => draw.giveaway_id === giveaway.giveaway_id));
+            return endAnnouncementPending(giveaway) || giveaway.status === GIVEAWAY_ACTIVE
+                && (confirmedDueIds.has(String(giveaway.giveaway_id)) || localEnd || cutoff && cutoff <= now);
+        }).sort((a, b) => (giveawayEntryCutoff(a)?.getTime() || 0) - (giveawayEntryCutoff(b)?.getTime() || 0));
     }
 
     async nextDueAt() {
@@ -756,27 +829,31 @@ class GiveawayStore {
                 await this.syncPending();
                 const [rows] = await this.mysqlQuery(`
                     SELECT DATE_FORMAT(MIN(CASE
-                        WHEN ends_at <= UTC_TIMESTAMP(6) AND end_lease_expires_at > UTC_TIMESTAMP(6)
-                        THEN end_lease_expires_at ELSE ends_at END), '%Y-%m-%dT%H:%i:%s.%fZ') AS due_at
-                    FROM giveaways WHERE status = ?
+                        WHEN (${SQL_ENTRY_CUTOFF} <= UTC_TIMESTAMP(6) OR (${SQL_PENDING_ANNOUNCEMENT}) OR ${SQL_HAS_END_DRAW})
+                            AND end_lease_expires_at > UTC_TIMESTAMP(6) THEN end_lease_expires_at
+                        WHEN (${SQL_PENDING_ANNOUNCEMENT}) OR ${SQL_HAS_END_DRAW} THEN UTC_TIMESTAMP(6)
+                        ELSE ${SQL_ENTRY_CUTOFF} END), '%Y-%m-%dT%H:%i:%s.%fZ') AS due_at
+                    FROM giveaways WHERE status = ? OR (${SQL_PENDING_ANNOUNCEMENT})
                 `, [GIVEAWAY_ACTIVE]);
                 const dates = [parseDate(rows[0]?.due_at), ...this.pendingGiveaways()
-                    .filter(giveaway => giveaway.status === GIVEAWAY_ACTIVE)
-                    .map(giveaway => parseDate(giveaway.ends_at))].filter(Boolean);
+                    .filter(giveaway => giveaway.status === GIVEAWAY_ACTIVE || endAnnouncementPending(giveaway))
+                    .map(giveaway => endAnnouncementPending(giveaway) ? new Date() : giveawayEntryCutoff(giveaway))].filter(Boolean);
                 return dates.length ? new Date(Math.min(...dates.map(date => date.getTime()))) : null;
             } catch (err) {
                 this.noteMysqlFailure(err);
             }
         }
-        const active = await this.listGiveaways(GIVEAWAY_ACTIVE);
-        const dates = active.map(giveaway => parseDate(giveaway.ends_at)).filter(Boolean);
+        const active = (await this.listGiveaways('all')).filter(giveaway => giveaway.status === GIVEAWAY_ACTIVE || endAnnouncementPending(giveaway));
+        const dates = active.map(giveaway => endAnnouncementPending(giveaway) ? new Date() : giveawayEntryCutoff(giveaway)).filter(Boolean);
         return dates.length ? new Date(Math.min(...dates.map(date => date.getTime()))) : null;
     }
 
     async claimEnd(giveawayId, { allowEarly = false } = {}) {
         if (!this.canUseMysql()) {
             const giveaway = await this.getGiveaway(giveawayId);
-            if (!giveaway || giveaway.status !== GIVEAWAY_ACTIVE || (!allowEarly && !giveawayHasEnded(giveaway))) return null;
+            if (!giveaway || !endAnnouncementPending(giveaway)
+                && (giveaway.status !== GIVEAWAY_ACTIVE || !allowEarly && !giveawayHasEnded(giveaway)
+                    && !endDrawForGiveaway(await this.listDraws(giveawayId)))) return null;
             return { shared: false, token: null };
         }
         await this.syncPending();
@@ -785,8 +862,9 @@ class GiveawayStore {
             UPDATE giveaways
             SET end_lease_token = ?,
                 end_lease_expires_at = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ${GIVEAWAY_END_LEASE_SECONDS} SECOND)
-            WHERE giveaway_id = ? AND status = ?
-              ${allowEarly ? '' : 'AND ends_at <= UTC_TIMESTAMP(6)'}
+            WHERE giveaway_id = ? AND ((status = ?
+              ${allowEarly ? '' : `AND (${SQL_ENTRY_CUTOFF} <= UTC_TIMESTAMP(6) OR ${SQL_HAS_END_DRAW})`})
+              OR (${SQL_PENDING_ANNOUNCEMENT}))
               AND (end_lease_expires_at IS NULL OR end_lease_expires_at <= UTC_TIMESTAMP(6))
         `, [token, giveawayId, GIVEAWAY_ACTIVE], 0);
         return result.affectedRows === 1 ? { shared: true, token } : null;
@@ -798,6 +876,15 @@ class GiveawayStore {
             UPDATE giveaways SET end_lease_token = NULL, end_lease_expires_at = NULL
             WHERE giveaway_id = ? AND end_lease_token = ?
         `, [giveawayId, claim.token], 1);
+    }
+
+    async renewEndClaim(giveawayId, claim) {
+        if (!claim?.shared) return true;
+        const [result] = await this.mysqlQuery(`UPDATE giveaways
+            SET end_lease_expires_at = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ${GIVEAWAY_END_LEASE_SECONDS} SECOND)
+            WHERE giveaway_id = ? AND end_lease_token = ? AND end_lease_expires_at > UTC_TIMESTAMP(6)
+              AND status IN ('active', 'ended')`, [giveawayId, claim.token], 0);
+        return result.affectedRows === 1;
     }
 
     async saveEntry(giveawayId, userId, entry) {
@@ -866,17 +953,22 @@ class GiveawayStore {
         return entries.sort((a, b) => String(a.joined_at || '').localeCompare(String(b.joined_at || '')));
     }
 
-    async saveDraw(drawId, draw, { requireMysql = false } = {}) {
+    async saveDraw(drawId, draw, { requireMysql = false, claim = null } = {}) {
         return this.enqueue(async () => {
             const saved = { ...clone(draw), draw_id: drawId };
             if (this.storageMode === 'json') return this.localSaveDraw(drawId, saved, false);
             try {
                 await this.syncPendingNow();
-                await this.mysqlSaveDraw(drawId, saved);
+                const confirmed = await this.mysqlSaveDraw(drawId, saved, { claim });
                 this.clearPending('pendingSyncDrawIds', drawId);
-                return this.localSaveDraw(drawId, saved, false);
+                return this.localSaveDraw(confirmed?.draw_id || drawId, confirmed || saved, false, { authoritative: true });
             } catch (err) {
-                if (requireMysql) throw err;
+                if (requireMysql) {
+                    const confirmed = draw.draw_type === 'end'
+                        ? endDrawForGiveaway(await this.mysqlListDraws(draw.giveaway_id).catch(() => [])) : null;
+                    if (confirmed) return this.localSaveDraw(confirmed.draw_id, confirmed, false, { authoritative: true });
+                    throw err;
+                }
                 this.noteMysqlFailure(err);
                 return this.localSaveDraw(drawId, saved, true);
             }
@@ -952,8 +1044,25 @@ class GiveawayStore {
         for (const giveawayId of [...(this.local.pendingSyncGiveawayIds || [])]) {
             const localGiveaway = this.local.giveaways[giveawayId];
             if (!localGiveaway) continue;
-            const giveaway = mergeGiveawaySyncState(localGiveaway, await this.mysqlGetGiveaway(giveawayId));
-            await this.mysqlSaveGiveaway(giveawayId, giveaway);
+            let giveaway = localGiveaway;
+            let confirmedReroll;
+            if (giveaway.status === GIVEAWAY_ENDED) {
+                const draws = await this.mysqlListDraws(giveawayId);
+                if (giveaway.last_rerolled_at) {
+                    // A saved reroll can have only its status update queued.
+                    // Validate against draw history before applying it narrowly.
+                    confirmedReroll = draws.find(draw => draw.draw_type === 'reroll'
+                        && draw.drawn_at === giveaway.last_rerolled_at
+                        && toJson(draw.winner_user_ids || []) === toJson(giveaway.winner_user_ids || []));
+                } else {
+                    const confirmedDraw = endDrawForGiveaway(draws);
+                    if (confirmedDraw) giveaway = { ...giveaway, winner_user_ids: confirmedDraw.winner_user_ids || [],
+                        ended_at: confirmedDraw.drawn_at, end_draw_id: confirmedDraw.draw_id, end_announcement_pending: true };
+                }
+            }
+            giveaway = confirmedReroll ? await this.mysqlApplyReroll(giveawayId, giveaway)
+                : await this.mysqlSaveGiveaway(giveawayId, giveaway);
+            if (!giveaway) throw new GiveawayFinalizationDeferred('Queued giveaway synchronization could not be confirmed.');
             this.local.giveaways[giveawayId] = clone(giveaway);
             this.cacheGiveaway(giveaway);
             this.clearPending('pendingSyncGiveawayIds', giveawayId);
@@ -971,7 +1080,20 @@ class GiveawayStore {
         for (const drawId of [...(this.local.pendingSyncDrawIds || [])]) {
             const draw = this.local.draws[drawId];
             if (!draw) continue;
-            await this.mysqlSaveDraw(drawId, draw);
+            const confirmed = await this.mysqlSaveDraw(drawId, draw);
+            if (confirmed?.draw_type === 'reroll') {
+                const current = await this.mysqlApplyReroll(confirmed.giveaway_id, { winner_user_ids: confirmed.winner_user_ids,
+                    last_rerolled_at: confirmed.drawn_at });
+                if (current) { this.local.giveaways[current.giveaway_id] = clone(current); this.cacheGiveaway(current); }
+            }
+            if (confirmed) {
+                if (confirmed.draw_id !== drawId) {
+                    delete this.local.draws[drawId];
+                    this.cache.draws.get(String(draw.giveaway_id))?.delete(String(drawId));
+                }
+                this.local.draws[confirmed.draw_id] = clone(confirmed);
+                this.cacheDraw(confirmed);
+            }
             this.clearPending('pendingSyncDrawIds', drawId);
         }
 
@@ -1052,7 +1174,50 @@ class GiveawayStore {
         return true;
     }
 
-    async mysqlSaveGiveaway(giveawayId, giveaway) {
+    async mysqlSaveGiveaway(giveawayId, giveaway, { claim = null } = {}) {
+        const incomingStatus = normalizeStatus(giveaway.status);
+        const guardParams = [];
+        const columns = ['guild_id', 'channel_id', 'message_id', 'name', 'prize', 'host_text', 'host_user_id',
+            'created_by_id', 'created_by_name', 'winners_total', 'required_role_id', 'starts_at', 'ends_at',
+            'ended_at', 'deleted_at', 'color_hex', 'thumbnail_url', 'winner_user_ids', 'giveaway_json', 'status'];
+        const guard = () => {
+            if (claim?.shared) {
+                guardParams.push(claim.token);
+                return "COALESCE(giveaways.end_lease_token, '') <> ? OR giveaways.end_lease_expires_at IS NULL OR giveaways.end_lease_expires_at <= UTC_TIMESTAMP(6) OR giveaways.status NOT IN ('active', 'ended')";
+            }
+            if (incomingStatus === GIVEAWAY_ACTIVE) return `giveaways.status IN ('ended', 'deleted') OR ${SQL_HAS_END_DRAW}
+                OR ${SQL_HAS_END_REQUEST}`;
+            if (incomingStatus === GIVEAWAY_ENDED) {
+                guardParams.push(giveaway.end_draw_id || '', toJson(giveaway.winner_user_ids || []));
+                return `giveaways.status IN ('ended', 'deleted') OR (${SQL_HAS_END_DRAW} AND NOT EXISTS
+                    (SELECT 1 FROM giveaway_draws d WHERE d.giveaway_id = giveaways.giveaway_id
+                     AND d.draw_type = 'end' AND d.draw_id = ? AND d.winner_user_ids = ?))`;
+            }
+            return "giveaways.status = 'deleted'";
+        };
+        // Guard every column against the original row. JSON and status are last.
+        const updates = columns.map(column => {
+            if (incomingStatus === GIVEAWAY_DELETED && !claim?.shared) {
+                if (column === 'status' || column === 'deleted_at') return `${column} = VALUES(${column})`;
+                if (column === 'giveaway_json') return `giveaway_json = JSON_SET(giveaways.giveaway_json, '$.status', 'deleted',
+                    '$.deleted_at', JSON_EXTRACT(VALUES(giveaway_json), '$.deleted_at'), '$.end_announcement_pending', JSON_EXTRACT('false', '$'))`;
+                return `${column} = giveaways.${column}`;
+            }
+            let value = `VALUES(${column})`;
+            if (column === 'giveaway_json') value = `IF(${SQL_HAS_END_REQUEST},
+                JSON_SET(VALUES(giveaway_json), '$.ends_at', JSON_EXTRACT(giveaways.giveaway_json, '$.ends_at'),
+                    '$.end_requested_at', JSON_EXTRACT(giveaways.giveaway_json, '$.end_requested_at'),
+                    '$.end_requested_by_id', JSON_EXTRACT(giveaways.giveaway_json, '$.end_requested_by_id'),
+                    '$.end_requested_by_name', JSON_EXTRACT(giveaways.giveaway_json, '$.end_requested_by_name')), VALUES(giveaway_json))`;
+            if (column === 'ends_at') value = `IF(${SQL_HAS_END_REQUEST}, giveaways.ends_at, VALUES(ends_at))`;
+            return `${column} = IF(${guard()}, giveaways.${column}, ${value})`;
+        }).join(',\n');
+        const selectParams = claim?.shared ? [giveawayId, claim.token] : [];
+        const values = claim?.shared
+            ? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM giveaways AS claimed
+                WHERE claimed.giveaway_id = ? AND claimed.end_lease_token = ?
+                  AND claimed.end_lease_expires_at > UTC_TIMESTAMP(6) AND claimed.status IN ('active', 'ended')`
+            : 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
         await this.mysqlQuery(`
             INSERT INTO giveaways (
                 giveaway_id, guild_id, channel_id, message_id, name, prize,
@@ -1061,28 +1226,8 @@ class GiveawayStore {
                 ended_at, deleted_at, color_hex, thumbnail_url,
                 winner_user_ids, giveaway_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE
-                guild_id = VALUES(guild_id),
-                channel_id = VALUES(channel_id),
-                message_id = VALUES(message_id),
-                name = VALUES(name),
-                prize = VALUES(prize),
-                host_text = VALUES(host_text),
-                host_user_id = VALUES(host_user_id),
-                created_by_id = VALUES(created_by_id),
-                created_by_name = VALUES(created_by_name),
-                winners_total = VALUES(winners_total),
-                required_role_id = VALUES(required_role_id),
-                status = VALUES(status),
-                starts_at = VALUES(starts_at),
-                ends_at = VALUES(ends_at),
-                ended_at = VALUES(ended_at),
-                deleted_at = VALUES(deleted_at),
-                color_hex = VALUES(color_hex),
-                thumbnail_url = VALUES(thumbnail_url),
-                winner_user_ids = VALUES(winner_user_ids),
-                giveaway_json = VALUES(giveaway_json)
+            ${values}
+            ON DUPLICATE KEY UPDATE ${updates}
         `, [
             giveawayId,
             giveaway.guild_id ?? null,
@@ -1104,8 +1249,20 @@ class GiveawayStore {
             parseColor(giveaway.color_hex),
             giveaway.thumbnail_url ?? null,
             toJson(giveaway.winner_user_ids || []),
-            JSON.stringify(giveaway)
+            JSON.stringify(giveaway), ...selectParams, ...guardParams
         ]);
+        return this.mysqlGetGiveaway(giveawayId);
+    }
+
+    async mysqlApplyReroll(giveawayId, giveaway) {
+        const winners = toJson(giveaway.winner_user_ids || []);
+        await this.mysqlQuery(`UPDATE giveaways SET winner_user_ids = ?,
+            giveaway_json = JSON_SET(giveaway_json, '$.winner_user_ids', JSON_EXTRACT(?, '$'), '$.last_rerolled_at', ?)
+            WHERE giveaway_id = ? AND status = 'ended'
+              AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(giveaway_json, '$.end_announcement_pending')), 'false') <> 'true'
+              AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(giveaway_json, '$.last_rerolled_at')), '') < ?`,
+        [winners, winners, giveaway.last_rerolled_at, giveawayId, giveaway.last_rerolled_at]);
+        return this.mysqlGetGiveaway(giveawayId);
     }
 
     async mysqlGetGiveaway(giveawayId) {
@@ -1167,36 +1324,74 @@ class GiveawayStore {
         return rows.map(row => fromJson(row.entry_json, {}));
     }
 
-    async mysqlSaveDraw(drawId, draw) {
-        await this.mysqlQuery(`
-            INSERT INTO giveaway_draws (
-                draw_id, giveaway_id, draw_type, drawn_by_id, drawn_at,
-                eligible_count, winner_user_ids, draw_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE
-                giveaway_id = VALUES(giveaway_id),
-                draw_type = VALUES(draw_type),
-                drawn_by_id = VALUES(drawn_by_id),
-                drawn_at = VALUES(drawn_at),
-                eligible_count = VALUES(eligible_count),
-                winner_user_ids = VALUES(winner_user_ids),
-                draw_json = VALUES(draw_json)
-        `, [
-            drawId,
-            draw.giveaway_id,
-            draw.draw_type,
-            draw.drawn_by_id ?? null,
-            mysqlDate(draw.drawn_at),
-            Number(draw.eligible_count || 0),
-            toJson(draw.winner_user_ids || []),
-            JSON.stringify(draw)
-        ]);
+    async mysqlSaveDraw(drawId, draw, { claim = null } = {}) {
+        const isEnd = draw.draw_type === 'end';
+        const saved = { ...draw, draw_id: isEnd ? makeDrawId(draw.giveaway_id, 'end') : drawId };
+        let connection;
+        try {
+            if (isEnd) {
+                connection = await this.db.getConnection();
+                await connection.beginTransaction();
+                // Lock the parent even under READ COMMITTED. A SELECT in an
+                // INSERT alone need not lock it, allowing a new host to claim it.
+                const [rows] = await connection.query(`SELECT giveaway_id FROM giveaways
+                    WHERE giveaway_id = ? ${claim?.shared
+                        ? "AND end_lease_token = ? AND end_lease_expires_at > UTC_TIMESTAMP(6) AND status IN ('active', 'ended')"
+                        : 'AND (end_lease_expires_at IS NULL OR end_lease_expires_at <= UTC_TIMESTAMP(6))'} FOR UPDATE`,
+                claim?.shared ? [draw.giveaway_id, claim.token] : [draw.giveaway_id]);
+                if (!rows.length) throw new GiveawayFinalizationDeferred('The end draw claim could not be confirmed.');
+            }
+            const query = connection ? connection.query.bind(connection) : this.mysqlQuery.bind(this);
+            const guardParams = [];
+            if (isEnd) guardParams.push(draw.giveaway_id);
+            if (isEnd && claim?.shared) guardParams.push(claim.token);
+            const values = isEnd
+                ? `SELECT ?, ?, ?, ?, ?, ?, ?, ? FROM giveaways AS claimed
+                    LEFT JOIN giveaway_draws AS existing ON existing.giveaway_id = claimed.giveaway_id AND existing.draw_type = 'end'
+                    WHERE claimed.giveaway_id = ?
+                    ${claim?.shared ? "AND claimed.end_lease_token = ? AND claimed.end_lease_expires_at > UTC_TIMESTAMP(6) AND claimed.status IN ('active', 'ended')"
+                        : 'AND (claimed.end_lease_expires_at IS NULL OR claimed.end_lease_expires_at <= UTC_TIMESTAMP(6))'}
+                    AND existing.draw_id IS NULL`
+                : 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+            const updates = isEnd ? 'draw_id = giveaway_draws.draw_id' : ['giveaway_id', 'drawn_by_id', 'drawn_at',
+                'eligible_count', 'winner_user_ids', 'draw_json', 'draw_type']
+                .map(column => `${column} = IF(draw_type = 'end', ${column}, VALUES(${column}))`).join(',\n');
+            await query(`
+                INSERT INTO giveaway_draws (
+                    draw_id, giveaway_id, draw_type, drawn_by_id, drawn_at,
+                    eligible_count, winner_user_ids, draw_json
+                )
+                ${values}
+                ON DUPLICATE KEY UPDATE ${updates}
+            `, [
+                saved.draw_id,
+                draw.giveaway_id,
+                draw.draw_type,
+                draw.drawn_by_id ?? null,
+                mysqlDate(draw.drawn_at),
+                Number(draw.eligible_count || 0),
+                toJson(draw.winner_user_ids || []),
+                JSON.stringify(saved), ...guardParams
+            ]);
+            if (!isEnd) return saved;
+            const confirmed = endDrawForGiveaway(await this.mysqlListDraws(draw.giveaway_id, { connection }));
+            if (!confirmed) throw new GiveawayFinalizationDeferred('The shared end draw could not be confirmed.');
+            await connection.commit();
+            this.noteMysqlRestored();
+            return confirmed;
+        } catch (err) {
+            if (connection) await connection.rollback().catch(() => {});
+            if (!(err instanceof GiveawayFinalizationDeferred)) this.noteMysqlFailure(err);
+            throw err;
+        } finally {
+            connection?.release();
+        }
     }
 
-    async mysqlListDraws(giveawayId) {
-        const [rows] = await this.mysqlQuery(
-            'SELECT draw_json FROM giveaway_draws WHERE giveaway_id = ? ORDER BY drawn_at ASC',
+    async mysqlListDraws(giveawayId, { connection = null } = {}) {
+        const query = connection ? connection.query.bind(connection) : this.mysqlQuery.bind(this);
+        const [rows] = await query(
+            'SELECT draw_json FROM giveaway_draws WHERE giveaway_id = ? ORDER BY drawn_at ASC, draw_id ASC',
             [giveawayId]
         );
         return rows.map(row => fromJson(row.draw_json, {}));
@@ -1463,14 +1658,21 @@ async function endGiveaway(client, config, giveaway, { actor = null, drawType, w
 }
 
 async function claimAndEndGiveawayLocked(client, config, giveaway, options = {}) {
+    if (options.drawType === 'end' && options.actor && config.giveawayStore.requestEnd) {
+        giveaway = await config.giveawayStore.requestEnd(String(giveaway.giveaway_id), options.actor) || giveaway;
+        wakeGiveawayLoop(client);
+    }
     if (options.drawType !== 'end' || !config.giveawayStore.claimEnd) {
         return endGiveawayLocked(client, config, giveaway, options);
     }
     const giveawayId = String(giveaway.giveaway_id);
-    const claim = await config.giveawayStore.claimEnd(giveawayId, { allowEarly: Boolean(options.actor) });
+    const claim = await config.giveawayStore.claimEnd(giveawayId, { allowEarly: Boolean(options.actor || giveaway.end_requested_at) });
     if (!claim) {
-        const current = await config.giveawayStore.getGiveaway(giveawayId);
-        return [current || giveaway, (current?.winner_user_ids || []).map(String)];
+        const current = await config.giveawayStore.getGiveaway(giveawayId, { requireMysql: Boolean(config.giveawayStore.canUseMysql?.()) });
+        if (current && current.status !== GIVEAWAY_ACTIVE && !endAnnouncementPending(current)) {
+            return [current, (current.winner_user_ids || []).map(String)];
+        }
+        throw new GiveawayFinalizationDeferred('Another host is finishing this giveaway.');
     }
     let completed = false;
     let writeAttempted = false;
@@ -1478,10 +1680,10 @@ async function claimAndEndGiveawayLocked(client, config, giveaway, options = {})
         const result = await endGiveawayLocked(client, config, giveaway, {
             ...options,
             requireMysql: Boolean(claim.shared),
+            endClaim: claim,
             onWriteStart: () => { writeAttempted = true; }
         });
         completed = true;
-        wakeGiveawayLoop(client);
         return result;
     } finally {
         // A failed read is safe to release; an uncertain draw write keeps the claim until expiry.
@@ -1493,15 +1695,43 @@ async function claimAndEndGiveawayLocked(client, config, giveaway, options = {})
     }
 }
 
-async function endGiveawayLocked(client, config, giveaway, { actor = null, drawType, winnerCount = null, announceInteraction = null, requireMysql = false, onWriteStart = null } = {}) {
+async function renewGiveawayClaim(store, giveawayId, claim, onWriteStart) {
+    if (!claim?.shared) return;
+    onWriteStart?.();
+    if (!store.renewEndClaim || !await store.renewEndClaim(giveawayId, claim)) {
+        throw new GiveawayFinalizationDeferred('The giveaway claim expired or belongs to another host.');
+    }
+}
+
+async function publishGiveawayEnd(client, config, giveaway, winnerIds, { announceInteraction, requireMysql, endClaim, onWriteStart }) {
+    await refreshGiveawayMessage(client, config, giveaway, { disabled: true });
+    await renewGiveawayClaim(config.giveawayStore, giveaway.giveaway_id, endClaim, onWriteStart);
+    const delivery = await announceGiveawayDraw(client, giveaway, winnerIds, { drawType: 'end', interaction: announceInteraction });
+    if (!delivery) return giveaway;
+    await renewGiveawayClaim(config.giveawayStore, giveaway.giveaway_id, endClaim, onWriteStart);
+    onWriteStart?.();
+    const confirmed = await config.giveawayStore.updateGiveaway(giveaway.giveaway_id, {
+        end_announcement_pending: false, end_announcement_message_id: delivery.id || null
+    }, { requireMysql, claim: endClaim });
+    if (requireMysql && confirmed?.end_announcement_pending !== false) {
+        throw new GiveawayFinalizationDeferred('The giveaway announcement receipt could not be confirmed.');
+    }
+    return confirmed || { ...giveaway, end_announcement_pending: false };
+}
+
+async function endGiveawayLocked(client, config, giveaway, { actor = null, drawType, winnerCount = null, announceInteraction = null,
+    requireMysql = false, onWriteStart = null, endClaim = null } = {}) {
     const giveawayId = String(giveaway.giveaway_id);
     const current = await config.giveawayStore.getGiveaway(giveawayId, { requireMysql });
-    if (!current) return [giveaway, []];
+    if (!current) {
+        if (requireMysql) throw new GiveawayFinalizationDeferred('The shared giveaway could not be found.');
+        return [giveaway, []];
+    }
 
     const existingDraws = await config.giveawayStore.listDraws(giveawayId, { requireMysql });
     if (drawType === 'end') {
-        const previousEndDraw = [...existingDraws].reverse().find(draw => draw.draw_type === 'end');
-        if (current.status !== GIVEAWAY_ACTIVE) {
+        const previousEndDraw = endDrawForGiveaway(existingDraws, current);
+        if (current.status !== GIVEAWAY_ACTIVE && !endAnnouncementPending(current)) {
             return [current, (current.winner_user_ids || previousEndDraw?.winner_user_ids || []).map(String)];
         }
 
@@ -1509,28 +1739,40 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
         if (previousEndDraw) {
             const winnerIds = (previousEndDraw.winner_user_ids || []).map(String);
             const endedAt = previousEndDraw.drawn_at || utcNowIso();
+            if (endAnnouncementPending(current)) return [await publishGiveawayEnd(client, config, current, winnerIds,
+                { announceInteraction, requireMysql, endClaim, onWriteStart }), winnerIds];
+            await renewGiveawayClaim(config.giveawayStore, giveawayId, endClaim, onWriteStart);
             onWriteStart?.();
             const savedRecovery = await config.giveawayStore.updateGiveaway(giveawayId, {
                 status: GIVEAWAY_ENDED,
                 ended_at: endedAt,
-                winner_user_ids: winnerIds
-            }, { requireMysql });
+                winner_user_ids: winnerIds, end_draw_id: previousEndDraw.draw_id, end_announcement_pending: true
+            }, { requireMysql, claim: endClaim });
             if (requireMysql && !savedRecovery) throw new Error(`Giveaway ${giveawayId} disappeared before its end was saved.`);
             const recovered = savedRecovery || {
                 ...current,
                 status: GIVEAWAY_ENDED,
                 ended_at: endedAt,
-                winner_user_ids: winnerIds
+                winner_user_ids: winnerIds, end_draw_id: previousEndDraw.draw_id, end_announcement_pending: true
             };
-            await refreshGiveawayMessage(client, config, recovered, { disabled: true });
-            await announceGiveawayDraw(client, recovered, winnerIds, { drawType, interaction: announceInteraction });
-            return [recovered, winnerIds];
+            if (recovered.status !== GIVEAWAY_ENDED) throw new GiveawayFinalizationDeferred('The recovered giveaway end was not saved.');
+            return [await publishGiveawayEnd(client, config, recovered, winnerIds,
+                { announceInteraction, requireMysql, endClaim, onWriteStart }), winnerIds];
         }
+        if (current.status === GIVEAWAY_ENDED) throw new GiveawayFinalizationDeferred('The saved end draw could not be found.');
     } else if (drawType === 'reroll' && current.status !== GIVEAWAY_ENDED) {
         return [current, (current.winner_user_ids || []).map(String)];
     }
+    if (drawType === 'reroll' && endAnnouncementPending(current)) {
+        throw new GiveawayFinalizationDeferred('The initial giveaway announcement is still pending.');
+    }
 
-    const entries = await config.giveawayStore.listEntries(giveawayId, { activeOnly: true, requireMysql });
+    let entries = await config.giveawayStore.listEntries(giveawayId, { activeOnly: drawType !== 'end', requireMysql });
+    if (drawType === 'end') {
+        const cutoff = giveawayEntryCutoff(current) || new Date();
+        entries = entries.filter(entry => (parseDate(entry.joined_at) || cutoff) <= cutoff
+            && (!entry.left_at || parseDate(entry.left_at) > cutoff)).map(entry => ({ ...entry, left_at: null }));
+    }
     const count = winnerCount || Number(current.winners_total || 1);
     const excluded = new Set();
     if (drawType === 'reroll') {
@@ -1541,33 +1783,46 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
     }
 
     const winners = chooseWinners(entries, count, excluded);
-    const winnerIds = winners.map(entry => String(entry.user_id));
-    const now = utcNowIso();
+    let winnerIds = winners.map(entry => String(entry.user_id));
+    let now = utcNowIso();
     const drawId = makeDrawId(giveawayId, drawType);
     const draw = {
         draw_id: drawId,
         giveaway_id: giveawayId,
         draw_type: drawType,
-        drawn_by_id: actor?.id ?? null,
-        drawn_by_name: actor?.displayName ?? actor?.username ?? null,
+        drawn_by_id: drawType === 'end' && current.end_requested_at ? current.end_requested_by_id : actor?.id ?? null,
+        drawn_by_name: drawType === 'end' && current.end_requested_at ? current.end_requested_by_name : actor?.displayName ?? actor?.username ?? null,
         drawn_at: now,
         eligible_count: activeEntries(entries).length,
         winner_user_ids: winnerIds
     };
+    await renewGiveawayClaim(config.giveawayStore, giveawayId, endClaim, onWriteStart);
     onWriteStart?.();
-    await config.giveawayStore.saveDraw(drawId, draw, { requireMysql });
+    const savedDraw = await config.giveawayStore.saveDraw(drawId, draw, { requireMysql, claim: endClaim });
+    if (drawType === 'end') {
+        if (requireMysql && !savedDraw) throw new GiveawayFinalizationDeferred('The shared end draw could not be confirmed.');
+        if (savedDraw) { winnerIds = (savedDraw.winner_user_ids || []).map(String); now = savedDraw.drawn_at || now; }
+    }
 
     const updates = { winner_user_ids: winnerIds };
     if (drawType === 'end') {
         updates.status = GIVEAWAY_ENDED;
         updates.ended_at = now;
+        updates.end_draw_id = savedDraw?.draw_id || drawId;
+        updates.end_announcement_pending = true;
     } else {
         updates.last_rerolled_at = now;
     }
 
-    const savedUpdate = await config.giveawayStore.updateGiveaway(giveawayId, updates, { requireMysql });
+    await renewGiveawayClaim(config.giveawayStore, giveawayId, endClaim, onWriteStart);
+    const savedUpdate = await config.giveawayStore.updateGiveaway(giveawayId, updates, { requireMysql, claim: endClaim });
     if (requireMysql && !savedUpdate) throw new Error(`Giveaway ${giveawayId} disappeared before its end was saved.`);
     const updated = savedUpdate || { ...current, ...updates };
+    if (drawType === 'end') {
+        if (updated.status !== GIVEAWAY_ENDED) throw new GiveawayFinalizationDeferred('The giveaway end was not saved.');
+        return [await publishGiveawayEnd(client, config, updated, winnerIds,
+            { announceInteraction, requireMysql, endClaim, onWriteStart }), winnerIds];
+    }
     await refreshGiveawayMessage(client, config, updated, { disabled: true });
     await announceGiveawayDraw(client, updated, winnerIds, { drawType, interaction: announceInteraction });
     return [updated, winnerIds];
@@ -1576,31 +1831,33 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
 async function announceGiveawayDraw(client, giveaway, winnerIds, { drawType, interaction = null }) {
     const content = drawAnnouncementContent(giveaway, winnerIds, { drawType });
     if (interaction) {
-        if (interaction.replied) return;
         try {
-            if (interaction.deferred) {
-                await interaction.editReply({ content, allowedMentions: { users: winnerIds } });
+            if (interaction.deferred || interaction.replied) {
+                return await interaction.editReply({ content, allowedMentions: { users: winnerIds } }) || {};
             } else {
-                await interaction.reply({ content, allowedMentions: { users: winnerIds } });
+                return await interaction.reply({ content, allowedMentions: { users: winnerIds } }) || {};
             }
         } catch {
             // The command handler will finish the deferred response with its own status message.
         }
-        return;
+        return null;
     }
 
     const channel = await getChannel(client, giveaway.channel_id);
-    if (!channel) return;
+    if (!channel) return null;
     const message = await fetchGiveawayMessage(channel, giveaway);
     try {
+        const delivery = drawType === 'end' ? { nonce: crypto.createHash('sha256')
+            .update(`giveaway-end:${giveaway.giveaway_id}`).digest('hex').slice(0, 24), enforceNonce: true } : {};
         if (message) {
-            await message.reply({ content, allowedMentions: { users: winnerIds }, failIfNotExists: false });
+            return await message.reply({ content, allowedMentions: { users: winnerIds, repliedUser: false }, failIfNotExists: false, ...delivery }) || {};
         } else {
-            await channel.send({ content, allowedMentions: { users: winnerIds } });
+            return await channel.send({ content, allowedMentions: { users: winnerIds }, ...delivery }) || {};
         }
     } catch {
         // Announcement failure should not undo an ended giveaway.
     }
+    return null;
 }
 
 async function fetchGiveawayMessage(channel, giveaway) {
@@ -1699,8 +1956,8 @@ async function handleJoinLeave(interaction, config) {
             try {
                 await claimAndEndGiveawayLocked(interaction.client, config, giveaway, { actor: null, drawType: 'end' });
             } catch (err) {
-                if (!config.giveawayStore.db?.isDatabaseUnavailableError?.(err)) throw err;
-                return { type: 'storage_unavailable' };
+                if (!(err instanceof GiveawayFinalizationDeferred) && !config.giveawayStore.db?.isDatabaseUnavailableError?.(err)) throw err;
+                return { type: 'ended' };
             }
             return { type: 'ended' };
         }
@@ -1772,7 +2029,7 @@ async function handleParticipantsButton(interaction, config) {
 
 function giveawayHasEnded(giveaway, now = new Date()) {
     if (giveaway.status !== GIVEAWAY_ACTIVE) return true;
-    const endsAt = parseDate(giveaway.ends_at);
+    const endsAt = giveawayEntryCutoff(giveaway);
     return endsAt ? endsAt <= now : false;
 }
 
@@ -2137,11 +2394,11 @@ function startGiveawayLoop(client, config) {
             for (const [index, giveaway] of dueGiveaways.entries()) {
                 try {
                     const current = await config.giveawayStore.getGiveaway(giveaway.giveaway_id);
-                    if (current?.status === GIVEAWAY_ACTIVE) {
+                    if (current?.status === GIVEAWAY_ACTIVE || endAnnouncementPending(current)) {
                         await endGiveaway(client, config, current, { actor: null, drawType: 'end' });
                     }
                 } catch (err) {
-                    if (!config.giveawayStore.db?.isDatabaseUnavailableError?.(err)) {
+                    if (!(err instanceof GiveawayFinalizationDeferred) && !config.giveawayStore.db?.isDatabaseUnavailableError?.(err)) {
                         console.error(`[WW LOG] Could not end giveaway ${giveaway.giveaway_id || 'unknown'}:`, err);
                     }
                 }
@@ -2184,6 +2441,9 @@ function wakeGiveawayLoop(client) {
 }
 
 module.exports = {
+    GiveawayFinalizationDeferred,
+    giveawayEntryCutoff,
+    makeDrawId,
     DEFAULT_GIVEAWAY_COLOR,
     GIVEAWAY_ACTIVE,
     GIVEAWAY_DELETED,

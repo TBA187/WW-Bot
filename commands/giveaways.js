@@ -8,6 +8,7 @@ const {
     GIVEAWAY_ACTIVE,
     GIVEAWAY_DELETED,
     GIVEAWAY_ENDED,
+    GiveawayFinalizationDeferred,
     buildGiveawayListEmbeds,
     canManageGiveaways,
     deleteGiveawayMessage,
@@ -17,6 +18,7 @@ const {
     giveawayChannelOnlyError,
     giveawayDisplayLabel,
     giveawayEndedWithinRerollWindow,
+    giveawayHasEnded,
     makeGiveawayId,
     normalizeGiveawayDescription,
     parseColor,
@@ -414,7 +416,7 @@ class Giveaways {
 
         const updated = await withGiveawayLock(giveawayId, async () => {
             const record = await this.giveawayStore.getGiveaway(giveawayId);
-            if (!record || record.status !== GIVEAWAY_ACTIVE) return null;
+            if (!record || giveawayHasEnded(record)) return null;
             return this.giveawayStore.updateGiveaway(giveawayId, updates);
         });
         if (!updated) return interaction.editReply('That active giveaway could not be found.');
@@ -431,7 +433,7 @@ class Giveaways {
         await interaction.deferReply();
         const giveawayId = interaction.options.getString('giveaway', true);
         const record = await this.giveawayStore.getGiveaway(giveawayId);
-        if (!record || record.status !== GIVEAWAY_ACTIVE) {
+        if (!record || record.status !== GIVEAWAY_ACTIVE && !record.end_announcement_pending) {
             return interaction.editReply('That active giveaway could not be found.');
         }
 
@@ -444,12 +446,19 @@ class Giveaways {
                 announceInteraction: interaction
             });
         } catch (err) {
-            if (!this.giveawayStore.db?.isDatabaseUnavailableError?.(err)) throw err;
+            if (!(err instanceof GiveawayFinalizationDeferred) && !this.giveawayStore.db?.isDatabaseUnavailableError?.(err)) throw err;
+            const saved = await this.giveawayStore.getGiveaway(giveawayId);
+            if (saved?.end_requested_at || saved?.end_announcement_pending) {
+                return interaction.editReply('The end request was saved. Entries are closed; the giveaway will finish automatically when storage and delivery are available.');
+            }
             return interaction.editReply('Giveaway storage is temporarily unavailable. Please try again shortly.');
         }
 
         if (ended.status !== GIVEAWAY_ENDED) {
             return interaction.editReply('That active giveaway could not be found.');
+        }
+        if (ended.end_announcement_pending) {
+            return interaction.editReply('The giveaway ended and its winners were saved. The announcement is pending and will retry automatically.');
         }
 
         const summary = drawSummary('Ended', ended, winnerIds, interaction.guild);
@@ -510,12 +519,18 @@ class Giveaways {
             return interaction.editReply(err.message);
         }
 
-        const [rerolled, winnerIds] = await endGiveaway(interaction.client, this.config, record, {
-            actor: interaction.user,
-            drawType: 'reroll',
-            winnerCount,
-            announceInteraction: interaction
-        });
+        let rerolled, winnerIds;
+        try {
+            [rerolled, winnerIds] = await endGiveaway(interaction.client, this.config, record, {
+                actor: interaction.user,
+                drawType: 'reroll',
+                winnerCount,
+                announceInteraction: interaction
+            });
+        } catch (err) {
+            if (!(err instanceof GiveawayFinalizationDeferred)) throw err;
+            return interaction.editReply(err.message);
+        }
 
         if (rerolled.status !== GIVEAWAY_ENDED) {
             return interaction.editReply('That ended giveaway could not be found.');

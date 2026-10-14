@@ -22,6 +22,7 @@ data/pvp_king_silver_data.json
 data/pvp_king_silver_data.json.tmp
 data/giveaways.json
 data/giveaways.json.tmp
+data/giveaways.json.corrupt-*
 data/guild_settings.json
 data/guild_settings.json.tmp
 data/xp_pending.json

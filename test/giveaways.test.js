@@ -439,6 +439,7 @@ test('an uncertain end draw keeps its shared claim until expiry', async () => {
     const initial = giveaway();
     const store = {
         async claimEnd() { return { shared: true, token: 'claimed' }; },
+        async renewEndClaim() { return true; },
         async releaseEndClaim() { releases++; },
         async getGiveaway() { return initial; },
         async listDraws() { return []; },
@@ -475,11 +476,12 @@ test('a shared end does not announce a draw without a saved giveaway state', asy
     const initial = giveaway();
     const store = {
         async claimEnd() { return { shared: true, token: 'claimed' }; },
+        async renewEndClaim() { return true; },
         async releaseEndClaim() { releases++; },
         async getGiveaway() { return initial; },
         async listDraws() { return []; },
         async listEntries() { return []; },
-        async saveDraw() {},
+        async saveDraw(_id, draw) { return draw; },
         async updateGiveaway() { return null; }
     };
     await assert.rejects(endGiveaway(emptyClient(), { giveawayStore: store }, initial, { drawType: 'end' }),
@@ -541,6 +543,9 @@ test('safe giveaway SQL retries once, while end claims do not', async () => {
                     if (retries === 0) throw err;
                     continue;
                 }
+                if (key === 'SELECT DRAW_JSON FROM') return [[{ draw_json: JSON.stringify({
+                    draw_id: 'giveaway-1:end', giveaway_id: 'giveaway-1', draw_type: 'end', winner_user_ids: []
+                }) }]];
                 if (key.startsWith('SELECT')) return [[{ giveaway_json: JSON.stringify(giveaway()) }]];
                 return [{ affectedRows: 1 }];
             }
@@ -551,9 +556,9 @@ test('safe giveaway SQL retries once, while end claims do not', async () => {
     assert.equal((await store.mysqlGetGiveaway('giveaway-1')).giveaway_id, 'giveaway-1');
     await store.mysqlSaveGiveaway('giveaway-1', giveaway());
     await store.mysqlSaveEntry('giveaway-1', 'user-1', { joined_at: giveaway().starts_at });
-    await store.mysqlSaveDraw('draw-1', { giveaway_id: 'giveaway-1', draw_type: 'end', drawn_at: giveaway().ends_at });
+    await store.mysqlSaveDraw('draw-1', { giveaway_id: 'giveaway-1', draw_type: 'reroll', drawn_at: giveaway().ends_at });
     await store.releaseEndClaim('giveaway-1', { shared: true, token: 'exact-token' });
-    assert.equal(attempts.get('SELECT GIVEAWAY_JSON FROM'), 2);
+    assert.equal(attempts.get('SELECT GIVEAWAY_JSON FROM'), 4);
     assert.equal(attempts.get('INSERT INTO GIVEAWAYS'), 2);
     assert.equal(attempts.get('INSERT INTO GIVEAWAY_ENTRIES'), 2);
     assert.equal(attempts.get('INSERT INTO GIVEAWAY_DRAWS'), 2);
