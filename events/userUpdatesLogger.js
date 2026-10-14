@@ -75,7 +75,7 @@ function nameChangeDescription(user, label, oldValue, newValue, forcedAction = n
 
 function serverNicknameDescription(executor, member, isModeratorAction, oldValue, newValue) {
     const action = getChangeAction(oldValue, newValue);
-    const article = action === 'Added' ? 'a' : 'their';
+    const article = action === 'Added' ? 'a' : isModeratorAction ? 'the' : 'their';
 
     if (isModeratorAction) {
         return `<@${executor.id}> ${actionVerb(action)} ${article} **Server Nickname** for <@${member.id}>`;

@@ -151,7 +151,7 @@ test('first-use setup is private and branded and remembers the chosen IGN', asyn
     const payload = lastEdit(i), embed = payload.embeds[0].toJSON();
     assert.equal(payload.content, `### <@${USER_ID}>, please select your default server below.`);
     assert.equal(embed.footer.text, 'White Walker Server Settings');
-    assert.equal(embed.footer.icon_url, 'attachment://ww_logo.png');
+    assert.equal(embed.footer.icon_url, undefined);
     assert.equal(embed.thumbnail.url, 'https://example.com/avatar.png'); assert.ok(embed.timestamp);
     assert.deepEqual(buttons(payload).map(button => button.label), ['Gold', 'Silver', 'Cross Server']);
     assert.deepEqual(buttons(payload).map(button => button.emoji.id), [SERVERS.gold.emoji.id, SERVERS.silver.emoji.id, undefined]);
@@ -538,7 +538,8 @@ test('supplements can supply different search requirements for the same Pokémon
         fields: { ign: 'SameOpponent', details: 'shadow ball, sash' } });
     await f.command.handleModal(submit);
     assert.match(body(lastEdit(submit)), /`1`.*search result found/u);
-    assert.equal((body(lastEdit(submit)).match(/> - 🔎/gu) || []).length, 2);
+    assert.equal((body(lastEdit(submit)).match(/> - 🔎/gu) || []).length, 1);
+    assert.match(body(lastEdit(submit)), /Gengar.*Focus Sash.*Shadow Ball/u);
     assert.match(body(lastEdit(submit)), /Charizard/u);
 });
 

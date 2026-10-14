@@ -1037,16 +1037,6 @@ class PvpScoutStore {
         return this.getMessage(messageId);
     }
 
-    async resetRootLinks(channelId = this.channelId) {
-        await this.ensureSchema();
-        this.invalidateAutocompleteCache();
-        await this.db.query(
-            "UPDATE pvp_scout_messages SET root_message_id = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(staff_overrides_json, '$.rootMessageId')), message_id) WHERE channel_id = ?",
-            [String(channelId)]
-        );
-        this.invalidateAutocompleteCache();
-    }
-
     async searchRootsAndSources(ignNormalized, channelId = this.channelId) {
         await this.ensureSchema();
         const [rows] = await this.db.query(`

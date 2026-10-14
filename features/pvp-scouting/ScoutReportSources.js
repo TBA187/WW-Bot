@@ -3,6 +3,7 @@
 
 const { hasImageEvidence, isClearlyOffTopicText, splitScoutText } = require('./PvpScoutParser.js');
 const { reportContextSpecies } = require('./PokemonTeamParser.js');
+const { mergeTeamLines, teamMergeNotice } = require('./ScoutTeamMerge.js');
 
 // Formatting is pure, so revisiting unchanged reports can reuse the result.
 // Bound both entry count and text size to keep long-running bots predictable.
@@ -67,14 +68,19 @@ function reportSourceDetails(source, ign, root = source) {
     const protectedDetails = source.review_status === 'corrected' || source.staffOverrides?.locked;
     const legacyFields = !protectedDetails && source.team_text
         && source.team_text === source.message_content && source.notes === source.message_content;
+    const parserRepair = /\bfusion\s+bolt\b/iu.test(source.message_content || '') && /Raging Bolt/iu.test(source.team_text || '')
+        || /\bsammorut\b/iu.test(source.message_content || '') && !/Samurott/iu.test(source.team_text || '');
     const grouped = source.root_message_id && String(source.root_message_id) !== String(source.message_id);
-    const parsed = !protectedDetails && (legacyFields || !source.team_text)
+    const parsed = !protectedDetails && (legacyFields || !source.team_text || parserRepair)
         ? splitScoutText(source.message_content, ign, {
             allowContextualDetails: Boolean(grouped), contextSpecies: reportContextSpecies(root)
         }) : null;
+    // Repair these known parsing defects from a complete source roster, while
+    // retaining saved OCR roster slots and all human corrections elsewhere.
+    const freshRoster = parserRepair && (parsed?.teamText?.split('\n').filter(Boolean).length || 0) >= 4;
     return {
-        teamText: legacyFields ? parsed?.teamText || null : source.team_text || parsed?.teamText || null,
-        notes: parsed?.teamText && source.notes === source.message_content ? parsed.notes : source.notes ?? parsed?.notes ?? null
+        teamText: legacyFields || freshRoster ? parsed?.teamText || null : source.team_text || parsed?.teamText || null,
+        notes: freshRoster || parsed?.teamText && source.notes === source.message_content ? parsed.notes : source.notes ?? parsed?.notes ?? null
     };
 }
 
@@ -95,7 +101,9 @@ function mergeOriginalReport(originalSources, ign) {
         ocrResults.push(...(source.ocrResults || []));
         attachments.push(...(source.attachments || []));
     }
-    return { messageText: messages.join('\n'), teamText: teams.join('\n'), notes: notes.join('\n'), ocrResults, attachments };
+    const merged = mergeTeamLines(teams);
+    const detailNotes = [...notes, ...merged.unassigned, teamMergeNotice(merged)].filter(Boolean);
+    return { messageText: messages.join('\n'), teamText: merged.teamText, notes: detailNotes.join('\n'), ocrResults, attachments };
 }
 
 function teamDisplayText(team, ign) {

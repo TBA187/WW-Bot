@@ -2,9 +2,9 @@
 'use strict';
 
 const { PvpScoutOcr, SCAN_VERSION } = require('./PvpScoutOcr.js');
-const { extractScoutData, candidateFromText, cleanIgn, isClearlySpamTeam, normalizeIgn, hasImageEvidence, isClearlyOffTopicText } = require('./PvpScoutParser.js');
+const { extractScoutData, extractRating, candidateFromText, cleanIgn, isClearlySpamTeam, normalizeIgn, hasImageEvidence, isClearlyOffTopicText } = require('./PvpScoutParser.js');
 const { hasKnownTeamDetail, isPokemonDetailNote, matchKnownTermHeading, matchSpeciesHeading,
-    reportContextSpecies, resolveNoteShorthand, splitScoutText } = require('./PokemonTeamParser.js');
+    reportContextSpecies, resolveNoteShorthand, sameTeamSpecies, splitScoutText } = require('./PokemonTeamParser.js');
 const { setImmediate: yieldToEvents } = require('node:timers/promises');
 const { ScoutMessageFeedback, feedbackOutcome } = require('./ScoutMessageFeedback.js');
 const { contentHash, scoutVersion } = require('./PvpScoutStore.js');
@@ -108,18 +108,30 @@ function mayJoinReport(row, root, previous, explicitReply, windowMs = FOLLOW_UP_
     const name = String(row.ign_normalized || '').toLowerCase();
     const rootName = String(root.ign_normalized || '').toLowerCase();
     if (name && rootName && name !== rootName) return false;
-    if (!sameAuthor && explicitReply) return true;
+    const species = teamSpecies(row, contextual, contextSpecies);
+    const rootSpecies = root.species || teamSpecies(root);
+    const shared = [...species].filter(value => [...rootSpecies].some(original => sameTeamSpecies(value, original))).length;
+    const rootRating = root.rating ?? extractRating(root.message_content, root.opponent_ign);
+    const sourceRating = row.rating ?? extractRating(row.message_content, row.opponent_ign);
+    if (sourceRating != null && rootRating != null && Number(sourceRating) !== Number(rootRating)) return false;
+    const combinedSpecies = [...rootSpecies];
+    for (const value of species) {
+        if (!combinedSpecies.some(original => sameTeamSpecies(value, original))) combinedSpecies.push(value);
+    }
+    if (!explicitReply && combinedSpecies.length > 6) return false;
+    // An explicitly different/full team is a separate report, even for the same IGN.
+    if (species.size >= 4 && rootSpecies.size >= 4 && shared < 3) return false;
+    if (explicitReply) return true;
     if (!sameAuthor && !continuingReply) return false;
     const elapsed = messageTimestamp(row.created_at) - messageTimestamp(previous?.created_at || root.created_at);
     if (elapsed < 0 || elapsed > windowMs) return false;
-    const species = teamSpecies(row, contextual, contextSpecies);
-    const rootSpecies = root.species || teamSpecies(root);
-    const shared = [...species].filter(value => rootSpecies.has(value)).length;
-    // An explicitly different/full team is a separate report, even for the same IGN.
-    if (species.size >= 4 && rootSpecies.size >= 4 && shared < 3) return false;
     const bothImages = hasImageEvidence(row.attachments) && hasImageEvidence(root.attachments);
-    if (bothImages) return Boolean(name && rootName && name === rootName || shared >= 4);
-    if (explicitReply || name && rootName) return true;
+    if (bothImages) return false;
+    // Repeating the opponent alongside a team starts another battle report.
+    // Nameless move/item fragments and a screenshot followed by its text still join.
+    const statedName = normalizeIgn(candidateFromText(row.message_content)?.ign);
+    if (statedName && statedName === name && rootName && species.size && rootSpecies.size) return false;
+    if (name && rootName) return true;
     return elapsed <= IMMEDIATE_FOLLOW_UP_WINDOW_MS || shared >= 3
         || !hasImageEvidence(row.attachments) && !name && species.size > 0;
 }
@@ -137,6 +149,20 @@ function groupLink(row, rootId, root) {
     return link;
 }
 
+function savedContinuation(row, root) {
+    if (!root) return false;
+    const rowRating = row.rating ?? extractRating(row.message_content, row.opponent_ign);
+    const rootRating = root.rating ?? extractRating(root.message_content, root.opponent_ign);
+    if (rowRating != null && rootRating != null && Number(rowRating) !== Number(rootRating)) return false;
+    const stated = normalizeIgn(candidateFromText(row.message_content)?.ign);
+    if (stated && root.ign_normalized && stated !== normalizeIgn(root.ign_normalized)) return false;
+    if (!row.reply_to_id && stated && teamSpecies(row).size) return false;
+    // Existing officer-reviewed image pairs can be crops of one battle.
+    if (!row.reply_to_id && hasImageEvidence(row.attachments) && hasImageEvidence(root.attachments)
+        && !['confirmed', 'corrected'].includes(row.review_status)) return false;
+    return true;
+}
+
 // One state machine is shared by the pure helper and paged archive rebuilding.
 function groupRows(rows, state, followUpWindowMs = FOLLOW_UP_WINDOW_MS) {
     const links = [];
@@ -151,11 +177,14 @@ function groupRows(rows, state, followUpWindowMs = FOLLOW_UP_WINDOW_MS) {
         }
         let rootId = id;
         const manualRootId = row.staffOverrides?.rootMessageId;
+        const savedRootId = row.root_message_id && String(row.root_message_id) !== id ? String(row.root_message_id) : null;
+        const preserveContinuation = savedRootId && savedContinuation(row, roots.get(savedRootId));
         const parentRootId = row.reply_to_id && messageRoots.get(String(row.reply_to_id));
         const parentRoot = roots.get(parentRootId);
         if (manualRootId) rootId = String(manualRootId);
+        else if (preserveContinuation) rootId = savedRootId;
         else if (parentRoot && mayJoinReport(row, parentRoot, parentRoot, true, followUpWindowMs)) rootId = parentRootId;
-        if (!manualRootId && rootId === id && state.previous
+        if (!manualRootId && !preserveContinuation && !row.reply_to_id && rootId === id && state.previous
             && row.author_id && String(state.previous.author_id || '') === String(row.author_id)) {
             const priorRootId = messageRoots.get(String(state.previous.message_id));
             const priorRoot = roots.get(priorRootId);
@@ -416,11 +445,22 @@ class PvpScoutIngestor {
         if (saved?.staffOverrides?.rootMessageId) return;
         if (!saved || saved.is_deleted || saved.review_status === 'not_scout') return;
         let root = await this.rootForMessage(saved.reply_to_id);
+        const familySpecies = async candidate => {
+            if (!candidate || !this.store.sourcesForRoots) return candidate;
+            const sources = await this.store.sourcesForRoots([String(candidate.message_id)], this.channelId);
+            const species = teamSpecies(candidate);
+            for (const source of sources) {
+                if (String(source.message_id) === String(saved.message_id) || source.is_deleted || source.review_status === 'not_scout') continue;
+                for (const value of teamSpecies(source, true, reportContextSpecies(candidate))) species.add(value);
+            }
+            return { ...candidate, species };
+        };
+        root = await familySpecies(root);
         if (root && !mayJoinReport(saved, root, root, true)) root = null;
-        if (!root) {
+        if (!root && !saved.reply_to_id) {
             const previous = await this.store.getPreviousMessage(saved.message_id, this.channelId);
             if (previous && String(previous.author_id || '') === String(saved.author_id || '')) {
-                const priorRoot = await this.rootForMessage(previous.root_message_id || previous.message_id);
+                const priorRoot = await familySpecies(await this.rootForMessage(previous.root_message_id || previous.message_id));
                 if (priorRoot && mayJoinReport(saved, priorRoot, previous, false)) root = priorRoot;
             }
         }
@@ -664,12 +704,12 @@ class PvpScoutIngestor {
     }
 
     async rebuildGroups() {
-        await this.store.resetRootLinks(this.channelId);
         let cursor = null;
         let count = 0;
         const state = { roots: new Map(), messageRoots: new Map(), previous: null };
         const promotions = [];
-        // Retain the state across pages and finish after resetting links.
+        // Recompute with the live rules, preserving manual overrides. Update
+        // only changed links; never reset the entire archive between pages.
         while (true) {
             const rows = await this.store.listMessagesAfter(cursor, 500, this.channelId);
             if (!rows.length) break;
@@ -677,8 +717,17 @@ class PvpScoutIngestor {
             const links = [];
             for (let index = 0; index < rows.length; index += 20) {
                 await yieldToEvents();
-                const result = groupRows(rows.slice(index, index + 20), state);
-                links.push(...result.links);
+                const chunk = rows.slice(index, index + 20);
+                const result = groupRows(chunk, state);
+                const grouped = new Map(result.links.map(link => [link.messageId, link]));
+                for (const row of chunk) {
+                    const id = String(row.message_id), expected = result.messageRoots.get(id);
+                    if (!expected) continue;
+                    const link = grouped.get(id);
+                    if (String(row.root_message_id || '') !== expected || link?.teamDetails) {
+                        links.push(link || { messageId: id, rootMessageId: expected });
+                    }
+                }
                 promotions.push(...result.promotions);
             }
             await this.store.setRootLinks(links, this.channelId);

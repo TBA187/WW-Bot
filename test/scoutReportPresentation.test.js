@@ -82,7 +82,8 @@ test('other-author reply is supplemental information with its own reply link', (
     assert.match(review.fields.find(field => field.name === 'Linked scouting messages').value, /Clefable/u);
     assert.doesNotMatch(review.fields.find(field => field.name === 'Message text').value, /Clefable/u);
     const publicEmbed = buildScoutEmbed(root, [root, continuation, reply], 0, 1).embed.toJSON();
-    assert.match(publicEmbed.description, /Information added later/u);
+    assert.doesNotMatch(publicEmbed.description, /Information added later/u);
+    assert.match(publicEmbed.description, /Clefable.*Moonblast/u);
     assert.ok(publicEmbed.fields.some(field => field.name === 'Message reply'
         && field.value.includes(reply.source_url)));
 });
@@ -210,7 +211,8 @@ test('teams and search share complete-team pagination, accurate counts and scree
         if (!search) firstIds = firstTeams;
         const branded = scoutPayload(first);
         assert.ok(branded.embeds.slice(0, -1).every(embed => !embed.toJSON().footer));
-        assert.equal(branded.embeds.at(-1).toJSON().footer.icon_url, 'attachment://ww_logo.png');
+        assert.equal(branded.embeds.at(-1).toJSON().footer.icon_url, undefined);
+        assert.equal(branded.files, undefined);
     }
     assert.ok(firstIds.length > 0);
 });

@@ -19,11 +19,12 @@ const {
     TextDisplayBuilder
 } = require('discord.js');
 const { canonicalIgn, cleanIgn, isClearlyOffTopicText, normalizeIgn } = require('../features/pvp-scouting/PvpScoutParser.js');
-const { matchSpeciesHeading, nameKey, recognizedTerms, sameTeamSpecies, teamLineSpecies } = require('../features/pvp-scouting/PokemonTeamParser.js');
+const { matchSpeciesHeading, nameKey, recognizedTerms } = require('../features/pvp-scouting/PokemonTeamParser.js');
 const { authorDisplays } = require('../features/pvp-scouting/ScoutAuthorDisplay.js');
 const { downloadImageAttachment, refreshImageAttachments, reuseFreshImageAttachments,
     imageAttachment, uniqueImageAttachments: uniqueImages, sameImageUrl, urlIsFresh } = require('../features/pvp-scouting/ScoutImageUrls.js');
 const { partitionReportSources, reportSourceDetails, sameAuthor, teamDisplayText } = require('../features/pvp-scouting/ScoutReportSources.js');
+const { mergeTeamLines, teamMergeNotice } = require('../features/pvp-scouting/ScoutTeamMerge.js');
 const { isButtonLoading } = require('../utils/interactionLoading.js');
 const { scoutPayload, withScoutLoading } = require('../features/pvp-scouting/ScoutPresentation.js');
 const { packTeamPages } = require('../features/pvp-scouting/ScoutTeamPages.js');
@@ -104,9 +105,9 @@ function bestImage(sources) {
 }
 
 // Share the same team/notes distinction with the public report and history.
-function sourceTeamDetails(source, ign, max = 1800, root = source) {
+function sourceTeamDetails(source, ign, root = source) {
     const { teamText: teamValue, notes: noteValue } = reportSourceDetails(source, ign, root);
-    const team = safeText(teamDisplayText(teamValue, ign), max);
+    const team = safeText(teamDisplayText(teamValue, ign), Infinity);
     return {
         teamValue, noteValue, team,
         hasTeam: Boolean(team && (source.review_status === 'corrected' || teamValue !== noteValue || !noteValue)),
@@ -126,14 +127,16 @@ function historyData(results) {
         const { visibleSources } = partitionReportSources(root, sources);
         const lines = [];
         for (const source of visibleSources) {
-            const { team, hasTeam } = sourceTeamDetails(source, root.opponent_ign, Infinity, root);
+            const { team, hasTeam } = sourceTeamDetails(source, root.opponent_ign, root);
             if (!hasTeam || /^(?:[-—–\s]*|\*?none\*?|n\/?a|null)$/iu.test(team)) continue;
             for (const line of team.split(/\r?\n/u).map(value => value.trim()).filter(Boolean)) {
                 if (/^(?:[-—–\s]*|\*?none\*?|n\/?a|null)$/iu.test(line)) continue;
-                addTeamLine(lines, /^[-•]\s/u.test(line) ? line.replace(/^•/u, '-') : `- ${line}`);
+                lines.push(/^[-•]\s/u.test(line) ? line.replace(/^•/u, '-') : `- ${line}`);
             }
         }
-        if (lines.length) teams.push({ root, sources: visibleSources, rawTeam: lines.join('\n'), team: boldTeamNames(lines.join('\n')) });
+        const merged = mergeTeamLines(lines);
+        if (merged.teamText) teams.push({ root, sources: visibleSources, rawTeam: merged.teamText,
+            team: [boldTeamNames(merged.teamText), ...merged.unassigned, teamMergeNotice(merged)].filter(Boolean).join('\n') });
     }
     teams.sort((a, b) => (new Date(b.root.created_at).getTime() || 0) - (new Date(a.root.created_at).getTime() || 0)
         || String(b.root.message_id).localeCompare(String(a.root.message_id), 'en', { numeric: true }));
@@ -300,28 +303,6 @@ function boldTeamNames(team) {
     }).join('\n');
 }
 
-function isNameOnlyTeamLine(line) {
-    const body = String(line || '').trim().replace(/^[-•]\s*/u, '');
-    const heading = matchSpeciesHeading(body, { allowTypo: true });
-    return Boolean(heading?.species && !body.slice(heading.end).replace(/[\s.,:;]/gu, ''));
-}
-
-function addTeamLine(teamParts, line) {
-    if (teamParts.includes(line)) return;
-    const species = teamLineSpecies(line);
-    if (!species) return teamParts.push(line);
-    const matches = teamParts.map((value, index) => sameTeamSpecies(teamLineSpecies(value), species) ? index : -1)
-        .filter(index => index >= 0);
-    if (isNameOnlyTeamLine(line) && matches.length) return;
-    const bare = matches.filter(index => isNameOnlyTeamLine(teamParts[index]));
-    if (bare.length) {
-        teamParts[bare[0]] = line;
-        for (const index of bare.slice(1).reverse()) teamParts.splice(index, 1);
-        return;
-    }
-    teamParts.push(line);
-}
-
 function sourceLinkFields(sources, kind = 'original') {
     const urls = sources.map(source => source.source_url).filter(Boolean);
     if (kind === 'original') urls.splice(1);
@@ -367,19 +348,14 @@ function buildScoutEmbed(root, sources, index, total, authorNames = null, identi
     const orderedSources = [...originalSources, ...replies, ...additionalSources];
     const contributors = [...new Set(visibleSources.map(source => String(source.author_username || '').trim()).filter(Boolean))];
     const teamParts = [];
-    const laterParts = [];
     const laterNotes = [];
     const noteParts = [];
     for (const source of visibleSources) {
         const fromAnotherMember = !originalIds.has(String(source.message_id));
-        const { teamValue, noteValue, team, hasTeam, notes } = sourceTeamDetails(source, root.opponent_ign, 1800, root);
+        const { teamValue, noteValue, team, hasTeam, notes } = sourceTeamDetails(source, root.opponent_ign, root);
         if (hasTeam) {
             for (const line of team.split(/\r?\n/u).map(value => value.trim()).filter(Boolean)) {
-                if (fromAnotherMember) {
-                    if (!laterParts.includes(line)) laterParts.push(line);
-                } else {
-                    addTeamLine(teamParts, line);
-                }
+                teamParts.push(line);
             }
         }
         if (notes && noteValue !== teamValue && !justIgn(notes, root.opponent_ign)) {
@@ -393,10 +369,12 @@ function buildScoutEmbed(root, sources, index, total, authorNames = null, identi
             if (raw && !destination.includes(raw)) destination.push(raw);
         }
     }
+    const merged = mergeTeamLines(teamParts);
+    const allNotes = [...new Set([...noteParts, ...laterNotes, ...merged.unassigned])];
     const body = [
-        teamParts.length ? `**Pokémon Team**\n${boldTeamNames(teamParts.join('\n'))}` : null,
-        laterParts.length ? `${teamParts.length ? '**Information added later**' : '**Pokémon Team**'}\n${boldTeamNames(laterParts.join('\n'))}` : null,
-        [...noteParts, ...laterNotes].length ? `**Additional Notes**\n${[...noteParts, ...laterNotes].join('\n')}` : null
+        merged.teamText ? `**Pokémon Team**\n${boldTeamNames(merged.teamText)}` : null,
+        teamMergeNotice(merged),
+        allNotes.length ? `**Additional Notes**\n${allNotes.join('\n')}` : null
     ].filter(Boolean).join('\n\n');
     const sourceFields = [
         ...sourceLinkFields(originalSources),

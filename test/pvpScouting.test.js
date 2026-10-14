@@ -116,7 +116,7 @@ test('live grouping and paged rebuild use the same continuation rules', async ()
     ];
     const links = [];
     const store = {
-        resetRootLinks:async()=>{}, listMessagesAfter:async cursor=>cursor?[]:rows,
+        listMessagesAfter:async cursor=>cursor?[]:rows,
         setRootLinks:async value=>links.push(...value), promoteRootIgn:async()=>{},
         getMessage:async id=>rows.find(row=>row.message_id===id),
         getPreviousMessage:async()=>rows[0]

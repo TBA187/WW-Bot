@@ -122,8 +122,10 @@ for (const [alias, species] of Object.entries({
     alomola: 'Alomomola',
     alomuk: 'Muk-Alola',
     diance: 'Diancie',
-    shukle: 'Shuckle'
+    shukle: 'Shuckle',
+    sammorut: 'Samurott'
 })) addName(alias, species);
+addName('Hoopa Unbond', 'Hoopa-Unbound');
 
 function editDistanceWithin(a, b, limit) {
     if (Math.abs(a.length - b.length) > limit) return limit + 1;
@@ -264,7 +266,7 @@ for (const [alias, target] of Object.entries(vocabulary.aliases)) {
         termsByKey.get(nameKey(alias)).push({ kind, name: target });
     }
 }
-for (const [alias, name] of Object.entries({ rockhelmet: 'Rocky Helmet', rockyhelm: 'Rocky Helmet',
+for (const [alias, name] of Object.entries({ rockhelmet: 'Rocky Helmet', rockyhelm: 'Rocky Helmet', scarfed: 'Choice Scarf',
     rocks: 'Stealth Rock', banded: 'Choice Band', sitrus: 'Sitrus Berry',
     adam: 'Adamant', mod: 'Modest', tim: 'Timid', joll: 'Jolly', care: 'Careful' })) {
     if (!termsByKey.has(alias)) termsByKey.set(alias, []);
@@ -379,6 +381,14 @@ function organizedDetail(detail) {
 
 function formatEntry(species, remainder) {
     let detail = String(remainder || '');
+    const regional = detail.match(/^\s*\/?\s*((?:choice\s+)?(?:scarf|scraff))?\s*[-/;,]*\s*(Hisui|Alola|Galar|Paldea)\b\s*[-/;,]?/iu);
+    if (regional) {
+        const region = regional[2][0].toUpperCase() + regional[2].slice(1).toLowerCase();
+        if (knownSpecies.has(`${species}-${region}`)) {
+            species = `${species}-${region}`;
+            detail = `${regional[1] ? 'Choice Scarf ' : ''}${detail.slice(regional[0].length)}`;
+        }
+    }
     const mega = detail.match(/^\s*(?:\(\s*mega(?:\s+([XY]))?\s*\)|mega(?:\s+([XY]))?)\s*[:;,–-]?\s*/iu);
     if (mega) {
         const form = `${species}-Mega${mega[1] || mega[2] ? `-${(mega[1] || mega[2]).toUpperCase()}` : ''}`;
@@ -478,6 +488,7 @@ function structuredClauseEntries(line) {
     if (!clauses.length || clauses.length > 6) return null;
     const parsed = [];
     for (const clause of clauses) {
+        if (matchKnownTermHeading(clause) && !nameKey(recognizedTerms(clause).leftover)) return null;
         const words = speciesWordsOutsideParentheses(clause);
         const speciesReads = [];
         for (const word of words) {

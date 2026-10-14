@@ -77,6 +77,8 @@ Forum shop notifications use `tbaProForumShop`, `tbaProDungeonShop` and `tbaProF
 
 Scout reports that fail validation receive correction suggestions and a one-hour correction window before staff escalation. Correction deadlines survive restarts. Gold and Silver reports remain in separate archives; Cross Server searches read both. The saved autocomplete snapshots can be rebuilt from the database.
 
+Separate battle reports keep their own dates, ratings and IDs, even when the same member scouts the same opponent a few minutes apart. Replies and nameless continuations combine observations into one team with at most six Pokémon; newer items, abilities and natures replace older observations, and discovered moves are combined. Original sources and reply links remain available. Excess Pokémon in a manually linked report trigger a source-review notice without deleting stored information.
+
 A guild-application preview is available without Discord delivery:
 
 ```sh

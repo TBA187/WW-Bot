@@ -1,6 +1,8 @@
 // Reads both scout archives as one view while keeping every write in its source channel.
 'use strict';
 
+const { extractRating } = require('./PvpScoutParser.js');
+
 function utcDate(value) {
     if (value === null || value === undefined || value === '') return null;
     const date = new Date(value);
@@ -10,7 +12,9 @@ function utcDate(value) {
 function reportServer(row) { return row?.server === 'silver' ? 'silver' : 'gold'; }
 
 function reportRating(row) {
-    const value = (row?.root || row)?.rating;
+    const source = row?.root || row;
+    const value = source?.rating ?? (source?.review_status === 'corrected' ? null
+        : extractRating(source?.message_content, source?.opponent_ign));
     if (value === null || value === undefined || value === '') return null;
     const rating = Number(value);
     return Number.isInteger(rating) && rating >= 0 ? rating : null;

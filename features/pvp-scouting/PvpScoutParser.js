@@ -52,6 +52,9 @@ function extractRating(text, ign = null, { fromOcr = false } = {}) {
     if (!fromOcr) {
         patterns.push(/\b(?:pvp\s*)?rating\s*[:=]?\s*(?![+-])(\d{1,4})/iu);
         patterns.push(/\b(\d{2,4})\s+(?:pvp\s+)?(?:rating|rtg)\b/iu);
+        // Players also write "Opponent - 230 rank". Bind this shorthand to
+        // the opponent heading so unrelated rankings cannot become ratings.
+        if (ign) patterns.push(new RegExp(`(?:^|\\n)\\s*${escapeRegExp(ign)}\\s*[-:–—]\\s*(\\d{1,4})\\s+rank\\b`, 'iu'));
     } else if (ign) {
         const profileName = new RegExp(`\\b(?:inspect|name)\\s*[:=]\\s*${escapeRegExp(ign)}(?![\\p{L}\\p{N}_.-])`, 'iu');
         // Inspect windows show an absolute rating alongside wins/losses. Bind
@@ -792,6 +795,19 @@ function extractScoutData(message = {}, options = {}) {
         }
     }
     const structuredText = splitScoutText(content, contentCandidate?.ign || candidate?.ign);
+    // A complete typed scout is better spelling evidence than one weak image
+    // read. Keep real conflicts, strong image reads and established names in review.
+    if (!resolvedImageDifference && contentCandidate && screenshotCandidate
+        && contentCandidate.confidence >= 0.86 && screenshotCandidate.confidence < 0.9
+        && normalizeIgn(contentCandidate.ign)?.length >= 8
+        && closeIgnSpelling(contentCandidate.ign, screenshotCandidate.ign)
+        && (structuredText.teamText?.split('\n').filter(Boolean).length || 0) >= 4
+        && establishedNameSupport(screenshotCandidate.ign, options.knownIgnEvidence) < 2
+        && !results.some(result => normalizeIgn(result.focusedIgn) === normalizeIgn(screenshotCandidate.ign)
+            && Number(result.focusedConfidence || 0) >= 0.9)) {
+        candidate = contentCandidate;
+        resolvedImageDifference = true;
+    }
     if (!images && contentCandidate?.source === 'versus_text') {
         const explicitTeamRows = content.split(/\n+/u).map(line => line.trim()).filter(Boolean).filter(line => {
             if (/^(?:[-•]|\d+[.)])\s*\S/u.test(line)) return true;

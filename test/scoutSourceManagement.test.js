@@ -181,7 +181,7 @@ test('manual attachments to later messages and manual separation survive automat
     const rows = await Promise.all([ROOT, REPLY, TARGET].map(id => f.store.getMessage(id)));
     const grouped = buildGroupLinks(rows); assert.equal(grouped.messageRoots.get(ROOT), TARGET); assert.equal(grouped.messageRoots.get(REPLY), TARGET);
     const queries = []; const store = new PvpScoutStore({ channelId: 'channel', db: { query: async sql => { queries.push(sql); return [[]]; } } });
-    store.schemaReady = true; await store.resetRootLinks(); await store.setRootLinks([{ messageId: REPLY, rootMessageId: ROOT }]);
+    store.schemaReady = true; await store.setRootLinks([{ messageId: REPLY, rootMessageId: ROOT }]);
     assert.ok(queries.every(sql => sql.includes("JSON_EXTRACT(staff_overrides_json, '$.rootMessageId')")));
 });
 
