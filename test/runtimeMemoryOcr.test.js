@@ -31,6 +31,19 @@ function timers() {
     };
 }
 
+test('OCR health retains short-lived worker peaks and counts jobs without counting cleanup as work', async () => {
+    const worker = { recognize: async () => 'recognized', terminate: async () => {},
+        memorySnapshot: () => ({ rss: 100, peakRss: 250 }) };
+    const pool = new OcrWorkerPool({ worker, idleTimeoutMs: 0 });
+    await pool.run(() => pool.recognize('image'));
+    await assert.rejects(pool.run(async () => { throw new Error('controlled failure'); }), /controlled failure/);
+    await pool.close();
+    const snapshot = pool.healthSnapshot();
+    assert.equal(snapshot.workers, 0); assert.equal(snapshot.pending, 0);
+    assert.equal(snapshot.tasksStarted, 2); assert.equal(snapshot.tasksCompleted, 1);
+    assert.equal(snapshot.tasksFailed, 1); assert.equal(snapshot.peakProcessRss, 250);
+});
+
 test('Gold, Silver and guild OCR share one production pool while injected factories remain isolated', () => {
     const gold = new PvpScoutOcr();
     const silver = new PvpScoutOcr();

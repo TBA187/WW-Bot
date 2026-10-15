@@ -61,6 +61,26 @@ test('mass moderation lookups share a 100-entry audit batch and find early entri
     assert.equal(fetchCount, 1);
 });
 
+test('a failed older audit fetch cannot evict a newer shared request', async t => {
+    let now = Date.now(), rejectOlder, resolveNewer, calls = 0;
+    t.mock.method(Date, 'now', () => now);
+    t.mock.method(console, 'warn', () => {});
+    const older = new Promise((_, reject) => { rejectOlder = reject; });
+    const newer = new Promise(resolve => { resolveNewer = resolve; });
+    const guild = { id: 'audit-cache-replacement', fetchAuditLogs: () => ++calls === 1 ? older : newer };
+    const options = { attempts: 1 };
+    const first = findModerationAuditEntry(guild, AuditLogEvent.MemberKick, 'member', options);
+    now += 1000;
+    const second = findModerationAuditEntry(guild, AuditLogEvent.MemberKick, 'member', options);
+    rejectOlder(new Error('Old request failed'));
+    assert.equal(await first, null);
+    const third = findModerationAuditEntry(guild, AuditLogEvent.MemberKick, 'member', options);
+    const entry = { id: 'kick', targetId: 'member', createdTimestamp: now };
+    resolveNewer({ entries: new Collection([[entry.id, entry]]) });
+    assert.deepEqual(await Promise.all([second, third]), [entry, entry]);
+    assert.equal(calls, 2);
+});
+
 test('a ban event that arrives first produces one ban log and no leave log', async () => {
     const sent = [];
     const user = { id: 'member-ban-order-test', tag: 'Member#1234', globalName: 'Member' };
@@ -96,6 +116,8 @@ test('a ban event that arrives first produces one ban log and no leave log', asy
     await banPromise;
 
     assert.equal(sent.length, 1);
-    assert.match(sent[0], /was banned by/);
-    assert.doesNotMatch(sent[0], /voluntarily left/);
+    const embed = sent[0].embeds[0].toJSON();
+    assert.equal(embed.author.name, 'Member Banned 🔨');
+    assert.match(embed.description, /was banned by/);
+    assert.doesNotMatch(embed.description, /voluntarily left/);
 });

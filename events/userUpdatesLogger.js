@@ -3,16 +3,19 @@
 // Server/Global Avatar, Username & Nickname updates
 // ========================================
 
-const { AttachmentBuilder, AuditLogEvent, EmbedBuilder } = require('discord.js');
+const path = require('node:path');
+const { AttachmentBuilder, AuditLogEvent, EmbedBuilder, escapeMarkdown } = require('discord.js');
 const { syncMemberColorRoleName } = require('./auto_roles.js');
+const { findModerationAuditEntry } = require('./memberExit.js');
 
 const RECENT_NAME_LOG_TTL_MS = 30 * 1000;
 const recentNameLogs = new Map();
 const knownUserProfiles = new Map();
 
-function getLogChannel(config, guild = null) {
+async function getLogChannel(config, guild = null) {
     const targetGuild = guild || config.client?.guilds.cache.get(config.guildId);
-    return targetGuild?.channels.cache.get(config.logChannelID);
+    if (!targetGuild || !config.logChannelID) return null;
+    return targetGuild.channels.cache.get(config.logChannelID) || targetGuild.channels.fetch(config.logChannelID);
 }
 
 function normalizeNickname(value) {
@@ -33,15 +36,15 @@ function rememberUserProfile(user) {
 }
 
 function formatNickname(value) {
-    return value || '*No server nickname*';
+    return value ? escapeMarkdown(value) : '*No server nickname*';
 }
 
-function formatDiscordDisplayName(value, user) {
-    return value || '-# *No Discord Display Name!*';
+function formatDiscordDisplayName(value) {
+    return value ? escapeMarkdown(value) : '-# *No Discord Display Name!*';
 }
 
 function boldValue(value) {
-    return `**${value}**`;
+    return `**${escapeMarkdown(value)}**`;
 }
 
 function getChangeAction(oldValue, newValue) {
@@ -77,6 +80,10 @@ function serverNicknameDescription(executor, member, isModeratorAction, oldValue
     const action = getChangeAction(oldValue, newValue);
     const article = action === 'Added' ? 'a' : isModeratorAction ? 'the' : 'their';
 
+    if (!executor) {
+        return `<@${member.id}> had their **Server Nickname** ${actionVerb(action)} by *Unknown User*`;
+    }
+
     if (isModeratorAction) {
         return `<@${executor.id}> ${actionVerb(action)} ${article} **Server Nickname** for <@${member.id}>`;
     }
@@ -84,16 +91,16 @@ function serverNicknameDescription(executor, member, isModeratorAction, oldValue
     return `<@${member.id}> ${actionVerb(action)} ${article} **Server Nickname**`;
 }
 
-function serverNicknameFallbackText(user) {
+function serverNicknameFallbackText() {
     return '-# *No server nickname!*';
 }
 
 function newServerNicknameFallbackText(user) {
     if (user.globalName) {
-        return `-# *No server nickname!*\n-# Using Discord Display Name: **${user.globalName}**`;
+        return `-# *No server nickname!*\n-# Using Discord Display Name: **${escapeMarkdown(user.globalName)}**`;
     }
 
-    return `-# *No server nickname!*\n-# Using Discord Username: **@${user.username}**`;
+    return `-# *No server nickname!*\n-# Using Discord Username: **@${escapeMarkdown(user.username)}**`;
 }
 
 function auditChangeValue(change, key) {
@@ -101,7 +108,7 @@ function auditChangeValue(change, key) {
 }
 
 function createLogoFile() {
-    return new AttachmentBuilder('./images/ww_logo.png', { name: 'ww_logo.png' });
+    return new AttachmentBuilder(path.join(__dirname, '../images/ww_logo.png'), { name: 'ww_logo.png' });
 }
 
 function authorName(user) {
@@ -109,23 +116,25 @@ function authorName(user) {
     return displayName === user.username ? user.username : `${displayName} (${user.username})`;
 }
 
-function shouldSkipRecentNameLog(userId, label, oldValue, newValue, action) {
+function reserveNameLog(channelId, userId, label, oldValue, newValue, action) {
     const now = Date.now();
-    const key = `${userId}:${label}:${oldValue ?? ''}:${newValue ?? ''}:${action ?? ''}`;
-    const lastLoggedAt = recentNameLogs.get(key);
+    const key = `${channelId}:${userId}:${label}`;
+    const signature = JSON.stringify([oldValue, newValue, action]);
+    const previous = recentNameLogs.get(key);
 
-    for (const [entryKey, loggedAt] of recentNameLogs) {
-        if (now - loggedAt > RECENT_NAME_LOG_TTL_MS) {
+    for (const [entryKey, entry] of recentNameLogs) {
+        if (now - entry.loggedAt > RECENT_NAME_LOG_TTL_MS) {
             recentNameLogs.delete(entryKey);
         }
     }
 
-    if (lastLoggedAt && now - lastLoggedAt < RECENT_NAME_LOG_TTL_MS) {
-        return true;
+    if (previous?.signature === signature && now - previous.loggedAt < RECENT_NAME_LOG_TTL_MS) {
+        return null;
     }
 
-    recentNameLogs.set(key, now);
-    return false;
+    const entry = { signature, loggedAt: now };
+    recentNameLogs.set(key, entry);
+    return { key, entry };
 }
 
 async function sendAvatarLog(logChannel, user, avatarUrl, title) {
@@ -164,25 +173,31 @@ async function sendNameChangeLog(logChannel, options) {
         color
     } = options;
 
-    if (shouldSkipRecentNameLog(user.id, label, oldValue, newValue, action)) return;
+    const reservation = reserveNameLog(logChannel.id, user.id, label, oldValue, newValue, action);
+    if (!reservation) return;
 
-    const logoFile = createLogoFile();
-    const embed = new EmbedBuilder()
-        .setAuthor({
-            name: authorName(user),
-            iconURL: user.displayAvatarURL({ dynamic: true })
-        })
-        .setTitle(changeTitle(label, oldValue, newValue, action))
-        .setColor(color)
-        .setDescription(description)
-        .addFields(
-            { name: oldLabel, value: oldDisplayValue, inline: true },
-            { name: newLabel, value: newDisplayValue, inline: true }
-        )
-        .setFooter({ text: `ID: ${user.id}`, iconURL: 'attachment://ww_logo.png' })
-        .setTimestamp();
+    try {
+        const logoFile = createLogoFile();
+        const embed = new EmbedBuilder()
+            .setAuthor({
+                name: authorName(user),
+                iconURL: user.displayAvatarURL({ dynamic: true })
+            })
+            .setTitle(changeTitle(label, oldValue, newValue, action))
+            .setColor(color)
+            .setDescription(description)
+            .addFields(
+                { name: oldLabel, value: oldDisplayValue, inline: true },
+                { name: newLabel, value: newDisplayValue, inline: true }
+            )
+            .setFooter({ text: `ID: ${user.id}`, iconURL: 'attachment://ww_logo.png' })
+            .setTimestamp();
 
-    await logChannel.send({ embeds: [embed], files: [logoFile] });
+        await logChannel.send({ embeds: [embed], files: [logoFile] });
+    } catch (error) {
+        if (recentNameLogs.get(reservation.key) === reservation.entry) recentNameLogs.delete(reservation.key);
+        throw error;
+    }
 }
 
 async function sendDiscordUsernameLog(logChannel, oldProfile, newUser) {
@@ -196,7 +211,7 @@ async function sendDiscordUsernameLog(logChannel, oldProfile, newUser) {
         newLabel: 'New Discord Username',
         oldValue: oldProfile.username,
         newValue: newUser.username,
-        oldDisplayValue: oldProfile.username,
+        oldDisplayValue: oldProfile.username ? escapeMarkdown(oldProfile.username) : '*Unknown Username*',
         newDisplayValue: boldValue(newUser.username),
         action: 'Changed',
         color: 0x3498db
@@ -214,8 +229,8 @@ async function sendDiscordDisplayNameLog(logChannel, oldProfile, newUser) {
         newLabel: 'New Discord Display Name',
         oldValue: oldProfile.globalName,
         newValue: newUser.globalName,
-        oldDisplayValue: formatDiscordDisplayName(oldProfile.globalName, oldProfile),
-        newDisplayValue: newUser.globalName ? boldValue(newUser.globalName) : formatDiscordDisplayName(newUser.globalName, newUser),
+        oldDisplayValue: formatDiscordDisplayName(oldProfile.globalName),
+        newDisplayValue: newUser.globalName ? boldValue(newUser.globalName) : formatDiscordDisplayName(newUser.globalName),
         color: 0x9b59b6
     });
 }
@@ -235,62 +250,28 @@ async function sendNicknameLog(logChannel, oldMember, newMember) {
     const newNickname = normalizeNickname(newMember.nickname);
     if (oldNickname === newNickname) return;
 
-    let executor = newMember.user;
-    let isModeratorAction = false;
-    let nicknameAuditChange = null;
-
-    try {
-        await new Promise(res => setTimeout(res, 1200));
-
-        const fetchedLogs = await newMember.guild.fetchAuditLogs({
-            limit: 5,
-            type: AuditLogEvent.MemberUpdate,
-        });
-
-        const auditEntry = fetchedLogs.entries.find(
-            entry => entry.target?.id === newMember.id &&
-                entry.changes?.some(c => c.key === 'nick') &&
-                Date.now() - entry.createdTimestamp < 8000
-        );
-
-        nicknameAuditChange = auditEntry?.changes?.find(c => c.key === 'nick') ?? null;
-        if (nicknameAuditChange === null) {
-            return;
-        }
-
-        if (auditEntry && auditEntry.executor?.id !== newMember.id) {
-            executor = auditEntry.executor;
-            isModeratorAction = true;
-        }
-    } catch (error) {
-        console.error('[WW LOG] Error fetching audit logs for nickname change:', error);
-        return;
-    }
-
-    const auditedOldNickname = normalizeNickname(auditChangeValue(nicknameAuditChange, 'old'));
-    const auditedNewNickname = normalizeNickname(auditChangeValue(nicknameAuditChange, 'new'));
-    const displayOldNickname = auditedOldNickname ?? oldNickname;
-    const displayNewNickname = auditedNewNickname ?? newNickname;
-    const formattedNewNickname = displayNewNickname
-        ? formatNickname(displayNewNickname)
-        : newServerNicknameFallbackText(newMember.user);
+    const eventTime = Date.now();
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    const auditEntry = await findModerationAuditEntry(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id, {
+        eventTime,
+        matches: entry => entry.changes?.some(change => change.key === 'nick' &&
+            normalizeNickname(auditChangeValue(change, 'old')) === oldNickname &&
+            normalizeNickname(auditChangeValue(change, 'new')) === newNickname)
+    });
+    const executor = auditEntry?.executor;
+    const isModeratorAction = Boolean(executor && executor.id !== newMember.id);
 
     await sendNameChangeLog(logChannel, {
         user: newMember.user,
         label: 'Server Nickname',
-        description: serverNicknameDescription(executor, newMember, isModeratorAction, displayOldNickname, displayNewNickname),
+        description: serverNicknameDescription(executor, newMember, isModeratorAction, oldNickname, newNickname),
         oldLabel: 'Old Server Nickname',
         newLabel: 'New Server Nickname',
-        oldValue: displayOldNickname,
-        newValue: displayNewNickname,
-        oldDisplayValue: displayOldNickname ? formatNickname(displayOldNickname) : serverNicknameFallbackText(oldMember.user),
-        newDisplayValue: displayNewNickname ? boldValue(formattedNewNickname) : formattedNewNickname,
+        oldValue: oldNickname,
+        newValue: newNickname,
+        oldDisplayValue: oldNickname ? formatNickname(oldNickname) : serverNicknameFallbackText(),
+        newDisplayValue: newNickname ? boldValue(newNickname) : newServerNicknameFallbackText(newMember.user),
         color: 0xf1c40f
-    });
-
-    // Color Role Name Sync: If the user has a custom Color Role, change the Color Role Name to their new server nickname.
-    await syncMemberColorRoleName(newMember).catch(error => {
-        console.warn(`[WW LOG] Could not sync custom color role name for ${newMember.user.tag ?? newMember.id}:`, error);
     });
 }
 
@@ -312,27 +293,37 @@ module.exports = {
     },
 
     async handleUserUpdate(oldUser, newUser, config) {
-        const logChannel = getLogChannel(config);
-
-        await sendDiscordAccountNameLogs(logChannel, oldUser, newUser);
-
-        if (oldUser.avatar === newUser.avatar) return;
-
-        const avatarUrl = newUser.displayAvatarURL({ dynamic: true, size: 256 });
-        await sendAvatarLog(logChannel, newUser, avatarUrl, 'Discord Avatar Update');
+        try {
+            const logChannel = await getLogChannel(config);
+            await sendDiscordAccountNameLogs(logChannel, oldUser, newUser);
+            if (oldUser.avatar === newUser.avatar) return;
+            const avatarUrl = newUser.displayAvatarURL({ dynamic: true, size: 256 });
+            await sendAvatarLog(logChannel, newUser, avatarUrl, 'Discord Avatar Update');
+        } catch (error) {
+            console.error('[WW LOG] User profile update log failed:', error);
+        }
     },
 
     async handleGuildMemberUpdate(oldMember, newMember, config) {
-        const logChannel = getLogChannel(config, newMember.guild);
-
-        // Discord account-name changes can arrive here before userUpdate is useful from cache.
-        await sendDiscordAccountNameLogs(logChannel, oldMember.user, newMember.user);
-
-        if (oldMember.avatar !== newMember.avatar) {
-            const avatarUrl = newMember.displayAvatarURL({ dynamic: true, size: 256 });
-            await sendAvatarLog(logChannel, newMember.user, avatarUrl, 'Server Avatar Update');
+        try {
+            const logChannel = await getLogChannel(config, newMember.guild);
+            // Discord account-name changes can arrive here before userUpdate is useful from cache.
+            await sendDiscordAccountNameLogs(logChannel, oldMember.user, newMember.user);
+            if (oldMember.avatar !== newMember.avatar) {
+                const avatarUrl = newMember.displayAvatarURL({ dynamic: true, size: 256 });
+                await sendAvatarLog(logChannel, newMember.user, avatarUrl, 'Server Avatar Update');
+            }
+            await sendNicknameLog(logChannel, oldMember, newMember);
+        } catch (error) {
+            console.error('[WW LOG] Member profile update log failed:', error);
+        } finally {
+            // Role syncing must not depend on audit-log permissions or a successful log send.
+            if (normalizeNickname(oldMember.nickname) !== normalizeNickname(newMember.nickname)) {
+                const currentMember = newMember.guild.members.cache.get(newMember.id) ?? newMember;
+                await syncMemberColorRoleName(currentMember).catch(error => {
+                    console.warn(`[WW LOG] Could not sync custom color role name for ${newMember.user.tag ?? newMember.id}:`, error);
+                });
+            }
         }
-
-        await sendNicknameLog(logChannel, oldMember, newMember);
     }
 };

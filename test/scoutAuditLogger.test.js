@@ -3,7 +3,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { ScoutAuditLogger, auditPayload, diagnosticPayload, publishedPayload } = require('../features/pvp-scouting/ScoutAuditLogger.js');
+const { ScoutAuditLogger, auditPayload, diagnosticPayload, recoveryPayload, publishedPayload } = require('../features/pvp-scouting/ScoutAuditLogger.js');
 
 function event(action = 'edited') {
     return { action, actorId: '291142291073269761', messageId: '1350059044102078494', reportId: '1350059044102078494',
@@ -110,6 +110,28 @@ test('publication and diagnostic logs share the action queue and configured chan
     assert.equal(sent.length, 2);
     assert.equal(sent[0].embeds[0].toJSON().title, '✅ Scout Report Published');
     assert.equal(sent[1].content, '<@owner>');
+});
+
+test('recovery logs reply to the original alert and use the green branded embed', async () => {
+    const sent = [], channel = { guildId: 'guild', async send(payload) { sent.push(payload); return { id: `sent-${sent.length}` }; } };
+    const logger = new ScoutAuditLogger({ guildId: 'guild', channelId: 'log', ownerId: 'owner',
+        client: { channels: { cache: new Map([['log', channel]]) } } });
+    const payload = recoveryPayload({ message: 'PRO Forum Shop monitor connection restored.', component: 'PRO Forum Shop',
+        timestamp: '2026-10-15T17:02:57Z' });
+    const embed = payload.embeds[0].toJSON();
+    assert.equal(embed.title, '✅ Service Restored');
+    assert.equal(embed.color, 0x57F287);
+    assert.equal(embed.description, 'PRO Forum Shop monitor connection restored.');
+    assert.equal(embed.footer.text, 'WW • PRO Forum Shop');
+    assert.equal(embed.timestamp, '2026-10-15T17:02:57.000Z');
+    assert.deepEqual(payload.allowedMentions, { parse: [] });
+
+    logger.diagnostic({ status: 'recovered', message: 'PRO Forum Shop monitor connection restored.',
+        component: 'PRO Forum Shop', replyTo: 'warning-message-id' });
+    await logger.flush();
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].reply, { messageReference: 'warning-message-id', failIfNotExists: false });
+    assert.equal(sent[0].embeds[0].toJSON().title, '✅ Service Restored');
 });
 
 

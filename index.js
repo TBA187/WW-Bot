@@ -23,6 +23,7 @@ const { DiscordDiagnosticLogger, redactDiagnostic } = require('./utils/discordDi
 const { InteractionDiagnostics } = require('./utils/interactionDiagnostics.js');
 const { createDiscordTransport } = require('./utils/discordTransport.js');
 const { RuntimeHealth } = require('./utils/runtimeHealth.js');
+const { MemberAuditHistory } = require('./utils/memberAuditHistory.js');
 const { sharedOcrWorkerPool } = require('./utils/runtimeMemoryOcr.js');
 const { writeJsonIfChanged } = require('./utils/jsonFile.js');
 const { XpStore } = require('./utils/xpStore.js');
@@ -67,6 +68,7 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildInvites,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildWebhooks,
@@ -76,7 +78,9 @@ const client = new Client({
     partials: [Partials.GuildMember, Partials.User, Partials.Message, Partials.Reaction],
     rest: { makeRequest: discordTransport.makeRequest }
 });
-const runtimeHealth = new RuntimeHealth({ client, ocrSnapshot: () => sharedOcrWorkerPool.snapshot() });
+const runtimeHealth = new RuntimeHealth({ client, ocrSnapshot: () => sharedOcrWorkerPool.healthSnapshot() });
+const memberHistory = new MemberAuditHistory({ db, shutdownSignal: lifecycle.signal,
+    filePath: path.join(__dirname, 'data', 'member-audit-history.json') });
 
 // Map with DB Guild Settings where Key = guild_id, Value = { xp_enabled: false, ... }
 const guildSettingsCache = new Map();
@@ -365,6 +369,9 @@ const commandConfig = {
     wwRoleID,
     botChannelID,
     logChannelID,
+    memberHistory,
+    selfRoleChannelID: appConfig.selfRoleChannelID,
+    newAccountWarningHours: appConfig.newAccountWarningHours,
     ignoredLogChannels,
     ignoreLogPrivateChannelCreate,
     blockedEditBotMsgChannels,
@@ -435,6 +442,8 @@ async function bootstrap() {
         await startupStep('PvP King data', () => Promise.all(Object.values(pvpKingStores).map(store => store.restore())));
         await startupStep('giveaway data', () => giveawayStore.restore());
         await startupStep('notification data', () => notificationStore.restore());
+        await startupStep('member audit history', () => memberHistory.restore());
+        memberHistory.startSyncLoop();
         // A cold first run warms suggestions before commands become usable.
         // Later restarts have the saved list immediately, even during an outage.
         await lifecycle.preload(() => scoutServers.warmAutocomplete(), {
@@ -537,6 +546,7 @@ async function bootstrap() {
         // Load events dynamically
         for (const { file, basePath, event } of eventModules) {
             if (file === 'memberExit.js') {
+                event.initializeTimeoutTracking(client, commandConfig);
                 client.on('guildMemberRemove', member => event.handleMemberRemove(member, logChannelID));
                 client.on('guildBanAdd', ban => event.handleGuildBanAdd(ban, logChannelID));
                 client.on('guildBanRemove', ban => event.handleGuildBanRemove(ban, logChannelID));
@@ -641,11 +651,12 @@ async function shutdown(signal, exitCode = 0) {
     for (const store of Object.values(pvpKingStores)) store.stopSyncLoop();
     notificationStore.stopSyncLoop();
     const xpCleanup = xpStore.stopSyncLoop();
+    const memberHistoryCleanup = memberHistory.stopSyncLoop();
     clearInterval(client.guildSettingsSyncLoop);
     client.giveawayLoop?.stop?.();
     require('./tasks/proNotifications.js').stop?.();
     const cleanup = Promise.allSettled([
-        guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop(), xpCleanup,
+        guildApplicationMonitor.stop?.(), tbaForumShopMonitor.stop?.(), scoutServers.stop(), xpCleanup, memberHistoryCleanup,
         discordTransport.stop()
     ]);
     botDiagnostics.stop();

@@ -7,7 +7,8 @@ const { DiscordDiagnosticLogger, redactDiagnostic } = require('../utils/discordD
 
 function fixture(options = {}) {
     const printed = [], sent = [];
-    const consoleObject = { warn: (...args) => printed.push(['warn', ...args]), error: (...args) => printed.push(['error', ...args]) };
+    const consoleObject = { log: (...args) => printed.push(['log', ...args]),
+        warn: (...args) => printed.push(['warn', ...args]), error: (...args) => printed.push(['error', ...args]) };
     const logger = new DiscordDiagnosticLogger({ send: event => sent.push(event), consoleObject, ...options });
     logger.install();
     return { logger, consoleObject, printed, sent };
@@ -25,13 +26,13 @@ test('actionable warnings before Discord login stay in memory, then post once wi
     f.logger.stop();
 });
 
-test('expected startup deadlines and transient fallback notices stay in the console', () => {
+test('expected startup deadlines stay local while recoverable fallback outages reach Discord', () => {
     const f = fixture();
     const notices = [
         '[WW LOG] Scout autocomplete will refresh in the background (AUTOCOMPLETE_PRELOAD_TIMEOUT).',
         '[WW LOG] Player server preferences will refresh when used (SERVER_PREFERENCE_PRELOAD_TIMEOUT).',
         '[DB LOG] MySQL connectivity issue detected (ECONNRESET: read ECONNRESET). Query retries and feature fallbacks are active.',
-        '[WW LOG] MySQL PvP King storage unavailable (ETIMEDOUT). Using the synchronized JSON snapshot; writes will queue for recovery.',
+        '[WW LOG] MySQL PvP King Gold storage unavailable (ETIMEDOUT). Using the synchronized JSON snapshot; writes will queue for recovery.',
         '[PRO NOTIFICATIONS] MySQL storage unavailable (ECONNREFUSED). Using JSON; pending settings and subscriptions will retry automatically.'
     ];
     for (const notice of notices) f.consoleObject.warn(notice);
@@ -41,12 +42,13 @@ test('expected startup deadlines and transient fallback notices stay in the cons
         Object.assign(new Error('MySQL is temporarily unavailable.'), { code: 'DATABASE_UNAVAILABLE', causeCode: 'ETIMEDOUT' }));
     f.logger.start();
     assert.equal(f.printed.length, notices.length + 2);
-    assert.deepEqual(f.sent, []);
+    assert.equal(f.sent.length, 2);
+    assert.deepEqual(f.sent.map(event => event.statusKey), ['database:pvp-king:gold', 'database:pro-notifications']);
     assert.equal(f.logger.waiting.size, 0);
     // A real preload failure and a non-transient database failure still need attention.
     f.consoleObject.warn('[WW LOG] Could not preload player server preferences:', Object.assign(new Error('Access denied'), { code: 'ER_ACCESS_DENIED_ERROR' }));
     f.consoleObject.error('[WW LOG] Unexpected MySQL PvP King storage error:', Object.assign(new Error('Lost write'), { code: 'ETIMEDOUT' }));
-    assert.equal(f.sent.length, 2);
+    assert.equal(f.sent.length, 4);
     f.logger.stop();
 });
 
@@ -182,4 +184,124 @@ test('Discord diagnostic messages omit the redundant WW tag without changing com
     assert.match(f.sent[1].message, /^\[DB LOG\] MySQL query failed/u);
     assert.equal(f.sent[1].component, 'MySQL');
     f.logger.stop();
+});
+
+test('recoverable warnings get a reply only after the same subsystem reports recovery', async () => {
+    const printed = [], sent = [];
+    const consoleObject = {
+        log: (...args) => printed.push(['log', ...args]),
+        warn: (...args) => printed.push(['warn', ...args]),
+        error: (...args) => printed.push(['error', ...args])
+    };
+    const logger = new DiscordDiagnosticLogger({ consoleObject, send: event => {
+        sent.push(event);
+        return Promise.resolve({ id: `message-${sent.length}` });
+    } });
+    logger.install(); logger.start();
+    const scenarios = [
+        ['[WW LOG] PRO Forum Shop monitor is unavailable. Retrying in 12 minute(s): fetch failed',
+            '[WW LOG] PRO Forum Shop monitor connection restored.'],
+        ['[WW LOG] PRO Dungeon Shop monitor is unavailable. Retrying in 12 minute(s): HTTP 522',
+            '[WW LOG] PRO Dungeon Shop monitor connection restored.'],
+        ['[WW LOG] Discord interaction connection warmup failed (ETIMEDOUT). Initial responses may need a new connection.',
+            '[WW LOG] Discord interaction connection warmup recovered.'],
+        ['[RUNTIME MEMORY] CRITICAL: 460.8/512.0 MiB (90.0%; container); OCR 0 queued/active task(s).',
+            '[RUNTIME MEMORY] Recovered below 75%: 380.0/512.0 MiB (container).'],
+        ['[WW LOG] MySQL PvP King Gold storage unavailable (ECONNREFUSED). Using the synchronized JSON snapshot; writes will queue for recovery.',
+            '[WW LOG] MySQL PvP King Gold storage restored; pending JSON operations will synchronize automatically.'],
+        ['[PRO NOTIFICATIONS] MySQL storage unavailable (ETIMEDOUT). Using JSON; pending settings and subscriptions will retry automatically.',
+            '[PRO NOTIFICATIONS] MySQL storage restored; pending JSON data is synchronizing.']
+    ];
+    for (const [warning, recovery] of scenarios) {
+        consoleObject.warn(warning);
+        consoleObject.log(recovery);
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent.length, scenarios.length * 2);
+    for (let index = 0; index < scenarios.length; index++) {
+        const warning = sent[index], recovery = sent[index + scenarios.length];
+        assert.equal(warning.status, 'unavailable');
+        assert.equal(recovery.status, 'recovered');
+        assert.equal(recovery.replyTo, `message-${index + 1}`);
+        assert.equal(recovery.statusKey, warning.statusKey);
+    }
+    assert.equal(printed.length, scenarios.length * 2);
+    logger.stop();
+});
+
+test('unmatched recovery logs do not create standalone Discord alerts', () => {
+    const f = fixture(); f.logger.start();
+    f.consoleObject.log('[WW LOG] PRO Forum Shop monitor connection restored.');
+    assert.deepEqual(f.sent, []);
+    f.logger.stop();
+});
+
+test('a recoverable outage resolved before Discord is ready does not post a stale warning later', () => {
+    const f = fixture();
+    f.consoleObject.warn('[WW LOG] PRO Forum Shop monitor is unavailable. Retrying in 1 minute(s): fetch failed');
+    f.consoleObject.log('[WW LOG] PRO Forum Shop monitor connection restored.');
+    f.logger.start();
+    assert.deepEqual(f.sent, []);
+    assert.equal(f.logger.waiting.size, 0);
+    f.logger.stop();
+});
+
+test('a failed repeat alert keeps the last delivered reference and recovery resets the cooldown', async t => {
+    for (const failure of [() => null, () => Promise.reject(new Error('Discord unavailable'))]) {
+        let now = 1000, calls = 0;
+        const sent = [];
+        const f = fixture({ now: () => now, send: event => {
+            if (++calls === 2) return failure();
+            sent.push(event);
+            return { id: `message-${calls}`, attachments: new Map() };
+        } });
+        t.after(() => f.logger.stop()); f.logger.start();
+        const warning = '[WW LOG] PRO Forum Shop monitor is unavailable. Retrying in 1 minute(s): fetch failed';
+        f.consoleObject.warn(warning);
+        assert.equal(await f.logger.statusMessages.get('forum:pro-forum-shop'), 'message-1');
+        now += 5 * 60_000;
+        f.consoleObject.warn(warning);
+        f.consoleObject.log('[WW LOG] PRO Forum Shop monitor connection restored.');
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(sent[1].replyTo, 'message-1');
+        f.consoleObject.warn(warning);
+        assert.equal(sent[2].status, 'unavailable');
+        assert.equal(calls, 4);
+    }
+});
+
+test('pending recovery replies are cancelled at shutdown', async () => {
+    let finish;
+    const sent = [], pending = new Promise(resolve => { finish = resolve; });
+    const f = fixture({ send: event => { sent.push(event); return pending; } });
+    f.logger.start();
+    f.consoleObject.warn('[WW LOG] PRO Forum Shop monitor is unavailable. Retrying in 1 minute(s): fetch failed');
+    f.consoleObject.log('[WW LOG] PRO Forum Shop monitor connection restored.');
+    f.logger.stop();
+    finish({ id: 'warning' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent.length, 1);
+});
+
+test('Gold and Silver storage outages recover independently and omit unrelated scout context', async t => {
+    const PvpKingStorage = require('../commands/pvp-king/utils/pvpKingStorage.js');
+    const sent = [];
+    const f = fixture({ send: event => { sent.push(event); return { id: `message-${sent.length}` }; } });
+    t.after(() => f.logger.stop()); f.logger.start();
+    t.mock.method(console, 'warn', f.consoleObject.warn);
+    t.mock.method(console, 'log', f.consoleObject.log);
+    const gold = new PvpKingStorage({ server: 'gold' }), silver = new PvpKingStorage({ server: 'silver' });
+    const outage = Object.assign(new Error('Connection refused'), { code: 'ECONNREFUSED' });
+    f.logger.run({ component: 'Scout ingestion', reportId: '123', messageId: '456' }, () => {
+        gold.noteMysqlFailure(outage); silver.noteMysqlFailure(outage);
+    });
+    assert.deepEqual(sent.map(event => event.statusKey), ['database:pvp-king:gold', 'database:pvp-king:silver']);
+    assert.ok(sent.every(event => event.reportId === undefined && event.messageId === undefined));
+    gold.noteMysqlRestored();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent[2].replyTo, 'message-1');
+    assert.equal(f.logger.statusMessages.has('database:pvp-king:silver'), true);
+    silver.noteMysqlRestored();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent[3].replyTo, 'message-2');
 });

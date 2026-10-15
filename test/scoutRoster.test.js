@@ -59,7 +59,7 @@ function fixture({ rows = [], friends = [], seeded = true, members = [] } = {}) 
     } };
     const store = new ScoutRosterStore({ db });
     store.schemaReady = true;
-    const guild = { id: 'guild', members: { async fetch() {
+    const guild = { id: 'guild', members: { async list() {
         state.fetches++;
         return new Map(members.map(value => [value.id, value]));
     } } };
@@ -143,13 +143,13 @@ test('first initialization writes the seed once and later startups reconcile', a
 
 test('failed full-member fetch propagates without changing membership and allows retry', async () => {
     const f = fixture({ rows: [saved('current', 'Same')], members: [member('current', 'Same', true)] });
-    const originalFetch = f.guild.members.fetch;
-    f.guild.members.fetch = async () => { throw new Error('Roster fetch failed'); };
+    const originalList = f.guild.members.list;
+    f.guild.members.list = async () => { throw new Error('Roster fetch failed'); };
     await assert.rejects(f.store.seedCurrentGuildMembers(f.guild, 'member-role'), /Roster fetch failed/u);
     assert.equal(f.state.rows.get('current').status, 'current');
     assert.deepEqual(f.state.writes, []);
     assert.equal(f.store.seedPromises.size, 0);
-    f.guild.members.fetch = originalFetch;
+    f.guild.members.list = originalList;
     assert.equal((await f.store.seedCurrentGuildMembers(f.guild, 'member-role')).former, 0);
 });
 

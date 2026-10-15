@@ -1,4 +1,5 @@
 const { MessageFlags } = require('discord.js');
+const { fetchGuildMemberRoster } = require('../../../utils/guildMemberRoster.js');
 
 const MEMBER_REFRESH_COOLDOWN_MS = 10 * 60 * 1000;
 const memberRefreshCache = new WeakMap();
@@ -72,9 +73,12 @@ async function refreshGuildMembers(guild, contextLabel) {
         return false;
     }
 
-    await guild.members.fetch().catch(err => {
+    try {
+        await fetchGuildMemberRoster(guild);
+    } catch (err) {
         console.error(`[WW LOG] Failed to refresh members for ${contextLabel}:`, err.code || err.message);
-    });
+        return false;
+    }
     memberRefreshCache.set(guild, Date.now());
     return true;
 }

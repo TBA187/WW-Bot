@@ -137,13 +137,13 @@ class PvpReverse {
                     if (kingRole) {
                         // Remove king role from the wrong King
                         const wrongMember = await interaction.guild.members.fetch(wrongKing.king_id).catch(() => null);
-                        if (wrongMember) await wrongMember.roles.remove(kingRole).catch(() => { });
+                        if (wrongMember) await wrongMember.roles.remove(kingRole, `Command /pvp_reverse: reverse crown by ${interaction.user.username}`).catch(() => { });
                         console.log("3) Remove king role from the wrong King: ", wrongKing.king_id);
 
                         // Give King role back to previous king
                         if (prevKing) {
                             const newMember = await interaction.guild.members.fetch(prevKing.king_id).catch(() => null);
-                            if (newMember) await newMember.roles.add(kingRole).catch(() => { });
+                            if (newMember) await newMember.roles.add(kingRole, `Command /pvp_reverse: restore crown by ${interaction.user.username}`).catch(() => { });
                             console.log("4) Give King role back to previous King: ", prevKing.king_id);
                         } else {
                             console.log("--) No previous King found to give role!");

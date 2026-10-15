@@ -130,13 +130,13 @@ class PvpCrownKing {
             if (!isDefense) {
                 await discordStep('King role updates', async () => {
                     // Preserve the old King if assigning the new King's role fails.
-                    await newKing.roles.add(this.pvpKingRoleID);
-                    if (oldKing) await oldKing.roles.remove(this.pvpKingRoleID);
+                    await newKing.roles.add(this.pvpKingRoleID, `Command /pvp_crown: crown assigned by ${interaction.user.username}`);
+                    if (oldKing) await oldKing.roles.remove(this.pvpKingRoleID, `Command /pvp_crown: previous crown replaced by ${interaction.user.username}`);
                 });
 
                 // Add secondary role ONCE to all first-time PvP Kings
                 if (!newKing.roles.cache.has(this.pvpWarriorRoleID)) {
-                    await discordStep('Warrior role update', () => newKing.roles.add(this.pvpWarriorRoleID));
+                    await discordStep('Warrior role update', () => newKing.roles.add(this.pvpWarriorRoleID, `Command /pvp_crown: warrior reward assigned by ${interaction.user.username}`));
                 }
 
                 const usersToNotify = (crownResult.usersToNotify ?? []).map(row => `<@${row.challenger_id}>`);

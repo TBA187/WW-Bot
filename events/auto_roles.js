@@ -17,13 +17,13 @@ const path = require('path');
 const sharp = require('sharp');
 const botConfig = require('../config.json');
 const { SERVERS, selectionFeedback } = require('../features/pvp-scouting/ScoutServerSettings.js');
+const { rolePanelReason } = require('../utils/roleAuditSource.js');
 
 
 // AUTO ROLES - INTERNAL CONFIG TYPES
 const SUPPORTED_AUTO_ROLE_MODES = new Set(['buttons', 'dropdown', 'reactions', 'color_roles']);
 const CUSTOM_ID_PREFIX = 'ww:auto_roles';
 const COLOR_ROLE_PRESET_PAGE_SIZE = 25;
-const COLOR_ROLE_ANCHOR_ID = botConfig.colorRoleAnchorID;
 const CUSTOM_COLOR_ROLE_ANCHOR_ID = botConfig.customColorRoleAnchorID;
 const COLOR_ROLE_PANEL_PAGE = 0;
 const COLOR_ROLE_PREVIEW_FILENAME = 'role-color-preview.png';
@@ -684,6 +684,7 @@ function getConfiguredRole(guild, choice) {
 
 
 async function manageableRoleError(guild, role) {
+    if (role.id === botConfig.wwRoleID) return 'The White Walker role is managed automatically by your WW Server Tag. Equip or remove the tag to change this role.';
     const me = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
     if (me === null) {
         return 'Bot role setup is incomplete.';
@@ -1238,7 +1239,7 @@ async function syncMemberColorRoleName(member, user = member.user) {
 }
 
 
-async function removeActiveColorRoles(member, user, exceptRoleId = null) {
+async function removeActiveColorRoles(member, user, exceptRoleId = null, auditReason = null) {
     const presetRoles = await getPresetColorRoles(member.guild);
     const rolesToRemove = presetRoles.filter(role =>
         role.id !== exceptRoleId && member.roles.cache.has(role.id)
@@ -1251,7 +1252,8 @@ async function removeActiveColorRoles(member, user, exceptRoleId = null) {
     }
 
     if (rolesToRemove.length > 0) {
-        await member.roles.remove([...new Set(rolesToRemove)], `Remove previous color roles for ${user.tag ?? user.username} (${user.id})`);
+        for (const id of new Set(rolesToRemove.map(role => role.id))) await member.roles.remove(id,
+            auditReason || `Remove previous color roles for ${user.tag ?? user.username} (${user.id})`);
     }
 
     if (shouldDeleteCustomRole) {
@@ -1318,9 +1320,9 @@ async function applyPresetColorRole(interaction, presetId) {
     }
 
     try {
-        await removeActiveColorRoles(member, interaction.user, role.id);
+        await removeActiveColorRoles(member, interaction.user, role.id, rolePanelReason(interaction, 'Replace active color role'));
         if (!member.roles.cache.has(role.id)) {
-            await member.roles.add(role, `Preset color role assigned to ${interaction.user.tag ?? interaction.user.username} (${interaction.user.id})`);
+            await member.roles.add(role, rolePanelReason(interaction, 'Select preset color role'));
         }
 
         await editPreviewFeedback(
@@ -1399,10 +1401,10 @@ async function applyCustomColorRole(interaction, style) {
 
         await applyRoleColors(role, style, reason);
         const positioned = await maybePositionRoleUnderAnchor(interaction.guild, role, CUSTOM_COLOR_ROLE_ANCHOR_ID, 'Custom Color Roles anchor');
-        await removeActiveColorRoles(member, interaction.user, role.id);
+        await removeActiveColorRoles(member, interaction.user, role.id, rolePanelReason(interaction, 'Replace active color role'));
 
         if (!member.roles.cache.has(role.id)) {
-            await member.roles.add(role, `Color role assigned to ${interaction.user.tag ?? interaction.user.username} (${interaction.user.id})`);
+            await member.roles.add(role, rolePanelReason(interaction, 'Select custom color role'));
         }
 
         await editPreviewFeedback(
@@ -1449,10 +1451,9 @@ async function clearMemberColorRole(interaction) {
         }
 
         if (rolesToRemove.length > 0) {
-            await member.roles.remove(
-                [...new Set(rolesToRemove)],
-                `Clear active color roles for ${interaction.user.tag ?? interaction.user.username} (${interaction.user.id})`
-            );
+            for (const id of new Set(rolesToRemove.map(role => role.id))) {
+                await member.roles.remove(id, rolePanelReason(interaction, 'Clear active color roles'));
+            }
         }
 
         if (customRoleToDelete !== null) {
@@ -1510,7 +1511,7 @@ async function toggleRoleFromButton(interaction, panel, choice) {
         return;
     }
 
-    const reason = `Auto-role button used by ${member.user?.tag ?? member.displayName} (${member.id})`;
+    const reason = rolePanelReason(interaction, 'Role selection button');
 
     try {
         if (member.roles.cache.has(role.id)) {
@@ -1538,7 +1539,7 @@ async function toggleRoleFromButton(interaction, panel, choice) {
         }
 
         if (rolesToRemove.length > 0) {
-            await member.roles.remove(rolesToRemove, reason);
+            for (const removed of rolesToRemove) await member.roles.remove(removed.id, reason);
         }
 
         await member.roles.add(role, reason);
@@ -1620,14 +1621,14 @@ async function applyRolesFromDropdown(interaction, panel, selectedKeys) {
         return;
     }
 
-    const reason = `Auto-role dropdown used by ${member.user?.tag ?? member.displayName} (${member.id})`;
+    const reason = rolePanelReason(interaction, 'Role selection dropdown');
 
     try {
         if (rolesToRemove.length > 0) {
-            await member.roles.remove(rolesToRemove, reason);
+            for (const removed of rolesToRemove) await member.roles.remove(removed.id, reason);
         }
         if (rolesToAdd.length > 0) {
-            await member.roles.add(rolesToAdd, reason);
+            for (const added of rolesToAdd) await member.roles.add(added.id, reason);
         }
     } catch (err) {
         if (err?.code === 50013) {

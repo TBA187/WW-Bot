@@ -71,7 +71,7 @@ function fixture(t) {
     }
     members.get('challenger').roles.cache.set('officer', roles.get('officer'));
     const guild = { channels: { cache: channels, fetch: async id => channels.get(id) },
-        roles: { cache: roles }, members: { fetch: async id => id ? members.get(id) : members },
+        roles: { cache: roles }, members: { fetch: async id => members.get(id), list: async () => members },
         iconURL: () => 'https://example.com/guild.png' };
     const client = { channels: guild.channels, guilds: { cache: new Map([['guild', guild]]) }, user: { id: 'bot' } };
     const config = { ...appConfig, guildId: 'guild', logChannelID: 'log', officerRoleID: 'officer',
@@ -244,7 +244,7 @@ test('crown starts acknowledgement synchronously and waits for acceptance before
     let acknowledged = false, accept;
     const gate = new Promise(resolve => { accept = resolve; });
     i.deferReply = () => { acknowledged = true; return gate.then(() => { i.deferred = true; }); };
-    const fetch = t.mock.method(i.guild.members, 'fetch');
+    const fetch = t.mock.method(i.guild.members, 'list');
     const write = t.mock.method(f.stores.silver, 'recordCrownEvent');
     const pending = load('pvp_crown', f.config).execute(i);
     assert.equal(acknowledged, true, 'initial request starts before execute returns its promise');
@@ -261,7 +261,7 @@ test('an expired crown acknowledgement leaves both stores, roles, cooldowns and 
     const before = Object.fromEntries(Object.entries(f.stores).map(([server, store]) => [server, store.serializeState()]));
     const i = f.interaction('silver');
     i.deferReply = async () => { throw Object.assign(new Error('Unknown interaction'), { code: 10062 }); };
-    const fetch = t.mock.method(i.guild.members, 'fetch');
+    const fetch = t.mock.method(i.guild.members, 'list');
     await assert.rejects(load('pvp_crown', f.config).execute(i), error => error.code === 10062);
     assert.equal(fetch.mock.calls.length, 0);
     for (const [server, store] of Object.entries(f.stores)) assert.deepEqual(store.serializeState(), before[server]);

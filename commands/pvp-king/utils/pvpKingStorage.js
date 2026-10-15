@@ -127,7 +127,7 @@ class PvpKingStorage {
         this.mysqlOutage = true;
         const errorCode = this.db?.getErrorCode?.(err) || err?.causeCode || err?.cause?.code || err?.code || err?.message || err;
         console.warn(
-            `[WW LOG] MySQL PvP King storage unavailable (${errorCode}). ` +
+            `[WW LOG] MySQL PvP King ${this.server === 'silver' ? 'Silver' : 'Gold'} storage unavailable (${errorCode}). ` +
             'Using the synchronized JSON snapshot; writes will queue for recovery.'
         );
     }
@@ -135,7 +135,7 @@ class PvpKingStorage {
     noteMysqlRestored() {
         if (!this.mysqlOutage) return;
         this.mysqlOutage = false;
-        console.log('[WW LOG] MySQL PvP King storage restored; pending JSON operations will synchronize automatically.');
+        console.log(`[WW LOG] MySQL PvP King ${this.server === 'silver' ? 'Silver' : 'Gold'} storage restored; pending JSON operations will synchronize automatically.`);
     }
 
     // The JSON interpreter and queued operations use the same logical table

@@ -14,6 +14,7 @@ async function createOcrProcessWorker({ cachePath, workerOptions = {}, forkProce
     });
     const pending = new Map();
     let nextId = 0, ended = false, stopping = false, killTimer;
+    let lastMemory = null;
     let resolveExit;
     const exited = new Promise(resolve => { resolveExit = resolve; });
     const rejectPending = error => {
@@ -21,6 +22,9 @@ async function createOcrProcessWorker({ cachePath, workerOptions = {}, forkProce
         pending.clear();
     };
     child.on('message', message => {
+        if (Number.isFinite(message?.memory?.rss) && Number.isFinite(message?.memory?.peakRss)) {
+            lastMemory = { rss: message.memory.rss, peakRss: message.memory.peakRss };
+        }
         const task = pending.get(message?.id);
         if (!task) return;
         pending.delete(message.id);
@@ -80,7 +84,7 @@ async function createOcrProcessWorker({ cachePath, workerOptions = {}, forkProce
         return { processId: child.pid, recognize: (...args) => request('recognize', args),
             analyzeScout: (...args) => request('scout', args, Math.max(timeoutMs, 10 * 60_000)),
             resolveGuild: (...args) => request('guild', args, Math.max(timeoutMs, 10 * 60_000)),
-            memoryUsage: () => request('memory', []), terminate };
+            memoryUsage: () => request('memory', []), memorySnapshot: () => lastMemory, terminate };
     } catch (error) {
         await terminate();
         throw error;

@@ -84,7 +84,7 @@ async function finishXpAward(operation, currentData, guild, member, commandConfi
                     // Assign role if roleId is present and user doesn't have it
                     if (reward.roleId && !member.roles.cache.has(reward.roleId)) {
                         try {
-                            await member.roles.add(reward.roleId);
+                            await member.roles.add(reward.roleId, `XP level reward: reached level ${reward.level} (${track})`);
                             // Push object to reference the level and role together in the embed
                             rolesEarned.push({ id: reward.roleId, level: reward.level });
                         } catch (roleErr) {

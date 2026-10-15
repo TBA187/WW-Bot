@@ -1,127 +1,197 @@
-// ====================
-// Detect Role Updates
-// ====================
+'use strict';
 
-const { AuditLogEvent } = require('discord.js');
+const { AuditLogEvent, AttachmentBuilder, EmbedBuilder, Events } = require('discord.js');
+const path = require('node:path');
+const { findModerationAuditEntry } = require('./memberExit.js');
+const { buildMemberAuditPayload, auditActor, inlineCode } = require('../utils/memberAuditEmbeds.js');
+const { ServerTagRoleManager, serverTagStatus, POLICY_REASON_PREFIX } = require('../utils/serverTagRoleManager.js');
+const { sleep } = require('../utils/logHelpers.js');
+const { roleSource } = require('../utils/roleAuditSource.js');
+
+function changedRole(entry, roleId, added) {
+    return entry.changes?.some(change => change.key === (added ? '$add' : '$remove') &&
+        Array.isArray(change.new) && change.new.some(role => String(role.id) === String(roleId)));
+}
+
+function roleLines(roles, added, mixed = false) {
+    if (!roles.length) return [];
+    const label = `- ${mixed ? `**${added ? '+' : '-'}** ` : ''}**Role${roles.length > 1 ? 's' : ''} ${added ? 'Added' : 'Removed'}:**`;
+    const format = role => `<@&${role.id}> (\`${role.id}\`)`;
+    return roles.length === 1 ? [`${label} ${format(roles[0])}`] : [label, ...roles.map(role => `  - ${format(role)}`)];
+}
+
+function buildRoleAuditPayload(member, { addedRoles = [], removedRoles = [], entry, source, definitionDeleted = false }) {
+    const roles = [...addedRoles, ...removedRoles], mixed = addedRoles.length > 0 && removedRoles.length > 0;
+    const added = addedRoles.length > 0;
+    const lines = [...roleLines(addedRoles, true, mixed), ...roleLines(removedRoles, false, mixed)];
+    if (definitionDeleted) lines.push('- **Removal Context:** The role itself was deleted from the server.');
+    let actionText = mixed ? `had roles updated by ${auditActor(entry?.executor)}`
+        : `had ${roles.length > 1 ? 'roles' : 'a role'} ${added ? 'added' : 'removed'} by ${auditActor(entry?.executor)}`;
+    if (source?.kind === 'self_panel') {
+        actionText = `${mixed ? 'updated their self-assigned roles' : added ? 'self-assigned roles' : 'self-removed roles'} using the role selection panel.`;
+        lines.push(`- **Role Selection Panel:** <#${source.channelId}>`, `- **Roles Updated By:** ${auditActor(entry.executor)}`);
+    } else if (source?.kind === 'other_panel') lines.push(`- **Action Source:** Role panel in <#${source.channelId}>`, `- **Roles Updated By:** ${auditActor(entry.executor)}`);
+    else if (source?.kind === 'command' || source?.kind === 'settings') lines.push(`- **Action Source:** ${source.detail}`);
+    else if (source?.kind === 'automatic') lines.push(`- **Action Source:** Automatic event — ${source.detail}`);
+    else if (entry?.executor?.bot) lines.push(`- **Action Source:** ${source?.detail || 'Bot role update — the command, panel, or event was not supplied.'}`);
+    else if (roles.every(role => role.managed)) lines.push('- **Action Source:** Integration-managed role');
+    if (!entry?.executor) lines.push('- **Discord Audit Log:** Executor unavailable; the role change was confirmed from member data.');
+    return buildMemberAuditPayload({
+        authorName: mixed ? 'Member Roles Updated 🔄' : `Member Role${roles.length > 1 ? 's' : ''} ${added ? 'Added 🏷️➕' : 'Removed 🏷️➖'}`,
+        member, actionText,
+        color: mixed ? 0x5865F2 : added ? 0x57F287 : 0xED4245,
+        reason: source && source.kind !== 'bot' ? undefined : entry?.reason?.trim() || undefined, extraLines: lines, showUserDetails: false
+    });
+}
+
+function buildWwRolePayload(member, { role, added, entry, enforcement }) {
+    if (typeof enforcement?.enabled === 'boolean' && enforcement.enabled !== added) {
+        const corrected = enforcement.status === 'corrected';
+        return buildMemberAuditPayload({ authorName: corrected
+            ? `WW Role ${added ? 'Addition Intercepted 🏷️➖' : 'Removal Intercepted 🏷️➕'}` : 'WW Role Correction Pending 🔄', member,
+            actionHeading: `${auditActor(entry?.executor)} tried to ${added ? 'give' : 'remove'} the White Walker role ${added ? 'to' : 'from'} <@${member.id}>.` +
+                (corrected ? ` WW-Bot intercepted the change and ${added ? 'removed the role again' : 'restored the role'}!` : ''),
+            color: corrected ? added ? 0xED4245 : 0x57F287 : 0x5865F2,
+            reason: enforcement.enabled ? 'This member is wearing the WW Server Tag and must keep the White Walker role.'
+                : 'This member is not wearing the WW Server Tag and cannot have the White Walker role.',
+            showUserDetails: false,
+            extraLines: corrected ? [...roleLines([role], !added), '- **Correction Status:** Confirmed by Discord.']
+                : [`- **Role:** <@&${role.id}> (\`${role.id}\`)`,
+                    `- **Correction Status:** ${enforcement.status === 'compliant' ? 'The role already matches the current tag.' : 'Not completed — ' + (enforcement.error || 'verification will retry automatically.')}`] });
+    }
+    const payload = buildRoleAuditPayload(member, { addedRoles: added ? [role] : [], removedRoles: added ? [] : [role], entry });
+    if (!enforcement || enforcement.enabled === undefined) payload.embeds[0].setDescription(payload.embeds[0].data.description +
+        '\n- **WW Role Verification:** Pending — the current server tag could not be confirmed. WW-Bot will retry automatically.');
+    return payload;
+}
+
+function buildWwCorrectionPayload(member, { added, role, source, reason, success, error }, bot) {
+    const label = success ? added ? 'WW Role Assigned / Restored 🏷️➕' : 'WW Role Removed 🏷️➖' : 'WW Role Correction Failed 🔄';
+    const triggers = { tag_update: 'Server tag changed', role_update: 'Member roles changed', join: 'Member joined', startup: 'Bot startup', periodic: 'Scheduled verification' };
+    return buildMemberAuditPayload({ authorName: label, member,
+        actionText: success ? `had the White Walker role ${added ? 'assigned or restored' : 'removed'} by ${auditActor(bot)}`
+            : 'needs a White Walker role correction that WW-Bot could not complete.',
+        color: success ? added ? 0x57F287 : 0xED4245 : 0x5865F2,
+        reason: reason?.replace(`${POLICY_REASON_PREFIX} `, ''), showUserDetails: false,
+        extraLines: [...(success ? roleLines([role], added) : [`- **Role:** <@&${role.id}> (\`${role.id}\`)`,
+            `- **Requested Role Action:** ${added ? 'Assign / restore' : 'Remove'}`]), `- **Server Tag:** ${added ? 'Equipped' : 'Not equipped'}`,
+            `- **Check Trigger:** ${triggers[source] || 'Policy verification'}`,
+            success ? `- **Correction Status:** Confirmed — the role is ${added ? 'present' : 'absent'}.`
+                : `- **Correction Status:** Failed — ${inlineCode(String(error).slice(0, 512))}`] });
+}
+
+function buildWwTagPayload(member, equipped) {
+    return buildMemberAuditPayload({ authorName: `WW Server Tag ${equipped ? 'Equipped 🏷️➕' : 'Removed 🏷️➖'}`,
+        member, actionText: `${equipped ? 'equipped' : 'removed'} the WW Server Tag!`,
+        color: equipped ? 0x57F287 : 0xED4245, showUserDetails: false,
+        extraLines: [`- **Server Tag:** ${equipped ? 'Equipped' : 'Not equipped'}`] });
+}
+
+function buildWwRepresentativePayload(member, config) {
+    const embed = new EmbedBuilder().setTitle('New White Walker Representative 🎉').setColor(0x9B59B6)
+        .setDescription(`### Big shoutout to <@${member.id}> for equipping the WW Server Tag!\n` +
+            '- Your White Walker role, name color, and mascot icon are managed automatically.\n' +
+            `-# If you would like to change your name color or icon, you can contact <@${config.ownerID}>`)
+        .setFooter({ text: `User ID: ${member.id}`, iconURL: 'attachment://ww_logo.png' }).setTimestamp();
+    return { content: `<@${member.id}>`, embeds: [embed],
+        files: [new AttachmentBuilder(path.join(__dirname, '../images/ww_logo.png'), { name: 'ww_logo.png' })],
+        allowedMentions: { parse: [], users: [member.id] } };
+}
+
+async function getChannel(guild, id) {
+    if (!id) return null;
+    const channel = guild.channels.cache.get(id) || await guild.channels.fetch(id);
+    return channel?.isTextBased() ? channel : null;
+}
+
+async function sendStaff(member, config, payload) {
+    const channel = await getChannel(member.guild, config.logChannelID);
+    if (channel) await channel.send(payload);
+}
+
+async function handleRoleUpdate(oldMember, newMember, config) {
+    if (config.guildId && newMember.guild.id !== config.guildId) return;
+    const policy = config.serverTagRoleManager;
+    // Enforcement runs independently of log-channel availability and audit access.
+    if (oldMember.partial || !oldMember.roles?.cache || !newMember.roles?.cache) return policy?.request(newMember);
+    const eventTime = Date.now();
+    const changes = [
+        ...[...newMember.roles.cache.values()].filter(role => role.id !== newMember.guild.id && !oldMember.roles.cache.has(role.id)).map(role => ({ role, added: true })),
+        ...[...oldMember.roles.cache.values()].filter(role => role.id !== newMember.guild.id && !newMember.roles.cache.has(role.id)).map(role => ({ role, added: false }))
+    ].filter(change => change.role.id !== config.wwRoleID || !policy?.consumeExpectedChange(newMember, change.added));
+    const wwChanged = changes.some(change => change.role.id === config.wwRoleID);
+    const check = policy?.request(newMember, { reportCorrection: !wwChanged });
+    if (!changes.length) return check;
+    try {
+        const channel = await getChannel(newMember.guild, config.logChannelID);
+        if (!channel) return check;
+        await sleep(1200);
+        const resolved = await Promise.all(changes.map(async change => {
+            const definitionDeleted = !change.added && !newMember.guild.roles.cache.has(change.role.id);
+            const entry = await findModerationAuditEntry(newMember.guild,
+                definitionDeleted ? AuditLogEvent.RoleDelete : AuditLogEvent.MemberRoleUpdate,
+                definitionDeleted ? change.role.id : newMember.id,
+                { eventTime, matches: candidate => definitionDeleted || changedRole(candidate, change.role.id, change.added) });
+            return { ...change, entry, definitionDeleted };
+        }));
+        const groups = new Map();
+        for (const change of resolved) {
+            if (change.role.id === config.wwRoleID && !change.definitionDeleted) {
+                if (change.entry?.executor?.id === config.client.user?.id && change.entry.reason?.startsWith(POLICY_REASON_PREFIX)) continue;
+                await channel.send(buildWwRolePayload(newMember, { ...change, enforcement: await check }));
+                continue;
+            }
+            const key = `${change.definitionDeleted}:${change.entry?.id || 'unknown'}`;
+            if (!groups.has(key)) groups.set(key, { ...change, source: roleSource(change.entry, newMember, config.client.user?.id, config.selfRoleChannelID), changes: [] });
+            groups.get(key).changes.push(change);
+        }
+        for (const group of groups.values()) {
+            for (let index = 0; index < group.changes.length; index += 10) {
+                const batch = group.changes.slice(index, index + 10);
+                await channel.send(buildRoleAuditPayload(newMember, { ...group,
+                    addedRoles: batch.filter(change => change.added).map(change => change.role),
+                    removedRoles: batch.filter(change => !change.added).map(change => change.role) }));
+            }
+        }
+    } catch (error) { console.error('Member role audit failed:', error); }
+    return check;
+}
+
+async function handleWwTagUpdate(oldUser, newUser, config) {
+    if (!config.guildId || !config.serverTagRoleManager) return;
+    const before = oldUser.partial ? undefined : serverTagStatus(oldUser, config.guildId);
+    const equipped = serverTagStatus(newUser, config.guildId);
+    if (equipped === undefined || before === equipped) return;
+    try {
+        const guild = config.client.guilds.cache.get(config.guildId);
+        if (!guild) return;
+        const member = guild.members.cache.get(newUser.id) || await guild.members.fetch(newUser.id).catch(() => null);
+        if (member) await config.serverTagRoleManager.request(member, { user: newUser, previousTag: before,
+            source: 'tag_update', trustEvent: true });
+    } catch (error) { console.error('WW server tag audit failed:', error); }
+}
 
 module.exports = {
-    name: 'guildMemberUpdate',
-    async execute(oldMember, newMember, config) {
-        if (!oldMember.roles || !newMember.roles) return; // Prevents "False Positive" pings
-        if (!newMember.guild.roles.cache.has(config.wwRoleID)) return;
-
-        // "White Walker" Role Checks
-        const hadRole = oldMember.roles.cache.has(config.wwRoleID);
-        const hasRole = newMember.roles.cache.has(config.wwRoleID);
-        if (hadRole === hasRole) return;
-        let action = 'No action';
-
-        try {
-            const logChannel = newMember.guild.channels.cache.get(config.logChannelID);
-
-            await new Promise(resolve => setTimeout(resolve, 1500));
-
-            // Fetch the latest 5 audit log for member role updates
-            const fetchedLogs = await newMember.guild.fetchAuditLogs({
-                limit: 5,
-                type: AuditLogEvent.MemberRoleUpdate,
-            });
-
-            // Filter all entries in the last 10 seconds that specifically modified the WW role
-            const relevantLogs = fetchedLogs.entries.filter(e => {
-                if (e.target.id !== newMember.id) return false;
-                if ((Date.now() - e.createdTimestamp) >= 10000) return false;
-
-                const roleChange = e.changes.find(c => c.key === '$add' || c.key === '$remove');
-                if (roleChange && roleChange.new) {
-                    return roleChange.new.some(role => role.id === config.wwRoleID);
-                }
-                return false;
-            });
-
-            if (relevantLogs.size === 0) {
-                return;
-            }
-
-            // Check for human actions
-            const humanLog = relevantLogs.find(e => !e.executor.bot);
-            let humanAddedRole = false;
-            let humanRemovedRole = false;
-
-            if (humanLog) {
-                const addChange = humanLog.changes.find(c => c.key === '$add');
-                if (addChange && addChange.new && addChange.new.some(r => r.id === config.wwRoleID)) {
-                    humanAddedRole = true;
-                }
-
-                const removeChange = humanLog.changes.find(c => c.key === '$remove');
-                if (removeChange && removeChange.new && removeChange.new.some(r => r.id === config.wwRoleID)) {
-                    humanRemovedRole = true;
-                }
-            }
-
-            // =========================
-            // ROLE ADDED
-            // =========================
-            if (!hadRole && hasRole) {
-                action = 'ADD';
-
-                if (humanAddedRole) {
-                    // Scenario A: Human tried to ADD the WW role manually
-                    const humanExecutor = humanLog.executor;
-                    if (logChannel) {
-                        await logChannel.send(`### ⚠️ <@${humanExecutor.id}> (${humanExecutor.tag}) tried to give the \`White Walker\` role to <@${newMember.id}>\n - This role will be given to members **automatically when they equip the WW Server Tag!**\n### 🔄  Role has been removed from ${newMember.displayName}  ❌`);
-                    }
-                    return; // Stop here!
-                }
-
-                if (humanRemovedRole) {
-                    // Scenario B: If human removed the WW role manually, RaidProtect Bot will automatically ADD it back
-                    console.log(`[WW LOG] - RaidProtect restored WW role after human removal. Skipping welcome message!`);
-                    return; // Stop here and do NOT send the welcome message!
-                }
-
-                // If RaidProtect Bot gave the WW role -> Member Equipped the WW Server Tag!
-                const channel = newMember.guild.channels.cache.get(config.welcomeChannelID);
-                if (channel) {
-                    await channel.send(
-                        `## 🎉  New White Walker Representative!  🎉\n` +
-                        `### Big shoutout to <@${newMember.id}> for equipping the WW Server Tag! <:man_of_culture:1186287184106496112>\n` +
-                        `- You now have a cool new name color and an icon featuring the White Walkers mascot <:kyurem:1472065995089645609>\n` +
-                        `-# If you would like to change your name color or icon, you can contact <@${config.ownerID}>`
-                    );
-                }
-            }
-
-            // =========================
-            // ROLE REMOVED
-            // =========================
-            if (hadRole && !hasRole) {
-                action = 'REMOVE';
-
-                if (humanRemovedRole) {
-                    // Scenario C: Human tried to REMOVE thw WW role manually
-                    const humanExecutor = humanLog.executor;
-                    if (logChannel) {
-                        await logChannel.send(`### ⚠️ <@${humanExecutor.id}> (${humanExecutor.tag}) tried to remove the \`White Walker\` role from <@${newMember.id}>\n - This role will be removed from members **automatically when they unequip the WW Server Tag!**\n### 🔄  Role has been restored back to ${newMember.displayName}  ✅`);
-                    }
-                    return; // Stop here!
-                }
-
-                if (humanAddedRole) {
-                    // Scenario D: If human added the WW role manually, RaidProtect Bot will automatically remove it again
-                    console.log(`[WW LOG] - RaidProtect reverted WW role after human addition. Skipping removal log message!`);
-                    return; // Stop here and do NOT send the removal log message!
-                }
-
-                // If RaidProtect Bot removed the WW role -> Member unequipped the WW Server Tag!
-                if (logChannel) {
-                    await logChannel.send(`### 🔎  <@${newMember.id}> (${newMember.user.tag}) removed the WW Server Tag!`);
-                }
-            }
-
-        } catch (err) {
-            console.error(`[WW LOG] - ERROR sending role-detection (${action} Event) message:`, err);
-        }
-    }
+    register(client, config) {
+        if (config.serverTagRoleManager) return;
+        const manager = new ServerTagRoleManager({ client, guildId: config.guildId, roleId: config.wwRoleID, signal: config.shutdownSignal,
+            onTagChange: async (member, equipped) => {
+                const jobs = [sendStaff(member, config, buildWwTagPayload(member, equipped))];
+                if (equipped) jobs.push((async () => {
+                    const welcome = await getChannel(member.guild, config.welcomeChannelID);
+                    if (welcome) await welcome.send(buildWwRepresentativePayload(member, config));
+                })());
+                const results = await Promise.allSettled(jobs);
+                for (const result of results) if (result.status === 'rejected') console.error('WW tag notification failed:', result.reason);
+            },
+            onCorrection: (member, correction) => sendStaff(member, config, buildWwCorrectionPayload(member, correction, client.user)) });
+        config.serverTagRoleManager = manager;
+        client.on(Events.GuildMemberUpdate, (oldMember, newMember) => { void handleRoleUpdate(oldMember, newMember, config); });
+        client.on(Events.UserUpdate, (oldUser, newUser) => { void handleWwTagUpdate(oldUser, newUser, config); });
+        client.on(Events.GuildMemberAdd, member => { void manager.request(member, { source: 'join' }); });
+        client.on(Events.GuildMemberRemove, member => manager.forget(member));
+        manager.start();
+    },
+    handleRoleUpdate, handleWwTagUpdate, buildRoleAuditPayload, buildWwRolePayload, buildWwTagPayload,
+    buildWwCorrectionPayload, buildWwRepresentativePayload
 };

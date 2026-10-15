@@ -27,7 +27,7 @@ test('actual index startup cannot restore stores, register commands, login or st
         exit: code => { calls.push('exit ' + code); exit.resolve(); }
     };
     let client;
-    let xpStopped = false;
+    let xpStopped = false, historyStopped = false;
     class FakeClient extends EventEmitter {
         constructor() { super(); client = this; }
         destroy() { calls.push('disconnect'); }
@@ -40,6 +40,7 @@ test('actual index startup cannot restore stores, register commands, login or st
         autocomplete() { return Promise.resolve([]); }
     }
     class FakeXpStore extends FakeStore { stopSyncLoop() { xpStopped = true; } }
+    class FakeMemberHistory extends FakeStore { stopSyncLoop() { historyStopped = true; } }
     const monitor = { start() { calls.push('monitor start'); return Promise.resolve(); }, stop() {} };
     class FakeIngestor { start() { calls.push('ingestor start'); return Promise.resolve(); } stop() {} }
     const db = { initPromise: databaseReady.promise,
@@ -59,7 +60,8 @@ test('actual index startup cannot restore stores, register commands, login or st
         './utils/interactionDiagnostics.js': require('../utils/interactionDiagnostics.js'),
         './utils/discordTransport.js': { createDiscordTransport: () => ({ makeRequest() {}, startWarmup() {}, async stop() {} }) },
         './utils/runtimeHealth.js': { RuntimeHealth: class { start() {} stop() {} } },
-        './utils/runtimeMemoryOcr.js': { sharedOcrWorkerPool: { snapshot: () => ({ workers: 0, pending: 0, creating: false }) } },
+        './utils/runtimeMemoryOcr.js': { sharedOcrWorkerPool: { healthSnapshot: () => ({ workers: 0, pending: 0, creating: false }) } },
+        './utils/memberAuditHistory.js': { MemberAuditHistory: FakeMemberHistory },
         './commands/pvp-king/utils/pvpKingStorage.js': FakeStore,
         './events/giveaways.js': { createGiveawayStore: () => new FakeStore() },
         './features/pro-notifications/NotificationStore.js': FakeStore,
@@ -107,4 +109,5 @@ test('actual index startup cannot restore stores, register commands, login or st
         'logging stopped', 'exit 0'
     ]);
     assert.equal(xpStopped, true);
+    assert.equal(historyStopped, true);
 });

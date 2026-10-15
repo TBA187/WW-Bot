@@ -7,6 +7,7 @@ const { Collection, MessageFlags } = require('discord.js');
 const sharp = require('sharp');
 const AutoRoles = require('../commands/auto_roles.js');
 const { findAutoRolePanel, handleAutoRoleButton, handleAutoRoleSelect, handleAutoRoleModal } = require('../events/auto_roles.js');
+const { roleSource } = require('../utils/roleAuditSource.js');
 
 function panelRequest() {
     const calls = [];
@@ -21,6 +22,51 @@ function panelRequest() {
     };
     return interaction;
 }
+
+test('role button writes verified panel provenance on both assign and remove requests', async () => {
+    const panel = findAutoRolePanel('guild_roles'), choice = panel.roles.find(item => item.key === 'pvp');
+    const calls = [], cache = new Collection(), bot = { id: '223456789012345678', bot: true };
+    const role = { id: choice.roleId, name: 'PvP', comparePositionTo: () => -1, toString: () => `<@&${choice.roleId}>` };
+    const member = { id: '296447098298171393', user: { id: '296447098298171393', username: 'kaasfondue' }, roles: { cache,
+        add: async (_, reason) => { calls.push(reason); cache.set(role.id, role); },
+        remove: async (_, reason) => { calls.push(reason); cache.delete(role.id); } } };
+    const guild = { roles: { cache: new Collection([[role.id, role]]) }, members: { me: { permissions: { has: () => true }, roles: { highest: {} } }, fetch: async () => member } };
+    const interaction = { customId: panel.customIdForRole(choice.key), channelId: '1184121209609269409', user: member.user, member, guild,
+        async deferReply() { this.deferred = true; }, editReply: async () => {} };
+    await handleAutoRoleButton(interaction); await handleAutoRoleButton(interaction);
+    assert.equal(calls.length, 2);
+    for (const reason of calls) assert.equal(roleSource({ executor: bot, reason }, member, bot.id).kind, 'self_panel');
+});
+
+test('role dropdown records its actual channel and cannot label a panel elsewhere as the roles-channel panel', async () => {
+    const panel = findAutoRolePanel('region_roles'), calls = [], bot = { id: '223456789012345678', bot: true };
+    const member = { id: '296447098298171393', user: { id: '296447098298171393', username: 'kaasfondue' }, roles: { cache: new Collection(),
+        add: async (_, reason) => calls.push(reason), remove: async (_, reason) => calls.push(reason) } };
+    const guild = { roles: { cache: new Collection(panel.roles.map(choice => [choice.roleId, { id: choice.roleId, comparePositionTo: () => -1 }])) },
+        members: { me: { permissions: { has: () => true }, roles: { highest: {} } }, fetch: async () => member } };
+    await handleAutoRoleSelect({ customId: panel.selectCustomId, values: ['europe'], channelId: '123456789012345678', user: member.user, member, guild,
+        async deferReply() { this.deferred = true; }, editReply: async () => {} });
+    assert.equal(calls.length, 1);
+    assert.equal(roleSource({ executor: bot, reason: calls[0] }, member, bot.id).kind, 'other_panel');
+});
+
+test('switching panel roles uses single-role routes and preserves a WW role added while the cache is stale', async () => {
+    const panel = findAutoRolePanel('region_roles');
+    const definitions = new Collection(panel.roles.map(choice => [choice.roleId, { id: choice.roleId, comparePositionTo: () => -1 }]));
+    const oldId = panel.roles.find(choice => choice.key === 'europe').roleId;
+    const nextId = panel.roles.find(choice => choice.key === 'north_america').roleId;
+    const ww = '1483676323301036072', actual = new Set([oldId]), calls = [];
+    const member = { id: '296447098298171393', user: { id: '296447098298171393' }, roles: {
+        cache: new Collection([[oldId, definitions.get(oldId)]]),
+        async remove(id) { assert.equal(typeof id, 'string'); calls.push(['remove', id]); actual.delete(id); actual.add(ww); },
+        async add(id) { assert.equal(typeof id, 'string'); calls.push(['add', id]); actual.add(id); }
+    } };
+    await handleAutoRoleSelect({ customId: panel.selectCustomId, values: ['north_america'], channelId: '1184121209609269409', user: member.user, member,
+        guild: { roles: { cache: definitions }, members: { me: { permissions: { has: () => true }, roles: { highest: {} } } } },
+        async deferReply() { this.deferred = true; }, editReply: async () => {} });
+    assert.deepEqual(calls, [['remove', oldId], ['add', nextId]]);
+    assert.deepEqual([...actual].sort(), [ww, nextId].sort());
+});
 
 function defaultPanelChannel(t) {
     const panel = findAutoRolePanel('color_roles'), original = panel.defaultChannelId;

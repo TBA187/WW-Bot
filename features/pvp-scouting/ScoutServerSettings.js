@@ -2,6 +2,7 @@
 'use strict';
 
 const { PermissionFlagsBits } = require('discord.js');
+const { rolePanelReason } = require('../../utils/roleAuditSource.js');
 
 const SERVERS = Object.freeze({
     gold: Object.freeze({ label: 'Gold', emoji: { id: '1555743525759356948', name: 'gold' },
@@ -71,7 +72,8 @@ class ScoutServerSettings {
                 throw new Error('Gold and Silver roles must be below the bot\'s highest role.');
             }
         }
-        return { guild, member, roleIds };
+        return { guild, member, roleIds, auditReason: interaction.customId?.startsWith('ww:auto_roles:')
+            ? rolePanelReason(interaction, 'Select game-server roles') : 'White Walker game-server preference settings' };
     }
 
     async applySelection(interaction, server, toggle) {
@@ -123,7 +125,7 @@ class ScoutServerSettings {
 
     async syncRoles(prepared, expectedRoles) {
         let member = await prepared.guild.members.fetch({ user: prepared.member.id || prepared.member.user.id, force: true });
-        const reason = 'White Walker game-server preference';
+        const reason = prepared.auditReason;
         // Singular role routes preserve unrelated roles and remove the old server first.
         for (const id of prepared.roleIds) if (!expectedRoles.has(id) && member.roles.cache.has(id)) {
             member = await member.roles.remove(id, reason);

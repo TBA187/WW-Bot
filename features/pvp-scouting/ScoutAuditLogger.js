@@ -153,6 +153,16 @@ function diagnosticPayload(event, ownerId, logoPath = path.join(__dirname, '../.
         allowedMentions: { parse: [], users: ownerId ? [String(ownerId)] : [] } };
 }
 
+function recoveryPayload(event, logoPath = path.join(__dirname, '../../images/ww_logo.png')) {
+    const embed = new EmbedBuilder().setColor(0x57F287).setTitle('✅ Service Restored')
+        .setDescription(event.message.slice(0, 3500) || 'The service is responding again.')
+        .setFooter({ text: `WW • ${event.component || 'Bot runtime'}`.slice(0, 256), iconURL: 'attachment://ww_logo.png' })
+        .setTimestamp(event.timestamp ? new Date(event.timestamp) : new Date());
+    if (event.component) embed.addFields({ name: 'Component', value: escapeMarkdown(event.component).slice(0, 256), inline: true });
+    return { embeds: [embed], files: [new AttachmentBuilder(logoPath, { name: 'ww_logo.png' })],
+        allowedMentions: { parse: [] } };
+}
+
 class ScoutAuditLogger {
     constructor({ client, guildId, channelId, ownerId, logoPath } = {}) {
         this.client = client; this.guildId = String(guildId || ''); this.channelId = String(channelId || '');
@@ -175,15 +185,27 @@ class ScoutAuditLogger {
     diagnostic(event) {
         if (!this.channelId) return;
         const saved = structuredClone(event);
-        this.queuePayload(() => diagnosticPayload(saved, this.ownerId, this.logoPath), 'bot diagnostic log');
+        if (saved.status === 'recovered') {
+            return this.queuePayload(() => recoveryPayload(saved, this.logoPath), 'bot recovery log', saved.replyTo);
+        }
+        return this.queuePayload(() => diagnosticPayload(saved, this.ownerId, this.logoPath), 'bot diagnostic log');
     }
 
-    queuePayload(build, label) {
-        this.pending = this.pending.then(async () => {
+    queuePayload(build, label, replyTo) {
+        const queued = this.pending.then(async () => {
             const channel = this.client.channels.cache.get(this.channelId) || await this.client.channels.fetch(this.channelId);
             if (!channel?.send || channel.guildId !== this.guildId) throw new Error('Scout log channel is unavailable in this server.');
-            await channel.send(build());
-        }).catch(error => console.warn(`[WW LOG] Could not send ${label}: ${error.message}`));
+            const payload = build();
+            if (replyTo) payload.reply = { messageReference: String(replyTo), failIfNotExists: false };
+            return channel.send(payload);
+        });
+        const result = queued.catch(error => {
+            console.warn(`[WW LOG] Could not send ${label}: ${error.message}`);
+            return null;
+        });
+        // The send result is useful to callers, but the idle queue must not retain a Discord Message.
+        this.pending = result.then(() => undefined);
+        return result;
     }
 
     enqueue(event) {
@@ -200,4 +222,4 @@ class ScoutAuditLogger {
     flush() { return this.pending; }
 }
 
-module.exports = { ScoutAuditLogger, auditPayload, changesBetween, diagnosticPayload, publishedPayload, memberEditPayload, scoutTextDiff };
+module.exports = { ScoutAuditLogger, auditPayload, changesBetween, diagnosticPayload, recoveryPayload, publishedPayload, memberEditPayload, scoutTextDiff };

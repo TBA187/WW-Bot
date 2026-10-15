@@ -2,7 +2,7 @@
 
 const { createOcrProcessWorker } = require('./ocrProcessWorker.js');
 const path = require('node:path');
-const { readContainerMemory } = require('./runtimeHealth.js');
+const { readContainerMemory, MEMORY_BUDGET_BYTES } = require('./runtimeHealth.js');
 
 const OCR_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const configuredSharp = new WeakSet();
@@ -35,6 +35,10 @@ class OcrWorkerPool {
         this.pause = options.pause || (ms => new Promise(resolve => setTimeout(resolve, ms)));
         this.log = options.log || (message => console.warn(message));
         this.maxBatchImages = options.maxBatchImages ?? 20;
+        this.tasksStarted = 0;
+        this.tasksCompleted = 0;
+        this.tasksFailed = 0;
+        this.peakProcessRss = 0;
     }
 
     clearIdleTimer() {
@@ -57,10 +61,20 @@ class OcrWorkerPool {
     // Serialize complete tasks, including their multiple recognize calls. All
     // production OCR users share this queue, so Gold, Silver and forum scans
     // never each allocate a Tesseract runtime at the same time.
-    run(task) {
+    run(task, { maintenance = false } = {}) {
         this.pending++;
+        if (!maintenance) this.tasksStarted++;
         this.clearIdleTimer();
-        const result = this.queue.then(task);
+        const result = this.queue.then(async () => {
+            try {
+                const value = await task();
+                if (!maintenance) this.tasksCompleted++;
+                return value;
+            } catch (error) {
+                if (!maintenance) this.tasksFailed++;
+                throw error;
+            }
+        });
         const settled = result.finally(() => {
             this.pending--;
             this.scheduleIdleRelease();
@@ -76,6 +90,7 @@ class OcrWorkerPool {
         const creating = this.workerPromise;
         try {
             this.worker = await creating;
+            this.recordWorkerMemory(this.worker);
             this.scheduleIdleRelease();
             return this.worker;
         } finally {
@@ -98,11 +113,21 @@ class OcrWorkerPool {
                 console.warn('[WW LOG] Could not release the failed OCR worker:', releaseError?.message || releaseError);
             }
             throw error instanceof Error ? error : new Error(String(error));
+        } finally {
+            this.recordWorkerMemory(worker);
         }
+    }
+
+    recordWorkerMemory(worker) {
+        try {
+            const memory = worker?.memorySnapshot?.();
+            if (Number.isFinite(memory?.peakRss)) this.peakProcessRss = Math.max(this.peakProcessRss, memory.peakRss);
+        } catch { /* Diagnostics must not interrupt recognition or worker cleanup. */ }
     }
 
     async releaseWorker() {
         const worker = this.worker || (this.workerPromise ? await this.workerPromise.catch(() => null) : null);
+        this.recordWorkerMemory(worker);
         this.worker = null;
         this.workerPromise = null;
         this.completedImages = 0;
@@ -114,7 +139,7 @@ class OcrWorkerPool {
             const memory = await this.containerMemory();
             // Respect a smaller host limit; use the user's 512 MiB budget even
             // if the hosting panel/cgroup exposes a slightly larger allowance.
-            return Boolean(memory && memory.used >= Math.min(memory.limit, 512 * 1024 * 1024) * 0.85);
+            return Boolean(memory && memory.used >= Math.min(memory.limit, MEMORY_BUDGET_BYTES) * 0.85);
         } catch { return false; }
     }
 
@@ -142,16 +167,24 @@ class OcrWorkerPool {
         } catch (error) {
             await this.releaseWorker();
             throw error;
+        } finally {
+            this.recordWorkerMemory(worker);
         }
     }
 
     close() {
-        return this.run(() => this.releaseWorker());
+        return this.run(() => this.releaseWorker(), { maintenance: true });
     }
 
     snapshot() {
         return { workers: this.worker ? 1 : 0, creating: Boolean(this.workerPromise), pending: this.pending,
             ...(this.worker?.processId ? { processId: this.worker.processId } : {}) };
+    }
+
+    healthSnapshot() {
+        this.recordWorkerMemory(this.worker);
+        return { ...this.snapshot(), tasksStarted: this.tasksStarted, tasksCompleted: this.tasksCompleted,
+            tasksFailed: this.tasksFailed, peakProcessRss: this.peakProcessRss };
     }
 }
 

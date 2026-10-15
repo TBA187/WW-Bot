@@ -287,7 +287,7 @@ class LevelAdmin {
             if (!targetMember.roles.cache.has(pending.roleIdToAssign)) {
                 await targetMember.roles.add(
                     pending.roleIdToAssign,
-                    `Level admin XP-Track confirmation by ${interaction.user.tag}`
+                    `Command /level: XP-Track confirmation by ${interaction.user.tag}`
                 );
             }
 

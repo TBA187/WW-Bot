@@ -6,6 +6,14 @@ const fs = require('node:fs');
 function serveOcrProcess(createWorker = (...args) => require('tesseract.js').createWorker(...args)) {
     let pool;
     let queue = Promise.resolve();
+    const respond = response => {
+        if (!process.connected) return;
+        // The OS retains the high-water mark even when a short image job has
+        // already released its allocations before the next parent sample.
+        process.send({ ...response, memory: {
+            rss: process.memoryUsage.rss(), peakRss: process.resourceUsage().maxRSS * 1024
+        } });
+    };
     process.on('disconnect', () => process.exit(0));
     process.on('message', message => {
         queue = queue.then(async () => {
@@ -42,9 +50,9 @@ function serveOcrProcess(createWorker = (...args) => require('tesseract.js').cre
                 } else if (action === 'memory') {
                     result = process.memoryUsage();
                 } else throw new Error('Invalid OCR helper request.');
-                if (process.connected) process.send({ id, result });
+                respond({ id, result });
             } catch (error) {
-                if (process.connected) process.send({ id, error: error?.message || String(error) });
+                respond({ id, error: error?.message || String(error) });
             }
         }).catch(() => process.exit(1));
     });

@@ -49,7 +49,7 @@ function fakeGuild(kingMembers = []) {
             }
         },
         members: {
-            fetch: async () => null
+            list: async () => new Map()
         }
     };
 }
@@ -164,7 +164,7 @@ test('resolveSinglePvpKing handles zero, one, and multiple kings', async () => {
 test('resolveSinglePvpKing does not refresh all members when the king is cached', async () => {
     let fetchCount = 0;
     const interaction = fakeInteraction([{ id: 'king' }]);
-    interaction.guild.members.fetch = async () => {
+    interaction.guild.members.list = async () => {
         fetchCount++;
     };
 
@@ -185,7 +185,7 @@ test('refreshGuildMembers catches refresh failures', async () => {
     console.error = () => { };
     const guild = {
         members: {
-            fetch: async () => {
+            list: async () => {
                 const err = new Error('rate limited');
                 err.code = 'RATE_LIMITED';
                 throw err;
@@ -198,4 +198,17 @@ test('refreshGuildMembers catches refresh failures', async () => {
     } finally {
         console.error = oldError;
     }
+});
+
+test('failed member refresh does not start the ten-minute success cooldown', async t => {
+    t.mock.method(console, 'error', () => {});
+    let calls = 0;
+    const guild = { members: { async list() {
+        if (++calls === 1) throw new Error('Temporary HTTP failure');
+        return new Map();
+    } } };
+    assert.equal(await refreshGuildMembers(guild, 'unit test'), false);
+    assert.equal(await refreshGuildMembers(guild, 'unit test'), true);
+    assert.equal(await refreshGuildMembers(guild, 'unit test'), false);
+    assert.equal(calls, 2);
 });

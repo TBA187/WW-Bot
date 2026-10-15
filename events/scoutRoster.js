@@ -20,7 +20,7 @@ module.exports = {
             try {
                 const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
                 if (stopped()) return;
-                const result = await abortable(store.seedCurrentGuildMembers(guild, roleId), { signal });
+                const result = await abortable(store.seedCurrentGuildMembers(guild, roleId, { signal }), { signal });
                 const changes = [
                     result.added && `${result.added} added`,
                     result.restored && `${result.restored} restored`,

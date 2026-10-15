@@ -4,7 +4,8 @@ const { ensureScoutTables } = require('./ScoutSchema.js');
 
 
 const { cleanIgn, normalizeIgn } = require('./PvpScoutParser.js');
-const { abortable } = require('../../utils/abortable.js');
+const { abortable, throwIfAborted } = require('../../utils/abortable.js');
+const { fetchGuildMemberRoster } = require('../../utils/guildMemberRoster.js');
 
 const FRIENDLY_LOOKUP_TTL_MS = 15_000;
 const MAX_FRIENDLY_LOOKUPS = 200;
@@ -95,7 +96,7 @@ class ScoutRosterStore {
         return rows.length > 0;
     }
 
-    async seedCurrentGuildMembers(guild, roleId) {
+    async seedCurrentGuildMembers(guild, roleId, { signal } = {}) {
         if (!guild?.id || !roleId) return { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded: false, profileUpdates: [] };
         const guildId = String(guild.id);
         if (this.seedPromises.has(guildId)) return this.seedPromises.get(guildId);
@@ -104,7 +105,7 @@ class ScoutRosterStore {
             const alreadySeeded = await this.hasSeededGuild(guildId);
             // Fetch the complete roster on every startup, including after the first seed.
             // A failed fetch must not turn stored members into former members.
-            const members = await guild.members.fetch();
+            const members = await fetchGuildMemberRoster(guild, { signal });
             const [rows] = await this.db.query(
                 'SELECT discord_id, username, global_name, server_nickname, server_nickname_normalized, status FROM guild_members WHERE guild_id = ?',
                 [guildId]
@@ -123,6 +124,7 @@ class ScoutRosterStore {
             }
             const result = { added: 0, restored: 0, former: 0, updated: 0, alreadySeeded, profileUpdates: [] };
             for (const member of members.values()) {
+                throwIfAborted(signal);
                 const profile = profileFor(member);
                 const row = savedMembers.get(profile.discordId);
                 const current = member.roles.cache.has(String(roleId));
@@ -149,6 +151,7 @@ class ScoutRosterStore {
                 }
             }
             for (const row of rows) {
+                throwIfAborted(signal);
                 if (row.status !== 'current' || members.has(String(row.discord_id))) continue;
                 // Keep the last known profile and history for people who left the server.
                 await this.saveMember({
@@ -158,6 +161,7 @@ class ScoutRosterStore {
                 result.former++;
             }
             if (!alreadySeeded) {
+                throwIfAborted(signal);
                 await this.db.query(
                     'INSERT IGNORE INTO pvp_scout_member_seed (guild_id) VALUES (?)',
                     [guildId]

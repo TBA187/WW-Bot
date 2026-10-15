@@ -71,3 +71,45 @@ test('memory reporting has one unreferenced timer and suppresses late output aft
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(cancelled, 1); assert.deepEqual(lines, []);
 });
+
+test('memory pressure uses the 512 MiB budget, suppresses repeat warnings, and reports recovery', async () => {
+    let now = 1000, used = 409.6 * MIB;
+    const warnings = [], reports = [];
+    const health = new RuntimeHealth({ now: () => now,
+        consoleObject: { warn: line => warnings.push(line), log: line => reports.push(line) },
+        containerMemory: async () => ({ used, limit: 588.8 * MIB, fileCache: null }),
+        containerPeak: async () => null, processPeak: () => 0 });
+    await health.sample();
+    assert.match(warnings[0], /WARNING: 409.6\/512.0 MiB \(80.0%/);
+    now += 1000; await health.sample(); assert.equal(warnings.length, 1);
+    used = 460.8 * MIB; await health.sample();
+    assert.match(warnings[1], /CRITICAL: 460.8\/512.0 MiB \(90.0%/);
+    now += 600000; await health.sample(); assert.equal(warnings.length, 3);
+    used = 380 * MIB; await health.sample();
+    assert.ok(reports.some(line => /Recovered below 75%/.test(line)));
+    used = 410 * MIB; await health.sample(); assert.equal(warnings.length, 4);
+    health.stop();
+});
+
+test('idle sampling is cheap, active OCR samples each second, and short OCR jobs appear in the next report', async () => {
+    let now = 0, reads = 0, fullReads = 0, rssReads = 0, pending = 0, tasksStarted = 0, tasksCompleted = 0;
+    const reports = [];
+    const health = new RuntimeHealth({ now: () => now, intervalMs: 30000,
+        consoleObject: { warn() {}, log: line => reports.push(line) },
+        containerMemory: async () => { reads++; return null; }, containerPeak: async () => null, processPeak: () => 0,
+        memoryUsage: () => { fullReads++; return { rss: 100 * MIB, heapUsed: MIB, heapTotal: MIB, external: 0 }; },
+        rssUsage: () => { rssReads++; return 100 * MIB; },
+        ocrSnapshot: () => ({ pending, tasksStarted, tasksCompleted, workers: 0 }) });
+    await health.sample();
+    now = 1000; await health.sample({ report: false }); assert.equal(reads, 1);
+    now = 5000; await health.sample({ report: false }); assert.equal(reads, 2);
+    pending = 1; tasksStarted = 1;
+    now = 6000; await health.sample({ report: false }); assert.equal(reads, 3);
+    pending = 0; tasksCompleted = 1;
+    now = 7000; await health.sample({ report: false }); assert.equal(reads, 3);
+    now = 30000; await health.sample({ report: false });
+    assert.equal(reads, 4); assert.equal(fullReads, 2); assert.equal(rssReads, 2);
+    assert.match(reports.at(-1), /1 task\(s\) queued, 1 completed, 0 failed/);
+    assert.match(reports.at(-1), /budget 512.0 MiB/);
+    health.stop();
+});

@@ -27,6 +27,8 @@
   "colorRoleAnchorID": "1520941592708386886",
   "customColorRoleAnchorID": "1520940617335574528",
   "logChannelID": "1423716368326590575",
+  "selfRoleChannelID": "1184121209609269409",
+  "newAccountWarningHours": 48,
   "ignoredLogChannels": [
     "1184117095231918101"
   ],
