@@ -1,7 +1,7 @@
 // =====================================================
 // LOG MEMBER LEAVE, KICK, BAN, UNBAN, AND TIMEOUT EVENTS
 // =====================================================
-const { AuditLogEvent, Events } = require('discord.js');
+const { AuditLogEvent, Events, escapeMarkdown } = require('discord.js');
 const { buildMemberAuditPayload, auditActor, formatDiscordTime } = require('../utils/memberAuditEmbeds.js');
 const { fetchGuildMemberRoster } = require('../utils/guildMemberRoster.js');
 let memberHistory = null;
@@ -392,7 +392,7 @@ module.exports = {
                 authorName: 'Member Unbanned 🔓',
                 member,
                 actionText: `was unbanned by ${auditActor(executor)}`,
-                afterActionLines: [`-# <@${ban.user.id}> can now join the Discord Server again!`, ''],
+                afterActionLines: [`-# **${escapeMarkdown(ban.user.username)}** can now join the Discord Server again!`],
                 reason: unbanLog ? unbanLog.reason ?? null : 'Unavailable — audit details could not be retrieved.',
                 extraLines,
                 color: MEMBER_COLORS.unbanned,

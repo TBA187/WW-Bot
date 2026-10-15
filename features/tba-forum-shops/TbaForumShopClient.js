@@ -3,6 +3,7 @@
 // Reads post IDs, authors, timestamps, and message text from one PRO forum topic.
 const cheerio = require('cheerio');
 const { discoverForumLastPage } = require('../../utils/forumPagination.js');
+const { readResponseBuffer, cancelResponseBody } = require('../../utils/readResponseBuffer.js');
 const path = require('path');
 const sharp = require('sharp');
 const {
@@ -77,6 +78,7 @@ class TbaForumShopClient {
                 redirect: 'follow'
             });
             if (!response.ok) {
+                await cancelResponseBody(response);
                 throw new TbaForumRequestError(`PRO Forum request failed with HTTP ${response.status}.`, {
                     status: response.status,
                     retryAfterMs: parseRetryAfter(response.headers.get('retry-after'))
@@ -226,12 +228,12 @@ class TbaForumShopClient {
             'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.8',
             async response => {
                 const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-                const contentLength = Number(response.headers.get('content-length') || 0);
-                if (!contentType.startsWith('image/')) throw new TbaForumRequestError(`Forum attachment is not an image: ${url}`);
-                if (contentLength > this.maxImageBytes) throw new TbaForumRequestError(`Forum image is larger than ${this.maxImageBytes} bytes: ${url}`);
-
-                const buffer = Buffer.from(await response.arrayBuffer());
-                if (buffer.length > this.maxImageBytes) throw new TbaForumRequestError(`Forum image is larger than ${this.maxImageBytes} bytes: ${url}`);
+                if (!contentType.startsWith('image/')) {
+                    await cancelResponseBody(response);
+                    throw new TbaForumRequestError(`Forum attachment is not an image: ${url}`);
+                }
+                const buffer = await readResponseBuffer(response, this.maxImageBytes,
+                    () => new TbaForumRequestError(`Forum image is larger than ${this.maxImageBytes} bytes: ${url}`));
                 try {
                     const metadata = await sharp(buffer).metadata();
                     if (!metadata.format || !metadata.width || !metadata.height) {

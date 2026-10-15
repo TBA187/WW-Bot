@@ -139,6 +139,40 @@ test('startup repairs roles silently and periodic checks catch missed tag change
     assert.deepEqual(f.notifications, [false]); assert.equal(f.member.roles.cache.has(ROLE), false);
 });
 
+test('periodic verification reuses only a recent check, while manual edits still fetch fresh metadata', async () => {
+    const f = fixture({ tag: true, hasRole: true });
+    const get = f.client.rest.get;
+    let reads = 0;
+    f.client.rest.get = async (...args) => { reads++; return get(...args); };
+    await f.manager.request(f.member);
+    await f.manager.request(f.member, { source: 'periodic' });
+    assert.equal(reads, 1);
+    f.setTag(rawTag(false));
+    await f.manager.request(f.member);
+    assert.equal(reads, 2);
+    assert.equal(f.member.roles.cache.has(ROLE), false);
+    f.setTag(rawTag(true)); f.advance(30000);
+    await f.manager.request(f.member, { source: 'periodic' });
+    assert.equal(reads, 3);
+    assert.equal(f.member.roles.cache.has(ROLE), true);
+});
+
+test('overlapping tag sweeps share one run and clear the activity marker after a failure', async t => {
+    t.mock.method(console, 'warn', () => {});
+    const f = fixture();
+    const { RuntimeActivity } = require('../utils/runtimeActivity.js');
+    f.manager.activity = new RuntimeActivity();
+    let reject;
+    f.guild.members.list = () => new Promise((_, fail) => { reject = fail; });
+    const run = f.manager.sweep();
+    while (!reject) await Promise.resolve();
+    await f.manager.sweep();
+    assert.equal(f.manager.activity.snapshot().active.length, 1);
+    reject(new Error('Discord unavailable')); await run;
+    assert.equal(f.manager.sweeping, false);
+    assert.equal(f.manager.activity.snapshot().active.length, 0);
+});
+
 test('shutdown and departed members invalidate an in-flight role lookup', async () => {
     for (const stop of ['stop', 'forget']) {
         const f = fixture(); let resolve;

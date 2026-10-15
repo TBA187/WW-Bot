@@ -168,7 +168,7 @@ test('ban then unban then rejoin does not hide a new voluntary departure', async
     await exits.handleMemberRemove(returned, 'log');
     assert.deepEqual(sent.map(payload => embed(payload).author.name), ['Member Banned 🔨', 'Member Unbanned 🔓', 'Member Left 👋']);
     const unbanned = embed(sent[1]);
-    assert.match(unbanned.description, /\*\*\n-# <@296447098298171393> can now join the Discord Server again!\n\n- \*\*Reason:/);
+    assert.match(unbanned.description, /\*\*\n-# \*\*kaasfondue\*\* can now join the Discord Server again!\n- \*\*Reason:/);
     assert.ok(unbanned.description.indexOf('can now join') < unbanned.description.indexOf('**Reason:**'));
     assert.ok(unbanned.description.indexOf('can now join') < unbanned.description.indexOf('**Discord Member Count:**'));
     assert.doesNotMatch(unbanned.description, /User Details|can now join the Discord Server again\./);

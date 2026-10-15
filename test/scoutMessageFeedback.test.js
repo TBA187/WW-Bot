@@ -620,11 +620,25 @@ test('startup keeps an unfinished IGN-only live report in review rather than pub
 
 test('catch-up imports and groups missed messages before resuming saved feedback timers', async () => {
     const order = [];
-    const ingestor = new PvpScoutIngestor({ client: {}, store: {}, channelId: CHANNEL, ocr: {},
+    const { RuntimeActivity } = require('../utils/runtimeActivity.js');
+    const activity = new RuntimeActivity();
+    const ingestor = new PvpScoutIngestor({ client: {}, store: {}, channelId: CHANNEL, ocr: {}, activity,
         feedback: { async restorePending() { order.push('feedback'); } } });
-    ingestor.catchUpMessages = async () => { order.push('catchup'); };
+    ingestor.catchUpMessages = async () => {
+        assert.equal(activity.snapshot().active[0].name, 'PvP Scout gold: catch-up');
+        order.push('catchup');
+    };
     await ingestor.startCatchup();
     assert.deepEqual(order, ['catchup', 'feedback']);
+    assert.equal(activity.snapshot().active.length, 0);
+    assert.equal(activity.snapshot().recent.length, 1);
+});
+
+test('an idle ingestion queue releases its last result while returning it to the caller', async () => {
+    const ingestor = new PvpScoutIngestor({ client: {}, store: {}, ocr: {}, feedback: {} });
+    const result = { archived: 'payload' };
+    assert.equal(await ingestor.enqueue(async () => result), result);
+    assert.equal(await ingestor.queue, undefined);
 });
 
 test('a clear same-author IGN follow-up resolves nameless team text without overriding officer decisions', async () => {

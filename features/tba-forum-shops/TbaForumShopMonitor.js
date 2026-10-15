@@ -7,6 +7,7 @@ const {
     MONITOR_INTERVAL_MS
 } = require('./constants.js');
 const { TbaForumRequestError } = require('./TbaForumShopClient.js');
+const { runtimeActivity } = require('../../utils/runtimeActivity.js');
 
 function postNumber(value) {
     const number = Number(value);
@@ -24,6 +25,7 @@ function uniquePosts(pages) {
 class TbaForumShopMonitor {
     constructor(options = {}) {
         this.shops = options.shops || [];
+        this.activity = options.activity || runtimeActivity;
         this.store = options.store;
         this.notifier = options.notifier;
         this.enabled = Number(options.enabled) === 1;
@@ -34,6 +36,7 @@ class TbaForumShopMonitor {
         this.timers = new Map();
         this.shopStates = new Map();
         this.started = false;
+        this.stopped = false;
     }
 
     stateFor(shop) {
@@ -51,8 +54,10 @@ class TbaForumShopMonitor {
     async start() {
         if (this.started) return;
         this.started = true;
+        this.stopped = false;
         try {
             await this.store.initialize(this.shops);
+            if (this.stopped) return;
             if (!this.enabled) return;
             if (this.shops.length !== 2) throw new Error('Both TBA PRO Forum shop URLs must be configured.');
 
@@ -66,6 +71,7 @@ class TbaForumShopMonitor {
     }
 
     stop() {
+        this.stopped = true;
         for (const timer of this.timers.values()) clearTimeout(timer);
         this.timers.clear();
         this.started = false;
@@ -113,9 +119,10 @@ class TbaForumShopMonitor {
 
     async runShopOnce(shop) {
         const state = this.stateFor(shop);
-        if (state.running || this.clock() < state.nextAttemptAt) return false;
+        if (this.stopped || state.running || this.clock() < state.nextAttemptAt) return false;
 
         state.running = true;
+        const finishActivity = this.activity.begin(`${shop.name} monitoring`);
         try {
             await this.scanShop(shop);
             this.forumRestored(shop, state);
@@ -126,6 +133,7 @@ class TbaForumShopMonitor {
             return false;
         } finally {
             state.running = false;
+            finishActivity();
         }
     }
 

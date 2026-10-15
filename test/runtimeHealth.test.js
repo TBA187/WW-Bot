@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { RuntimeHealth, readContainerMemory, discordCacheCounts } = require('../utils/runtimeHealth.js');
+const { RuntimeActivity } = require('../utils/runtimeActivity.js');
 const MIB = 1024 * 1024;
 
 function readFixture(values) {
@@ -15,13 +16,67 @@ function readFixture(values) {
 test('container memory supports v2 and v1 accounting, separately showing file cache', async () => {
     assert.deepEqual(await readContainerMemory(readFixture({
         '/sys/fs/cgroup/memory.current': '450887680\n', '/sys/fs/cgroup/memory.max': '536870912\n',
-        '/sys/fs/cgroup/memory.stat': 'anon 360000000\nfile 90000000\n'
-    })), { used: 450887680, limit: 536870912, fileCache: 90000000 });
+        '/sys/fs/cgroup/memory.stat': 'anon 360000000\nfile 90000000\ninactive_file 80000000\n'
+    })), { used: 450887680, limit: 536870912, fileCache: 90000000, inactiveFile: 80000000, workingSet: 370887680 });
     assert.deepEqual(await readContainerMemory(readFixture({
         '/sys/fs/cgroup/memory/memory.usage_in_bytes': '100',
         '/sys/fs/cgroup/memory/memory.limit_in_bytes': '200',
-        '/sys/fs/cgroup/memory/memory.stat': 'cache 10\ntotal_cache 15\n'
-    })), { used: 100, limit: 200, fileCache: 15 });
+        '/sys/fs/cgroup/memory/memory.stat': 'cache 10\ntotal_cache 15\ninactive_file 5\ntotal_inactive_file 12\n'
+    })), { used: 100, limit: 200, fileCache: 15, inactiveFile: 12, workingSet: 88 });
+});
+
+test('panel estimates require valid inactive cache accounting and accept zero cache', async () => {
+    for (const [stat, expected] of [['file 90\n', null], ['inactive_file 101\n', null], ['inactive_file 0\n', 100]]) {
+        const container = await readContainerMemory(readFixture({
+            '/sys/fs/cgroup/memory.current': '100', '/sys/fs/cgroup/memory.max': '200',
+            '/sys/fs/cgroup/memory.stat': stat
+        }));
+        assert.equal(container.workingSet, expected);
+    }
+});
+
+test('job tracking distinguishes overlapping runs and bounds its completed history without timers', () => {
+    let now = 0;
+    const activity = new RuntimeActivity({ now: () => now, recentMs: 100, maxRecent: 2 });
+    const first = activity.begin('scan'), second = activity.begin('scan');
+    now = 20;
+    first(); first();
+    assert.equal(activity.snapshot().active.length, 1);
+    assert.deepEqual(activity.snapshot().recent, [{ name: 'scan', elapsedMs: 20, endedAgoMs: 0 }]);
+    second(); activity.begin('third')();
+    assert.equal(activity.snapshot().recent.length, 2);
+    now = 121;
+    assert.deepEqual(activity.snapshot(), { active: [], recent: [] });
+});
+
+test('warnings and recoveries include panel estimates, heap and jobs without full reads on every tick', async () => {
+    let now = 0, used = 300 * MIB, fullReads = 0;
+    const warnings = [], reports = [];
+    const activity = new RuntimeActivity({ now: () => now });
+    const health = new RuntimeHealth({ now: () => now, intervalMs: 30000,
+        consoleObject: { warn: line => warnings.push(line), log: line => reports.push(line) },
+        memoryUsage: () => { fullReads++; return { rss: 180 * MIB, heapUsed: 60 * MIB, heapTotal: 90 * MIB, external: 0 }; },
+        rssUsage: () => 180 * MIB, heapLimit: () => 340 * MIB, containerPeak: async () => null, processPeak: () => 0,
+        containerMemory: async () => ({ used, limit: 512 * MIB, fileCache: 200 * MIB, inactiveFile: 193 * MIB, workingSet: used - 193 * MIB }),
+        activitySnapshot: () => activity.snapshot() });
+    await health.sample();
+    const finish = activity.begin('WW server-tag verification');
+    now = 5000; used = 414 * MIB; await health.sample({ report: false });
+    assert.equal(fullReads, 2);
+    assert.match(warnings[0], /container total including cache/);
+    assert.match(warnings[0], /inactive file cache 193.0 MiB; panel-equivalent estimate 221.0 MiB/);
+    assert.match(warnings[0], /bot RSS 180.0 MiB; main heap 60.0\/90.0 MiB/);
+    assert.match(warnings[0], /active jobs: WW server-tag verification \(5.0s\)/);
+    now = 6000; await health.sample({ report: false });
+    assert.equal(fullReads, 2);
+    finish();
+    now = 7000; used = 367.9 * MIB; await health.sample({ report: false });
+    assert.equal(fullReads, 3);
+    assert.match(reports.at(-1), /Recovered below 75%: 367.9\/512.0/);
+    assert.match(reports.at(-1), /panel-equivalent estimate 174.9 MiB/);
+    assert.match(reports.at(-1), /active jobs: none; recent jobs: WW server-tag verification \(6.0s, ended 1.0s ago\)/);
+    now = 30000; await health.sample({ report: false });
+    assert.match(reports.at(-1), /jobs at sampled peak: WW server-tag verification/);
 });
 
 test('unlimited and unavailable cgroups omit a misleading memory percentage', async () => {

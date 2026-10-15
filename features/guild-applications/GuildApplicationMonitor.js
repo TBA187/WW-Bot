@@ -2,6 +2,7 @@
 
 // Checks the PRO forum for new posts, records how each one was classified, and sends the matching Discord alert.
 const crypto = require('crypto');
+const { runtimeActivity } = require('../../utils/runtimeActivity.js');
 const {
     CLASSIFICATIONS,
     MAX_BACKOFF_MS,
@@ -49,6 +50,7 @@ function topicIdFromUrl(url) {
 class GuildApplicationMonitor {
     constructor(options = {}) {
         this.client = options.client;
+        this.activity = options.activity || runtimeActivity;
         this.forum = options.forumClient;
         this.parser = options.parser;
         this.ocr = options.ocr;
@@ -66,6 +68,7 @@ class GuildApplicationMonitor {
         this.interval = null;
         this.running = false;
         this.started = false;
+        this.stopped = false;
         this.forumUnavailable = false;
         this.failureCount = 0;
         this.nextAttemptAt = 0;
@@ -75,11 +78,15 @@ class GuildApplicationMonitor {
     async start() {
         if (this.started) return;
         this.started = true;
+        this.stopped = false;
         try {
             await this.store.initialize();
+            if (this.stopped) return;
             this.store.startSyncLoop();
             await this.voteReminder?.start();
+            if (this.stopped) return;
             await this.runOnce();
+            if (this.stopped) return;
             this.interval = setInterval(() => {
                 this.runOnce().catch(error => console.error('[WW LOG] Guild Application monitor failed:', error));
             }, this.intervalMs);
@@ -91,12 +98,13 @@ class GuildApplicationMonitor {
     }
 
     async stop() {
+        this.stopped = true;
+        this.started = false;
         if (this.interval) clearInterval(this.interval);
         this.interval = null;
         this.voteReminder?.stop();
         this.store.stopSyncLoop();
         await this.ocr.close();
-        this.started = false;
     }
 
     forumRestored() {
@@ -118,10 +126,11 @@ class GuildApplicationMonitor {
     }
 
     async runOnce() {
-        if (this.running || Date.now() < this.nextAttemptAt) return false;
+        if (this.stopped || this.running || Date.now() < this.nextAttemptAt) return false;
         this.running = true;
-        this.staffFilter?.beginScan();
+        const finishActivity = this.activity.begin('Guild application monitoring');
         try {
+            this.staffFilter?.beginScan();
             const initialized = await this.store.isInitialized();
             if (!initialized) await this.buildSilentBaseline();
             else {
@@ -137,6 +146,7 @@ class GuildApplicationMonitor {
             return false;
         } finally {
             this.running = false;
+            finishActivity();
         }
     }
 

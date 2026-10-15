@@ -25,6 +25,14 @@ const html = `
 </body>
 </html>`;
 
+test('fetched forum pages retain extracted data without raw HTML or a DOM tree', async () => {
+    const client = new ProForumClient({ fetch: async () => ({ ok: true, text: async () => html }) });
+    const page = await client.fetchPage(1);
+    assert.equal(page.posts.length, 1);
+    assert.equal(Object.hasOwn(page, 'html'), false);
+    assert.equal(Object.hasOwn(client.extractPosts(html, 1), '$'), false);
+});
+
 test('discovers dynamic pagination and isolates the applicant post body', () => {
     const client = new ProForumClient({ fetch: async () => { throw new Error('not used'); } });
     const parsed = client.extractPosts(html, 12);

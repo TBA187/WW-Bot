@@ -8,6 +8,40 @@ const path = require('path');
 const { GuildApplicationMonitor } = require('../features/guild-applications/GuildApplicationMonitor.js');
 const { GuildApplicationParser } = require('../features/guild-applications/parsing/GuildApplicationParser.js');
 const { GuildApplicationStore } = require('../features/guild-applications/storage/GuildApplicationStore.js');
+const { RuntimeActivity } = require('../utils/runtimeActivity.js');
+
+test('application scans reject overlap and clear job tracking when scan initialization fails', async t => {
+    t.mock.method(console, 'error', () => {});
+    const activity = new RuntimeActivity();
+    let resolve;
+    const monitor = new GuildApplicationMonitor({ activity,
+        store: { isInitialized: () => new Promise(done => { resolve = done; }) } });
+    monitor.retryPendingNotifications = async () => {};
+    monitor.scanForNewPosts = async () => {};
+    const run = monitor.runOnce();
+    assert.equal(activity.snapshot().active[0].name, 'Guild application monitoring');
+    assert.equal(await monitor.runOnce(), false);
+    resolve(true); assert.equal(await run, true);
+    assert.equal(activity.snapshot().active.length, 0);
+    monitor.staffFilter = { beginScan() { throw new Error('scan failed'); } };
+    assert.equal(await monitor.runOnce(), false);
+    assert.equal(monitor.running, false);
+    assert.equal(activity.snapshot().active.length, 0);
+});
+
+test('stopping during application startup cannot rearm polling or start another scan', async () => {
+    let initialized, syncStarted = 0;
+    const monitor = new GuildApplicationMonitor({
+        store: { initialize: () => new Promise(done => { initialized = done; }),
+            startSyncLoop: () => { syncStarted++; }, stopSyncLoop() {} },
+        ocr: { async close() {} }
+    });
+    const startup = monitor.start();
+    await monitor.stop(); initialized(); await startup;
+    assert.equal(syncStarted, 0);
+    assert.equal(monitor.interval, null);
+    assert.equal(await monitor.runOnce(), false);
+});
 
 function tempFile() {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-monitor-'));

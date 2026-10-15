@@ -3,6 +3,7 @@
 // Fetches the PRO topic and reduces each forum post to the text and images the monitor needs.
 const cheerio = require('cheerio');
 const { discoverForumLastPage } = require('../../../utils/forumPagination.js');
+const { readResponseBuffer, cancelResponseBody } = require('../../../utils/readResponseBuffer.js');
 const path = require('path');
 const {
     TOPIC_URL,
@@ -176,6 +177,7 @@ class ProForumClient {
             });
 
             if (!response.ok) {
+                await cancelResponseBody(response);
                 throw new ForumRequestError(`PRO Forum request failed with HTTP ${response.status}.`, {
                     status: response.status,
                     retryAfterMs: parseRetryAfter(response.headers.get('retry-after'))
@@ -302,14 +304,14 @@ class ProForumClient {
             throw new ForumRequestError(`PRO Forum page ${page} contained a post that could not be read; checkpoint retained.`);
         }
 
-        return { $, posts, lastPage: this.discoverLastPage($) };
+        return { posts, lastPage: this.discoverLastPage($) };
     }
 
     async fetchPage(page = 1) {
         const html = await this.request(this.pageUrl(page), this.requestTimeoutMs, response => response.text());
         const parsed = this.extractPosts(html, page);
         if (!parsed.posts.length) throw new ForumRequestError(`PRO Forum page ${page} did not contain any readable posts.`);
-        return { page: Number(page), html, posts: parsed.posts, lastPage: parsed.lastPage };
+        return { page: Number(page), posts: parsed.posts, lastPage: parsed.lastPage };
     }
 
     imageFilename(url, index, contentType = '') {
@@ -329,18 +331,12 @@ class ProForumClient {
     async downloadImage(url, index = 0) {
         return this.request(url, this.imageTimeoutMs, async response => {
             const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-            const contentLength = Number(response.headers.get('content-length') || 0);
             if (!contentType.startsWith('image/')) {
+                await cancelResponseBody(response);
                 throw new ForumRequestError(`Forum attachment is not an image: ${url}`);
             }
-            if (contentLength > this.maxImageBytes) {
-                throw new ForumRequestError(`Forum image exceeds ${this.maxImageBytes} bytes: ${url}`);
-            }
-
-            const buffer = Buffer.from(await response.arrayBuffer());
-            if (buffer.length > this.maxImageBytes) {
-                throw new ForumRequestError(`Forum image exceeds ${this.maxImageBytes} bytes: ${url}`);
-            }
+            const buffer = await readResponseBuffer(response, this.maxImageBytes,
+                () => new ForumRequestError(`Forum image exceeds ${this.maxImageBytes} bytes: ${url}`));
 
             return {
                 url,

@@ -1,5 +1,7 @@
 'use strict';
 
+const { RuntimeActivity } = require('../utils/runtimeActivity.js');
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -8,6 +10,31 @@ const path = require('path');
 const { TbaForumShopMonitor } = require('../features/tba-forum-shops/TbaForumShopMonitor.js');
 const { TbaForumRequestError } = require('../features/tba-forum-shops/TbaForumShopClient.js');
 const { TbaForumShopStore } = require('../features/tba-forum-shops/TbaForumShopStore.js');
+
+test('shop activity distinguishes shops and clears failed runs without allowing overlap', async t => {
+    t.mock.method(console, 'error', () => {});
+    const activity = new RuntimeActivity();
+    const monitor = new TbaForumShopMonitor({ activity });
+    const shop = { key: 'forum', name: 'PRO Forum Shop' };
+    let reject;
+    monitor.scanShop = () => new Promise((_, fail) => { reject = fail; });
+    const run = monitor.runShopOnce(shop);
+    assert.equal(activity.snapshot().active[0].name, 'PRO Forum Shop monitoring');
+    assert.equal(await monitor.runShopOnce(shop), false);
+    reject(new Error('request failed')); assert.equal(await run, false);
+    assert.equal(activity.snapshot().active.length, 0);
+    assert.equal(monitor.stateFor(shop).running, false);
+});
+
+test('stopping during shop initialization cannot schedule new polls', async () => {
+    let initialized;
+    const monitor = new TbaForumShopMonitor({ enabled: 1, shops: [{ key: 'forum' }, { key: 'dungeon' }],
+        store: { initialize: () => new Promise(done => { initialized = done; }) } });
+    const startup = monitor.start();
+    monitor.stop(); initialized(); await startup;
+    assert.equal(monitor.timers.size, 0);
+    assert.equal(await monitor.runShopOnce(monitor.shops[0]), false);
+});
 
 function tempFile() {
     return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ww-tba-monitor-')), 'tba_forum_shops.json');

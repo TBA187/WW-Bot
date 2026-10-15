@@ -3,8 +3,44 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { ProForumClient, ForumRequestError } = require('../features/guild-applications/forum/ProForumClient.js');
 const { TbaForumShopClient, TbaForumRequestError } = require('../features/tba-forum-shops/TbaForumShopClient.js');
+const { readResponseBuffer } = require('../utils/readResponseBuffer.js');
+
+test('bounded downloads preserve valid chunks and release their stream reader', async () => {
+    const body = new ReadableStream({ start(controller) {
+        controller.enqueue(new Uint8Array([1, 2])); controller.enqueue(new Uint8Array([3])); controller.close();
+    } });
+    const buffer = await readResponseBuffer({ body, headers: new Headers() }, 3, () => new Error('too large'));
+    assert.deepEqual(buffer, Buffer.from([1, 2, 3]));
+    assert.equal(body.locked, false);
+});
 
 for (const [label, Client, ErrorType] of [['Applications', ProForumClient, ForumRequestError], ['Shops', TbaForumShopClient, TbaForumRequestError]]) {
+    test(`${label} stops oversized image streams without trusting Content-Length`, async () => {
+        for (const declaredSize of [null, '1', '12']) {
+            let pulled = 0, cancelled = false;
+            const headers = new Headers({ 'content-type': 'image/png' });
+            if (declaredSize) headers.set('content-length', declaredSize);
+            const body = new ReadableStream({ pull(controller) { pulled++; controller.enqueue(new Uint8Array(3)); },
+                cancel() { cancelled = true; } }, { highWaterMark: 0 });
+            const client = new Client({ topicUrl: 'https://example.com/forum/topic/1-test/', maxImageBytes: 5,
+                fetch: async () => ({ ok: true, headers, body }) });
+            await assert.rejects(client.downloadImage('https://example.com/image.png', 0),
+                error => error instanceof ErrorType && /exceeds|larger than/.test(error.message));
+            assert.equal(cancelled, true);
+            assert.equal(body.locked, false);
+            assert.equal(pulled, declaredSize === '12' ? 0 : 2);
+        }
+    });
+    test(`${label} cancels unused bodies after HTTP and content-type errors`, async () => {
+        for (const ok of [false, true]) {
+            let cancelled = false;
+            const client = new Client({ topicUrl: 'https://example.com/forum/topic/1-test/',
+                fetch: async () => ({ ok, status: 522, headers: new Headers({ 'content-type': 'text/html' }),
+                    body: new ReadableStream({ cancel() { cancelled = true; } }) }) });
+            await assert.rejects(client.downloadImage('https://example.com/image.png', 0), ErrorType);
+            assert.equal(cancelled, true);
+        }
+    });
     for (const method of ['html', 'image']) {
         test(`${label} aborts a stalled ${method} body even after successful HTTP headers`, async () => {
             const keepAlive = setInterval(() => {}, 1000);

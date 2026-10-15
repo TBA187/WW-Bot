@@ -2,6 +2,7 @@
 
 const { Events, PermissionFlagsBits, Routes } = require('discord.js');
 const { fetchGuildMemberRoster } = require('./guildMemberRoster.js');
+const { runtimeActivity } = require('./runtimeActivity.js');
 
 const POLICY_REASON_PREFIX = '[WW tag policy]';
 
@@ -27,9 +28,9 @@ function policyReason(enabled) {
 
 class ServerTagRoleManager {
     constructor({ client, guildId, roleId, signal, onTagChange = async () => {}, onCorrection = async () => {},
-        intervalMs = 10 * 60_000, spacingMs = 350, now = Date.now,
+        intervalMs = 10 * 60_000, spacingMs = 350, now = Date.now, activity = runtimeActivity,
         schedule = setInterval, cancel = clearInterval, pause = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
-        Object.assign(this, { client, guildId, roleId, signal, onTagChange, onCorrection, intervalMs, spacingMs, now, schedule, cancel, pause });
+        Object.assign(this, { client, guildId, roleId, signal, onTagChange, onCorrection, intervalMs, spacingMs, now, activity, schedule, cancel, pause });
         this.states = new Map();
         this.pending = new Map();
         this.expectedChanges = new Map();
@@ -95,7 +96,9 @@ class ServerTagRoleManager {
         const revision = state.revision;
         if (!this.current(member, state, revision)) return { status: 'stale' };
         let enabled;
+        const recentlyChecked = source === 'periodic' && state.checkedAt != null && this.now() - state.checkedAt < 30000;
         if (tag !== undefined || (state.eventTag !== undefined && this.now() - state.eventAt < 5000)) enabled = state.eventTag;
+        else if (recentlyChecked) enabled = state.enabled;
         else if (member.user.bot) enabled = false;
         else {
             // Inspect the raw response: an omitted optional field is unknown,
@@ -105,11 +108,15 @@ class ServerTagRoleManager {
             enabled = serverTagStatus(raw, this.guildId);
         }
         if (enabled === undefined) {
+            state.checkedAt = null;
             this.reportIssue('WW_TAG_METADATA', new Error('Discord did not provide primary-guild metadata; the WW role was left pending verification.'));
             return { status: 'unknown' };
         }
         const before = state.enabled ?? previousTag;
         state.enabled = enabled;
+        // A periodic sweep may reuse a just-completed live check. Manual edits
+        // still verify current metadata, and each ten-minute sweep refreshes it.
+        if (!recentlyChecked) state.checkedAt = this.now();
         if (announce && before !== enabled && (before !== undefined || (source === 'join' && enabled))) {
             try { await this.onTagChange(member, enabled); }
             catch (error) { this.reportIssue('WW_TAG_LOG', error); }
@@ -164,6 +171,7 @@ class ServerTagRoleManager {
     async sweep({ startup = false } = {}) {
         if (this.stopped || this.sweeping) return;
         this.sweeping = true;
+        const finishActivity = this.activity.begin(`WW server-tag verification${startup ? ' (startup)' : ''}`);
         try {
             const guild = this.client.guilds.cache.get(this.guildId);
             if (!guild || !guild.available) return;
@@ -178,7 +186,7 @@ class ServerTagRoleManager {
             for (const id of this.states.keys()) if (!members.has(id) && !this.pending.has(id)) this.states.delete(id);
         } catch (error) {
             if (!this.stopped) this.reportIssue(error.code || 'WW_TAG_SWEEP', error);
-        } finally { this.sweeping = false; }
+        } finally { this.sweeping = false; finishActivity(); }
     }
 
     start() {

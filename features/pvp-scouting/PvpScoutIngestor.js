@@ -8,6 +8,7 @@ const { hasKnownTeamDetail, isPokemonDetailNote, matchKnownTermHeading, matchSpe
 const { setImmediate: yieldToEvents } = require('node:timers/promises');
 const { ScoutMessageFeedback, feedbackOutcome } = require('./ScoutMessageFeedback.js');
 const { contentHash, scoutVersion } = require('./PvpScoutStore.js');
+const { runtimeActivity } = require('../../utils/runtimeActivity.js');
 
 const { isSafeScoutTypo } = require('./ScoutEditPolicy.js');
 
@@ -213,6 +214,7 @@ function buildGroupLinks(rows, followUpWindowMs = FOLLOW_UP_WINDOW_MS) {
 class PvpScoutIngestor {
     constructor(options = {}) {
         this.client = options.client;
+        this.activity = options.activity || runtimeActivity;
         this.store = options.store;
         this.rosterStore = options.rosterStore || null;
         this.guildId = String(options.guildId || '');
@@ -242,7 +244,8 @@ class PvpScoutIngestor {
 
     enqueue(task) {
         const pending = this.queue.then(task, task);
-        this.queue = pending.catch(error => {
+        // Callers receive the result, but an idle queue must not retain the last archive payload.
+        this.queue = pending.then(() => undefined, error => {
             console.error(`${this.logPrefix} Ingestion failed:`, error);
         });
         return pending;
@@ -263,6 +266,7 @@ class PvpScoutIngestor {
         }
         this.started = true;
         while (!this.stopped) {
+            const finishActivity = this.activity.begin(`PvP Scout ${this.server}: archive refresh`);
             try {
                 await this.store.ensureSchema();
                 const refreshStartedAt = Date.now();
@@ -288,11 +292,12 @@ class PvpScoutIngestor {
                 this.startCatchup();
                 return;
             } catch (error) {
+                finishActivity();
                 this.failureCount++;
                 const delayMs = Math.min(5000, 1000 * (2 ** Math.min(this.failureCount - 1, 3)));
                 console.warn(`${this.logPrefix} Storage unavailable (${error.message}); retrying in ${Math.ceil(delayMs / 1000)}s.`);
                 await new Promise(resolve => setTimeout(resolve, delayMs));
-            }
+            } finally { finishActivity(); }
         }
     }
 
@@ -741,6 +746,7 @@ class PvpScoutIngestor {
     startCatchup() {
         if (this.stopped) return;
         this.catchupReady = false;
+        const finishActivity = this.activity.begin(`PvP Scout ${this.server}: catch-up`);
         this.catchupPromise = this.catchUpMessages().then(async () => {
             // Resume saved timers after missed follow-ups have been archived and grouped.
             if (this.stopped) return;
@@ -749,7 +755,7 @@ class PvpScoutIngestor {
         }).catch(error => {
             this.catchupReady = false;
             if (!this.stopped) console.warn(`${this.logPrefix} Catch-up paused: ${error.message}; retry on restart.`);
-        });
+        }).finally(finishActivity);
         return this.catchupPromise;
     }
 
