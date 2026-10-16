@@ -48,9 +48,9 @@ test('invite creators, stream hosts, and deleting moderators use real user menti
         targetUser: { id: USER_ID, username: 'kaasfondue', globalName: 'Kaasfondue' }, maxAge: 0 };
     const created = embed(invites.buildInviteCreatedPayload(invite));
     assert.ok(created.description.includes(`<@${moderator.id}> created`));
-    assert.ok(created.description.includes(`**Stream Host:** <@${USER_ID}> / Kaasfondue`));
+    assert.ok(created.description.includes(`**Stream Host:** <@${USER_ID}>`));
     const deleted = embed(invites.buildInviteDeletedPayload(invite, { executor: moderator }));
-    assert.ok(deleted.description.includes(`<@${moderator.id}> / Am1damaru deleted`));
+    assert.ok(deleted.description.includes(`<@${moderator.id}> deleted`));
     assert.match(deleted.description, /Invite Code:\*\* `WWtest`/);
 });
 
@@ -88,7 +88,7 @@ test('unban rejoin is distinct, and an old unban does not label later voluntary 
     assert.equal(context.kind, 'unbanned');
     assert.equal(context.rejoined, true);
     assert.equal(embed(joins.buildMemberJoinPayload(rejoined, context)).author.name, 'Member Rejoined 🔓');
-    assert.match(embed(joins.buildMemberJoinPayload(rejoined, context)).description, /Unbanned By:\*\* <@123456789012345678> \/ Am1damaru/);
+    assert.match(embed(joins.buildMemberJoinPayload(rejoined, context)).description, /Unbanned By:\*\* <@123456789012345678>/);
     const payload = embed(joins.buildMemberJoinPayload(rejoined, context));
     for (const field of payload.fields.slice(3, 5)) {
         assert.match(field.value.replace(/^-# /u, ''), /^<t:\d+:d> \(<t:\d+:R>\)$/);
@@ -184,7 +184,7 @@ test('invite deletion selects an audit by invite code even when target_id is nul
     };
     await invites.handleInviteDelete({ guild, code: 'WWtest', channelId: '523456789012345678' }, config);
     assert.equal(sent.length, 1);
-    assert.match(embed(sent[0]).description, /<@123456789012345678> \/ Am1damaru.*deleted/);
+    assert.match(embed(sent[0]).description, /<@123456789012345678>.*deleted/);
     assert.equal(embed(sent[0]).footer.text, 'Invite Link ID: WWtest');
 });
 

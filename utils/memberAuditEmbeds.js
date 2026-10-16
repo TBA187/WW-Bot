@@ -13,9 +13,9 @@ function userDetail(value) {
 
 function auditActor(user) {
     if (!user) return '*Unknown Moderator*';
-    const username = user.id ? `<@${user.id}>` : user.username ? `@${escapeMarkdown(user.username)}` : '*Unknown Moderator*';
-    return user.globalName && user.globalName !== user.username
-        ? `${username} / ${escapeMarkdown(user.globalName)}` : username;
+    if (user.id) return `<@${user.id}>`;
+    const name = user.displayName || user.globalName || user.username;
+    return name ? `@${escapeMarkdown(name)}` : '*Unknown Moderator*';
 }
 
 function formatDiscordTime(timestampMs, relative = true, style = 'F') {

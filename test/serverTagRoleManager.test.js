@@ -73,7 +73,7 @@ test('manual removal is restored for a tag wearer and invalid manual addition is
         const enforcement = await f.manager.request(f.member, { reportCorrection: false });
         const payload = json(roleEvents.buildWwRolePayload(f.member, { role: f.role, added: !tag, entry: { executor: actor }, enforcement }));
         assert.match(payload.author.name, /Intercepted/);
-        assert.match(payload.description, /<@123456789012345678> \/ Am1damaru tried to/);
+        assert.match(payload.description, /<@123456789012345678> tried to/);
         assert.match(payload.description, tag ? /restored the role/ : /removed the role again/);
         assert.match(payload.description, /Confirmed by Discord/);
         assert.equal(f.corrections.length, 0);
@@ -348,7 +348,7 @@ test('real member-role handlers intercept invalid edits and suppress duplicate W
         const prior = { ...f.member, roles: { cache: new Collection(tag ? [[ROLE, f.role]] : []) } };
         await roleEvents.handleRoleUpdate(prior, f.member, config);
         assert.equal(f.member.roles.cache.has(ROLE), tag); assert.equal(sent.length, 1);
-        assert.match(json(sent[0]).author.name, /Intercepted/); assert.match(json(sent[0]).description, /<@123456789012345678> \/ Am1damaru tried to/);
+        assert.match(json(sent[0]).author.name, /Intercepted/); assert.match(json(sent[0]).description, /<@123456789012345678> tried to/);
         const beforeCorrection = { ...f.member, roles: { cache: new Collection(tag ? [] : [[ROLE, f.role]]) } };
         await roleEvents.handleRoleUpdate(beforeCorrection, f.member, config);
         assert.equal(sent.length, 1); assert.equal(f.calls.length, 1);
