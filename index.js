@@ -20,6 +20,7 @@ const { ScoutRosterStore } = require('./features/pvp-scouting/ScoutRosterStore.j
 const { ScoutServerSettings } = require('./features/pvp-scouting/ScoutServerSettings.js');
 const { ScoutAuditLogger } = require('./features/pvp-scouting/ScoutAuditLogger.js');
 const { DiscordDiagnosticLogger, redactDiagnostic } = require('./utils/discordDiagnostics.js');
+const { CommandRegistration } = require('./utils/commandRegistration.js');
 const { InteractionDiagnostics } = require('./utils/interactionDiagnostics.js');
 const { createDiscordTransport } = require('./utils/discordTransport.js');
 const { RuntimeHealth } = require('./utils/runtimeHealth.js');
@@ -344,6 +345,8 @@ const botDiagnostics = new DiscordDiagnosticLogger({ consoleObject: console,
     send: event => scoutAuditLogger.diagnostic(event),
     secrets: Object.entries(process.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|API_KEY/iu.test(key)).map(([, value]) => value) });
 botDiagnostics.install();
+botDiagnostics.watchGateway(client);
+let commandRegistration;
 interactionDiagnostics = new InteractionDiagnostics({ rest: client.rest });
 const scoutServers = new ScoutServerRegistry({ client, db, config: appConfig,
     rosterStore: scoutRosterStore, auditLogger: scoutAuditLogger, diagnostics: botDiagnostics,
@@ -528,18 +531,13 @@ async function bootstrap() {
         }
 
         const rest = new REST({ version: '10' }).setToken(token);
-        try {
-            console.log('[WW LOG] Registering Guild slash commands...');
-            await lifecycle.run(() => rest.put(
+        commandRegistration = new CommandRegistration({ signal: lifecycle.signal, consoleObject: console,
+            register: () => lifecycle.run(() => rest.put(
                 Routes.applicationGuildCommands(clientId, guildId),
                 { body: commandsForDiscord }
-            ));
-            console.log('[WW LOG] ✅ Guild slash commands registered to Discord');
-        } catch (err) {
-            lifecycle.check();
-            console.error('[WW LOG] ❌ ERROR: Command registration failed:', err);
-            throw err;
-        }
+            )) });
+        await commandRegistration.start();
+        lifecycle.check();
 
         runtimeLogging.logBlock(buildCommandSummary(commandsForDiscord, prefixCommands).lines);
 
@@ -644,6 +642,7 @@ async function shutdown(signal, exitCode = 0) {
     if (shutdownStarted) return;
     shutdownStarted = true;
     lifecycle.stop();
+    commandRegistration?.stop();
     runtimeHealth.stop();
     console.log(`[WW LOG] ${signal} received. Shutting down cleanly...`);
     // Cancel timers before closing the database and Discord connection.

@@ -150,6 +150,7 @@ function diagnosticPayload(event, ownerId, logoPath = path.join(__dirname, '../.
     if (event.repeats) embed.addFields({ name: 'Repeated occurrences', value: `${event.repeats} matching alert(s) were suppressed since the previous notification.`, inline: false });
     return { content: ownerId ? `<@${ownerId}>` : undefined, embeds: [embed],
         files: [new AttachmentBuilder(logoPath, { name: 'ww_logo.png' })],
+        ...(event.nonce ? { nonce: event.nonce, enforceNonce: true } : {}),
         allowedMentions: { parse: [], users: ownerId ? [String(ownerId)] : [] } };
 }
 
@@ -159,8 +160,13 @@ function recoveryPayload(event, logoPath = path.join(__dirname, '../../images/ww
         .setFooter({ text: `WW • ${event.component || 'Bot runtime'}`.slice(0, 256), iconURL: 'attachment://ww_logo.png' })
         .setTimestamp(event.timestamp ? new Date(event.timestamp) : new Date());
     if (event.component) embed.addFields({ name: 'Component', value: escapeMarkdown(event.component).slice(0, 256), inline: true });
+    if (Number.isFinite(event.durationMs)) {
+        const seconds = Math.max(0, Math.floor(event.durationMs / 1000));
+        embed.addFields({ name: 'Outage duration', value: `${Math.floor(seconds / 60)}m ${seconds % 60}s`, inline: true });
+    }
     return { embeds: [embed], files: [new AttachmentBuilder(logoPath, { name: 'ww_logo.png' })],
-        allowedMentions: { parse: [] } };
+        ...(event.nonce ? { nonce: event.nonce, enforceNonce: true } : {}),
+        allowedMentions: { parse: [], repliedUser: false } };
 }
 
 class ScoutAuditLogger {

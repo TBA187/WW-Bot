@@ -81,10 +81,12 @@ test('automatic publication logs use the report ID, logo, timestamp and correct 
 test('error and warning messages ping only the owner above the branded embed', () => {
     for (const level of ['warn', 'error']) {
         const payload = diagnosticPayload({ level, message: 'MySQL connection failed: ECONNREFUSED', code: 'ECONNREFUSED',
-            component: 'Scout feedback', reportId: '1500728816346075216', messageId: '1500728954083086407' }, '291142291073269761');
+            component: 'Scout feedback', reportId: '1500728816346075216', messageId: '1500728954083086407', nonce: 'di:warning' }, '291142291073269761');
         const embed = payload.embeds[0].toJSON();
         assert.equal(payload.content, '<@291142291073269761>');
         assert.deepEqual(payload.allowedMentions, { parse: [], users: ['291142291073269761'] });
+        assert.equal(payload.nonce, 'di:warning');
+        assert.equal(payload.enforceNonce, true);
         assert.equal(embed.footer.text, 'WW • Scout Report ID: 1500728816346075216');
         assert.equal(embed.footer.icon_url, 'attachment://ww_logo.png');
         assert.ok(embed.timestamp);
@@ -117,14 +119,17 @@ test('recovery logs reply to the original alert and use the green branded embed'
     const logger = new ScoutAuditLogger({ guildId: 'guild', channelId: 'log', ownerId: 'owner',
         client: { channels: { cache: new Map([['log', channel]]) } } });
     const payload = recoveryPayload({ message: 'PRO Forum Shop monitor connection restored.', component: 'PRO Forum Shop',
-        timestamp: '2026-10-15T17:02:57Z' });
+        timestamp: '2026-10-15T17:02:57Z', durationMs: 725_000, nonce: 'di:recovery' });
     const embed = payload.embeds[0].toJSON();
     assert.equal(embed.title, '✅ Service Restored');
     assert.equal(embed.color, 0x57F287);
     assert.equal(embed.description, 'PRO Forum Shop monitor connection restored.');
     assert.equal(embed.footer.text, 'WW • PRO Forum Shop');
     assert.equal(embed.timestamp, '2026-10-15T17:02:57.000Z');
-    assert.deepEqual(payload.allowedMentions, { parse: [] });
+    assert.equal(embed.fields.find(field => field.name === 'Outage duration').value, '12m 5s');
+    assert.equal(payload.nonce, 'di:recovery');
+    assert.equal(payload.enforceNonce, true);
+    assert.deepEqual(payload.allowedMentions, { parse: [], repliedUser: false });
 
     logger.diagnostic({ status: 'recovered', message: 'PRO Forum Shop monitor connection restored.',
         component: 'PRO Forum Shop', replyTo: 'warning-message-id' });

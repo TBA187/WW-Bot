@@ -137,6 +137,7 @@ test('startup prints dynamic prefix metadata beneath registration before event l
     const context = {
         path, __dirname: path.resolve(__dirname, '..'),
         buildCommandSummary,
+        CommandRegistration: require('../utils/commandRegistration.js').CommandRegistration,
         runtimeLogging: { logBlock: lines => output.push(...lines) },
         commandsForDiscord: [{ name: 'future_command' }], prefixCommands: prefixes,
         token: 'offline-test-token', clientId: 'application', guildId: 'guild', commandConfig: {},

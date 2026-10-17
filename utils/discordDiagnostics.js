@@ -3,8 +3,9 @@
 
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createHash } = require('node:crypto');
-const { escapeMarkdown } = require('discord.js');
+const { escapeMarkdown, Events } = require('discord.js');
 const { stripBotLogPrefix } = require('./logFormat.js');
+const { DiagnosticIncidents } = require('./diagnosticIncidents.js');
 
 const TRANSIENT_CONNECTION_CODES = /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|EHOSTUNREACH|ENOTFOUND|PROTOCOL_CONNECTION_LOST|ER_CON_COUNT_ERROR)$/u;
 
@@ -18,9 +19,13 @@ const STATUS_EVENTS = [
         recovery: /^\[WW LOG\] PRO Forum application monitor connection restored\./u },
     { key: 'discord:interaction-warmup', component: 'Discord', warning: /^\[WW LOG\] Discord interaction connection warmup failed\b/u,
         recovery: /^\[WW LOG\] Discord interaction connection warmup recovered\./u },
+    { key: 'discord:gateway', component: 'Discord connection', warning: /^\[WW LOG\] Discord gateway shard \d+ disconnected\b/u,
+        recovery: /^\[WW LOG\] Discord gateway shard \d+ connection restored\./u },
+    { key: 'discord:command-registration', component: 'Command registration', warning: /^\[WW LOG\] ❌ ERROR: Command registration failed:/u,
+        recovery: /^\[WW LOG\] ✅ Guild slash commands registered to Discord/u },
     { key: 'runtime:memory-pressure', component: 'Bot runtime', warning: /^\[RUNTIME MEMORY\] (?:WARNING|CRITICAL):/u,
         recovery: /^\[RUNTIME MEMORY\] Recovered below 75%:/u },
-    { key: 'database:mysql', component: 'MySQL', warning: /^\[DB LOG\] MySQL is still unavailable after /u,
+    { key: 'database:mysql', component: 'MySQL', warning: /^\[DB LOG\] MySQL (?:connectivity issue detected|is still unavailable after )/u,
         recovery: /^\[DB LOG\] MySQL connection restored after /u },
     { key: 'database:guild-settings', component: 'MySQL', warning: /^\[WW LOG\] Guild settings MySQL unavailable\b/u,
         recovery: /^\[WW LOG\] Guild settings MySQL restored\b/u },
@@ -30,6 +35,8 @@ const STATUS_EVENTS = [
         recovery: /^\[WW LOG\] MySQL Guild Application storage restored\b/u },
     { key: 'database:pro-notifications', component: 'MySQL', warning: /^\[PRO NOTIFICATIONS\] MySQL storage unavailable\b/u,
         recovery: /^\[PRO NOTIFICATIONS\] MySQL storage restored\b/u },
+    { key: 'database:giveaways', component: 'MySQL', warning: /^\[WW LOG\] MySQL giveaway storage unavailable\b/u,
+        recovery: /^\[WW LOG\] MySQL giveaway storage restored\b/u },
     ...['Gold', 'Silver'].map(server => ({ key: `database:pvp-king:${server.toLowerCase()}`, component: 'MySQL',
         warning: new RegExp(`^\\[WW LOG\\] MySQL PvP King ${server} storage unavailable\\b`, 'u'),
         recovery: new RegExp(`^\\[WW LOG\\] MySQL PvP King ${server} storage restored\\b`, 'u') })),
@@ -40,7 +47,19 @@ const STATUS_EVENTS = [
     { key: 'storage:guild-applications-json', component: 'Guild Applications',
         warning: /^\[WW LOG\] Guild Application local JSON storage (?:cannot write|failed)\b/u,
         recovery: /^\[WW LOG\] Guild Application local JSON storage restored\./u }
-];
+].map(status => ({ ...status, delayMs: status.key.startsWith('forum:') ? 10 * 60_000
+    : status.key === 'discord:gateway' ? 60_000
+        : status.key.startsWith('runtime:') || status.key.startsWith('storage:') ? 0 : 5 * 60_000 }));
+
+function incidentIdentity(status, text) {
+    return { key: status.key.startsWith('database:') ? 'database:mysql' : status.key,
+        source: status.key === 'discord:gateway' ? `shard:${/shard (\d+)/u.exec(text)?.[1]}` : status.key };
+}
+
+function databaseOutageAge(text) {
+    const duration = /MySQL is still unavailable after (?:(\d+)m\s*)?(?:(\d+)s)?/u.exec(text);
+    return duration ? (Number(duration[1] || 0) * 60 + Number(duration[2] || 0)) * 1000 : 0;
+}
 
 function statusEventFor(text, field) {
     return STATUS_EVENTS.find(status => status[field].test(text)) || null;
@@ -53,10 +72,10 @@ function consoleOnlyDiagnostic(level, text, code) {
     if (level === 'warn' && code === 'DEP0180' && /^Node runtime warning:\nDeprecationWarning:/u.test(text)) return true;
     if (level !== 'warn') return false;
     if (/^\[WW LOG\] (?:Scout autocomplete will refresh in the background \(AUTOCOMPLETE_PRELOAD_TIMEOUT\)|Player server preferences will refresh when used \(SERVER_PREFERENCE_PRELOAD_TIMEOUT\))\./u.test(text)) return true;
-    // The shared database health tracker reports an outage again if it persists.
+    // Preload deadlines have their own retry/fallback path. The shared database
+    // health tracker's paired status messages handle persistent connectivity.
     if (TRANSIENT_CONNECTION_CODES.test(String(code || ''))
-        && (/^\[DB LOG\] MySQL connectivity issue detected /u.test(text)
-            || /^\[WW LOG\] Could not preload (?:scout autocomplete; background refresh will retry|player server preferences; lookups will retry):/u.test(text))) return true;
+        && /^\[WW LOG\] Could not preload (?:scout autocomplete; background refresh will retry|player server preferences; lookups will retry):/u.test(text)) return true;
     return false;
 }
 
@@ -85,11 +104,13 @@ function redactDiagnostic(value, secrets = []) {
 }
 
 class DiscordDiagnosticLogger {
-    constructor({ send, consoleObject = console, secrets = [], repeatMs = 5 * 60 * 1000, now = () => Date.now() }) {
+    constructor({ send, consoleObject = console, secrets = [], repeatMs = 5 * 60 * 1000, now = () => Date.now(),
+        schedule = setTimeout, cancel = clearTimeout, retryMs = 30_000 } = {}) {
         this.send = send; this.console = consoleObject; this.secrets = secrets;
         this.repeatMs = repeatMs; this.now = now; this.context = new AsyncLocalStorage();
         this.recent = new Map(); this.waiting = new Map(); this.original = new Map();
-        this.statusMessages = new Map();
+        this.incidents = new DiagnosticIncidents({ send: event => this.send(event), now, schedule, cancel, retryMs });
+        this.gatewayCleanup = null;
         this.ready = false;
     }
 
@@ -125,36 +146,35 @@ class DiscordDiagnosticLogger {
         const error = args.find(value => value && typeof value === 'object' && (value.code || value.causeCode));
         const code = error?.causeCode || error?.code || /\b(?:E[A-Z_]{3,}|PROTOCOL_[A-Z_]+|DATABASE_UNAVAILABLE|DEP\d+)\b/u.exec(clean)?.[0];
         const status = statusEventFor(clean, 'warning');
+        // Corrupt/potentially lost data needs review immediately, even if a
+        // storage fallback uses the same log prefix as a recoverable outage.
+        const dataFailure = code === 'JSON_STORE_CORRUPT' || /\b(?:ENOSPC|EROFS|EIO)\b/u.test(String(code || ''))
+            || /JSON recovery paused|corrupt(?:ed)? (?:JSON|data)|(?:JSON|data).*corrupt/iu.test(clean);
+        if (status && !dataFailure) {
+            this.incidents.fail({ ...incidentIdentity(status, clean), delayMs: status.delayMs,
+                startedAt: this.now() - databaseOutageAge(clean), level, code, component: status.component,
+                message: escapeMarkdown(stripBotLogPrefix(clean)).slice(0, 3500) });
+            return;
+        }
         if (consoleOnlyDiagnostic(level, clean, code)) return;
-        const databaseStatus = level === 'warn' && /^\[DB LOG\] MySQL is still unavailable after /u.test(clean);
         const autocompleteStatus = level === 'warn' && /^\[WW LOG\] \/scout autocomplete missed its Discord response deadline /u.test(clean);
         const runtimeWarning = /^Node runtime warning:/u.test(clean);
-        const systemStatus = status || autocompleteStatus || runtimeWarning;
+        const systemStatus = autocompleteStatus || runtimeWarning;
         const reportId = systemStatus ? undefined : context.reportId;
-        // Group persistent connectivity problems even when their error code changes.
-        const category = databaseStatus ? 'database-outage' : autocompleteStatus ? 'autocomplete-deadline'
-            : `${status?.key || context.component || ''}:` + clean.replace(/\b\d+(?:\.\d+)?(?:ms|s|m)?\b/gu, '#');
-        const repeatMs = databaseStatus ? 30 * 60_000 : autocompleteStatus ? 15 * 60_000 : this.repeatMs;
+        const category = autocompleteStatus ? 'autocomplete-deadline'
+            : `${context.component || ''}:` + clean.replace(/\b\d+(?:\.\d+)?(?:ms|s|m)?\b/gu, '#');
+        const repeatMs = autocompleteStatus ? 15 * 60_000 : this.repeatMs;
         const key = createHash('sha256').update(`${level}:${reportId || ''}:${category}`).digest('hex');
         const previous = this.recent.get(key), now = this.now();
         if (previous && now - previous.at < repeatMs) { previous.repeats++; return; }
-        const event = { level, message: escapeMarkdown(stripBotLogPrefix(clean)).slice(0, 3500), component: databaseStatus ? 'MySQL'
-                : autocompleteStatus ? 'PvP scouting' : runtimeWarning ? 'Bot runtime' : context.component
+        const event = { level, message: escapeMarkdown(stripBotLogPrefix(clean)).slice(0, 3500), component: autocompleteStatus ? 'PvP scouting' : runtimeWarning ? 'Bot runtime' : context.component
                 || (/MySQL|\[DB LOG\]|Pool is closed/iu.test(clean) ? 'MySQL'
                     : /scout/iu.test(clean) ? 'PvP scouting' : /Discord|interaction/iu.test(clean) ? 'Discord' : 'Bot runtime'),
             reportId, messageId: systemStatus ? undefined : context.messageId,
             code, repeats: previous?.repeats || 0,
             timestamp: new Date(now).toISOString() };
-        if (status) {
-            event.status = 'unavailable';
-            event.statusKey = status.key;
-            event.component = status.component;
-        }
-        this.recent.delete(key); this.recent.set(key, { at: now, repeats: 0, statusKey: status?.key });
+        this.recent.delete(key); this.recent.set(key, { at: now, repeats: 0 });
         if (this.recent.size > 500) this.recent.delete(this.recent.keys().next().value);
-        if (status) {
-            if (!this.ready && !this.statusMessages.has(status.key)) this.statusMessages.set(status.key, Promise.resolve(null));
-        }
         if (this.ready) this.deliver(event);
         else {
             this.waiting.set(key, event);
@@ -164,39 +184,42 @@ class DiscordDiagnosticLogger {
 
     deliver(event) {
         try {
-            const { previousAlert, ...outgoing } = event;
-            const previousMessage = this.statusMessages.get(event.statusKey);
-            const pending = event.status === 'recovered'
-                ? Promise.resolve(previousAlert).then(messageId => this.ready && messageId
-                    ? this.send({ ...outgoing, replyTo: messageId }) : null)
-                : this.send(outgoing);
-            if (event.status === 'unavailable' && event.statusKey) {
-                // Keep only the ID, and retain the last delivered alert if a repeat fails.
-                const tracked = Promise.resolve(pending)
-                    .then(message => message?.id ? String(message.id) : previousMessage ?? null)
-                    .catch(() => previousMessage ?? null);
-                this.statusMessages.set(event.statusKey, tracked);
-            } else if (pending?.catch) void pending.catch(() => {});
+            const pending = this.send(event);
+            if (pending?.catch) void pending.catch(() => {});
         } catch { /* Console output remains available if Discord logging is unavailable. */ }
     }
 
     recoverStatus(status, text) {
-        if (!this.statusMessages.has(status.key)) return;
-        const previousAlert = this.statusMessages.get(status.key);
-        for (const [key, recent] of this.recent) if (recent.statusKey === status.key) this.recent.delete(key);
-        for (const [key, waiting] of this.waiting) if (waiting.statusKey === status.key) this.waiting.delete(key);
-        this.statusMessages.delete(status.key);
-        // If Discord was not ready, neither the warning nor recovery has been
-        // delivered; discard the stale queued warning instead of posting it later.
-        if (!this.ready) return;
-        const event = { level: 'log', status: 'recovered', statusKey: status.key,
-            message: escapeMarkdown(stripBotLogPrefix(text)).slice(0, 3500), component: status.component,
-            timestamp: new Date(this.now()).toISOString(), previousAlert };
-        this.deliver(event);
+        this.incidents.recover({ ...incidentIdentity(status, text),
+            message: escapeMarkdown(stripBotLogPrefix(text)).slice(0, 3500) });
+    }
+
+    watchGateway(client) {
+        if (this.gatewayCleanup) return;
+        const disconnected = new Set();
+        const down = (_event, shardId) => {
+            if (disconnected.has(shardId)) return;
+            disconnected.add(shardId);
+            this.console.warn(`[WW LOG] Discord gateway shard ${shardId} disconnected; automatic reconnects remain active.`);
+        };
+        const reconnecting = shardId => down(null, shardId);
+        const up = shardId => {
+            if (!disconnected.delete(shardId)) return;
+            this.console.log(`[WW LOG] Discord gateway shard ${shardId} connection restored.`);
+        };
+        const resumed = (shardId) => up(shardId);
+        const listeners = [[Events.ShardDisconnect, down], [Events.ShardReconnecting, reconnecting],
+            [Events.ShardReady, up], [Events.ShardResume, resumed]];
+        for (const [event, handler] of listeners) client.on(event, handler);
+        this.gatewayCleanup = () => {
+            for (const [event, handler] of listeners) client.removeListener(event, handler);
+            disconnected.clear();
+        };
     }
 
     start() {
         this.ready = true;
+        this.incidents.start();
         for (const event of this.waiting.values()) this.deliver(event);
         this.waiting.clear();
     }
@@ -205,7 +228,9 @@ class DiscordDiagnosticLogger {
         for (const [level, { original, wrapper }] of this.original) {
             if (this.console[level] === wrapper) this.console[level] = original;
         }
-        this.original.clear(); this.waiting.clear(); this.statusMessages.clear(); this.ready = false;
+        this.incidents.stop();
+        this.gatewayCleanup?.(); this.gatewayCleanup = null;
+        this.original.clear(); this.waiting.clear(); this.ready = false;
     }
 }
 

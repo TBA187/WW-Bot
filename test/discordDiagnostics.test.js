@@ -3,15 +3,46 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { Events } = require('discord.js');
 const { DiscordDiagnosticLogger, redactDiagnostic } = require('../utils/discordDiagnostics.js');
+const { CommandRegistration } = require('../utils/commandRegistration.js');
+
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+function fakeClock(initial = 1000) {
+    let time = initial;
+    const timers = new Set();
+    return { now: () => time, timers,
+        schedule(work, delay) {
+            const timer = { at: time + delay, work, unref() {} };
+            timers.add(timer); return timer;
+        },
+        cancel: timer => timers.delete(timer),
+        async advance(ms) {
+            const target = time + ms;
+            for (;;) {
+                const next = [...timers].filter(timer => timer.at <= target).sort((a, b) => a.at - b.at)[0];
+                if (!next) break;
+                time = next.at; timers.delete(next); next.work(); await settle();
+            }
+            time = target; await settle();
+        }
+    };
+}
 
 function fixture(options = {}) {
     const printed = [], sent = [];
+    const clock = fakeClock();
     const consoleObject = { log: (...args) => printed.push(['log', ...args]),
         warn: (...args) => printed.push(['warn', ...args]), error: (...args) => printed.push(['error', ...args]) };
-    const logger = new DiscordDiagnosticLogger({ send: event => sent.push(event), consoleObject, ...options });
+    const logger = new DiscordDiagnosticLogger({ send: event => { sent.push(event); return { id: `message-${sent.length}` }; },
+        consoleObject, now: clock.now, schedule: clock.schedule, cancel: clock.cancel, ...options });
     logger.install();
-    return { logger, consoleObject, printed, sent };
+    return { logger, consoleObject, printed, sent, clock };
 }
 
 test('actionable warnings before Discord login stay in memory, then post once with their original timestamp', () => {
@@ -22,11 +53,11 @@ test('actionable warnings before Discord login stay in memory, then post once wi
     assert.equal(f.sent.length, 1);
     assert.equal(f.sent[0].code, 'ECONNREFUSED');
     assert.equal(f.sent[0].component, 'MySQL');
-    assert.equal(f.sent[0].timestamp, '2026-10-03T09:30:00.000Z');
+    assert.equal(f.sent[0].timestamp, '2026-10-03T09:25:00.000Z');
     f.logger.stop();
 });
 
-test('expected startup deadlines stay local while recoverable fallback outages reach Discord', () => {
+test('expected startup deadlines stay local while persistent fallback outages share one delayed database alert', async () => {
     const f = fixture();
     const notices = [
         '[WW LOG] Scout autocomplete will refresh in the background (AUTOCOMPLETE_PRELOAD_TIMEOUT).',
@@ -42,13 +73,15 @@ test('expected startup deadlines stay local while recoverable fallback outages r
         Object.assign(new Error('MySQL is temporarily unavailable.'), { code: 'DATABASE_UNAVAILABLE', causeCode: 'ETIMEDOUT' }));
     f.logger.start();
     assert.equal(f.printed.length, notices.length + 2);
-    assert.equal(f.sent.length, 2);
-    assert.deepEqual(f.sent.map(event => event.statusKey), ['database:pvp-king:gold', 'database:pro-notifications']);
+    assert.equal(f.sent.length, 0);
+    await f.clock.advance(5 * 60_000);
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].statusKey, 'database:mysql');
     assert.equal(f.logger.waiting.size, 0);
     // A real preload failure and a non-transient database failure still need attention.
     f.consoleObject.warn('[WW LOG] Could not preload player server preferences:', Object.assign(new Error('Access denied'), { code: 'ER_ACCESS_DENIED_ERROR' }));
     f.consoleObject.error('[WW LOG] Unexpected MySQL PvP King storage error:', Object.assign(new Error('Lost write'), { code: 'ETIMEDOUT' }));
-    assert.equal(f.sent.length, 4);
+    assert.equal(f.sent.length, 3);
     f.logger.stop();
 });
 
@@ -74,26 +107,25 @@ test('the known loader deprecation stays in stderr and other Node warnings have 
     f.logger.stop();
 });
 
-test('persistent MySQL alerts are grouped for 30 minutes even across error codes and report contexts', () => {
-    let now = 1000;
-    const f = fixture({ now: () => now }); f.logger.start();
+test('persistent MySQL alerts ping once until confirmed recovery even across error codes and report contexts', async () => {
+    const f = fixture(); f.logger.start();
     f.logger.run({ component: 'Scout ingestion', reportId: '123', messageId: '124' }, () => {
         f.consoleObject.warn('[DB LOG] MySQL is still unavailable after 5m (ECONNRESET; 5 failed attempt(s)).');
     });
     assert.equal(f.sent[0].component, 'MySQL');
     assert.equal(f.sent[0].reportId, undefined);
     assert.equal(f.sent[0].messageId, undefined);
-    now += 5 * 60_000;
+    await settle();
+    await f.clock.advance(5 * 60_000);
     f.consoleObject.warn('[DB LOG] MySQL is still unavailable after 10m (ETIMEDOUT; 10 failed attempt(s)).');
-    now += 5 * 60_000;
+    await f.clock.advance(5 * 60_000);
     f.consoleObject.warn('[DB LOG] MySQL is still unavailable after 15m (ECONNREFUSED; 15 failed attempt(s)).');
     assert.equal(f.sent.length, 1);
-    now = 1000 + 30 * 60_000;
+    await f.clock.advance(20 * 60_000);
     f.consoleObject.warn('[DB LOG] MySQL is still unavailable after 35m (ETIMEDOUT; 35 failed attempt(s)).');
-    assert.equal(f.sent.length, 2);
-    assert.equal(f.sent[1].repeats, 2);
+    assert.equal(f.sent.length, 1);
     f.consoleObject.error('The database write failed.', Object.assign(new Error('Lost connection'), { code: 'ECONNRESET' }));
-    assert.equal(f.sent.length, 3);
+    assert.equal(f.sent.length, 2);
     f.logger.stop();
 });
 
@@ -187,17 +219,7 @@ test('Discord diagnostic messages omit the redundant WW tag without changing com
 });
 
 test('recoverable warnings get a reply only after the same subsystem reports recovery', async () => {
-    const printed = [], sent = [];
-    const consoleObject = {
-        log: (...args) => printed.push(['log', ...args]),
-        warn: (...args) => printed.push(['warn', ...args]),
-        error: (...args) => printed.push(['error', ...args])
-    };
-    const logger = new DiscordDiagnosticLogger({ consoleObject, send: event => {
-        sent.push(event);
-        return Promise.resolve({ id: `message-${sent.length}` });
-    } });
-    logger.install(); logger.start();
+    const { logger, consoleObject, sent, printed, clock } = fixture(); logger.start();
     const scenarios = [
         ['[WW LOG] PRO Forum Shop monitor is unavailable. Retrying in 12 minute(s): fetch failed',
             '[WW LOG] PRO Forum Shop monitor connection restored.'],
@@ -214,15 +236,16 @@ test('recoverable warnings get a reply only after the same subsystem reports rec
     ];
     for (const [warning, recovery] of scenarios) {
         consoleObject.warn(warning);
+        await clock.advance(10 * 60_000);
         consoleObject.log(recovery);
+        await settle();
     }
-    await new Promise(resolve => setImmediate(resolve));
     assert.equal(sent.length, scenarios.length * 2);
     for (let index = 0; index < scenarios.length; index++) {
-        const warning = sent[index], recovery = sent[index + scenarios.length];
+        const warning = sent[index * 2], recovery = sent[index * 2 + 1];
         assert.equal(warning.status, 'unavailable');
         assert.equal(recovery.status, 'recovered');
-        assert.equal(recovery.replyTo, `message-${index + 1}`);
+        assert.equal(recovery.replyTo, `message-${index * 2 + 1}`);
         assert.equal(recovery.statusKey, warning.statusKey);
     }
     assert.equal(printed.length, scenarios.length * 2);
@@ -246,26 +269,28 @@ test('a recoverable outage resolved before Discord is ready does not post a stal
     f.logger.stop();
 });
 
-test('a failed repeat alert keeps the last delivered reference and recovery resets the cooldown', async t => {
+test('failed alert delivery retries with the same nonce, then recovery replies to the confirmed alert', async t => {
     for (const failure of [() => null, () => Promise.reject(new Error('Discord unavailable'))]) {
-        let now = 1000, calls = 0;
+        let calls = 0;
         const sent = [];
-        const f = fixture({ now: () => now, send: event => {
-            if (++calls === 2) return failure();
+        const f = fixture({ send: event => {
             sent.push(event);
+            if (++calls === 1) return failure();
             return { id: `message-${calls}`, attachments: new Map() };
         } });
         t.after(() => f.logger.stop()); f.logger.start();
         const warning = '[WW LOG] PRO Forum Shop monitor is unavailable. Retrying in 1 minute(s): fetch failed';
         f.consoleObject.warn(warning);
-        assert.equal(await f.logger.statusMessages.get('forum:pro-forum-shop'), 'message-1');
-        now += 5 * 60_000;
-        f.consoleObject.warn(warning);
+        await f.clock.advance(10 * 60_000);
+        await f.clock.advance(30_000);
+        assert.equal(sent[0].nonce, sent[1].nonce);
         f.consoleObject.log('[WW LOG] PRO Forum Shop monitor connection restored.');
-        await new Promise(resolve => setImmediate(resolve));
-        assert.equal(sent[1].replyTo, 'message-1');
+        await settle();
+        assert.equal(sent[2].replyTo, 'message-2');
         f.consoleObject.warn(warning);
-        assert.equal(sent[2].status, 'unavailable');
+        await f.clock.advance(10 * 60_000);
+        assert.equal(sent[3].status, 'unavailable');
+        assert.notEqual(sent[3].nonce, sent[0].nonce);
         assert.equal(calls, 4);
     }
 });
@@ -276,6 +301,7 @@ test('pending recovery replies are cancelled at shutdown', async () => {
     const f = fixture({ send: event => { sent.push(event); return pending; } });
     f.logger.start();
     f.consoleObject.warn('[WW LOG] PRO Forum Shop monitor is unavailable. Retrying in 1 minute(s): fetch failed');
+    await f.clock.advance(10 * 60_000);
     f.consoleObject.log('[WW LOG] PRO Forum Shop monitor connection restored.');
     f.logger.stop();
     finish({ id: 'warning' });
@@ -283,7 +309,7 @@ test('pending recovery replies are cancelled at shutdown', async () => {
     assert.equal(sent.length, 1);
 });
 
-test('Gold and Silver storage outages recover independently and omit unrelated scout context', async t => {
+test('Gold and Silver storage outages share one ping and recover only when both sources confirm success', async t => {
     const PvpKingStorage = require('../commands/pvp-king/utils/pvpKingStorage.js');
     const sent = [];
     const f = fixture({ send: event => { sent.push(event); return { id: `message-${sent.length}` }; } });
@@ -295,13 +321,334 @@ test('Gold and Silver storage outages recover independently and omit unrelated s
     f.logger.run({ component: 'Scout ingestion', reportId: '123', messageId: '456' }, () => {
         gold.noteMysqlFailure(outage); silver.noteMysqlFailure(outage);
     });
-    assert.deepEqual(sent.map(event => event.statusKey), ['database:pvp-king:gold', 'database:pvp-king:silver']);
+    await f.clock.advance(5 * 60_000);
+    assert.deepEqual(sent.map(event => event.statusKey), ['database:mysql']);
     assert.ok(sent.every(event => event.reportId === undefined && event.messageId === undefined));
     gold.noteMysqlRestored();
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(sent[2].replyTo, 'message-1');
-    assert.equal(f.logger.statusMessages.has('database:pvp-king:silver'), true);
+    assert.equal(sent.length, 1);
+    assert.equal(f.logger.incidents.active.has('database:mysql'), true);
     silver.noteMysqlRestored();
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(sent[3].replyTo, 'message-2');
+    assert.equal(sent[1].replyTo, 'message-1');
+    assert.equal(f.logger.incidents.active.has('database:mysql'), false);
+});
+
+const timedServices = [
+    { name: 'MySQL', delay: 5 * 60_000,
+        warning: '[DB LOG] MySQL connectivity issue detected (ECONNREFUSED). Query retries and feature fallbacks are active.',
+        recovery: '[DB LOG] MySQL connection restored after 5m (2 failed attempt(s)).' },
+    { name: 'command registration', delay: 5 * 60_000,
+        warning: '[WW LOG] ❌ ERROR: Command registration failed: ETIMEDOUT',
+        recovery: '[WW LOG] ✅ Guild slash commands registered to Discord' },
+    { name: 'Discord REST warmup', delay: 5 * 60_000,
+        warning: '[WW LOG] Discord interaction connection warmup failed (ETIMEDOUT). Initial responses may need a new connection.',
+        recovery: '[WW LOG] Discord interaction connection warmup recovered.' },
+    ...['PRO Forum Shop', 'PRO Dungeon Shop', 'PRO Forum application'].map(name => ({ name, delay: 10 * 60_000,
+        warning: `[WW LOG] ${name} monitor is unavailable. Retrying in 12 minute(s): fetch failed`,
+        recovery: `[WW LOG] ${name} monitor connection restored.` }))
+];
+
+for (const service of timedServices) {
+    test(`${service.name} alerts at its threshold from the first failure and pings once per incident`, async t => {
+        const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+        f.consoleObject.warn(service.warning);
+        await f.clock.advance(service.delay - 1);
+        assert.equal(f.sent.length, 0);
+        f.consoleObject.warn(service.warning);
+        await f.clock.advance(1);
+        assert.equal(f.sent.length, 1);
+        assert.equal(f.sent[0].timestamp, new Date(1000).toISOString());
+        await f.clock.advance(service.delay);
+        f.consoleObject.warn(service.warning);
+        assert.equal(f.sent.length, 1);
+        f.consoleObject.log(service.recovery); await settle();
+        assert.equal(f.sent.length, 2);
+        assert.equal(f.sent[1].status, 'recovered');
+        assert.equal(f.sent[1].replyTo, 'message-1');
+        assert.equal(f.sent[1].durationMs, service.delay * 2);
+        // Recovery starts a new incident clock, rather than reusing the old alert.
+        f.consoleObject.warn(service.warning);
+        await f.clock.advance(service.delay - 1);
+        assert.equal(f.sent.length, 2);
+        await f.clock.advance(1);
+        assert.equal(f.sent.length, 3);
+        assert.notEqual(f.sent[2].nonce, f.sent[0].nonce);
+    });
+}
+
+test('brief service interruptions stay in the console without warning or recovery messages', async t => {
+    for (const service of timedServices) {
+        const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+        f.consoleObject.warn(service.warning);
+        await f.clock.advance(service.delay - 1);
+        f.consoleObject.log(service.recovery);
+        await f.clock.advance(service.delay * 2);
+        assert.equal(f.sent.length, 0, service.name);
+        assert.equal(f.printed.length, 2);
+        assert.equal(f.clock.timers.size, 0);
+    }
+});
+
+test('a long outage resolved before login still sends its warning followed by confirmed recovery', async t => {
+    const f = fixture(); t.after(() => f.logger.stop());
+    const service = timedServices[0];
+    f.consoleObject.warn(service.warning);
+    await f.clock.advance(service.delay + 10_000);
+    f.consoleObject.log(service.recovery);
+    assert.equal(f.sent.length, 0);
+    f.logger.start(); await settle();
+    assert.deepEqual(f.sent.map(event => event.status), ['unavailable', 'recovered']);
+    assert.equal(f.sent[1].durationMs, service.delay + 10_000);
+});
+
+test('urgent data loss and unexpected failures alert immediately and corruption never auto-recovers', async t => {
+    const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+    f.consoleObject.error('Background job crashed:', new Error('Unexpected exception'));
+    f.consoleObject.error('Could not save settings JSON:', Object.assign(new Error('Permission denied'), { code: 'EACCES' }));
+    f.consoleObject.warn('[WW LOG] MySQL Guild Application storage unavailable. Using JSON fallback:',
+        Object.assign(new Error('JSON recovery paused; original data preserved at data.json.corrupt-123'), { code: 'JSON_STORE_CORRUPT' }));
+    f.consoleObject.warn('[WW LOG] Guild Application local JSON storage cannot write:',
+        Object.assign(new Error('No space left on device'), { code: 'ENOSPC' }));
+    assert.equal(f.sent.length, 4);
+    assert.ok(f.sent.every(event => event.status !== 'recovered'));
+    f.consoleObject.log('[WW LOG] MySQL Guild Application storage restored.');
+    f.consoleObject.log('[WW LOG] Guild Application local JSON storage restored.');
+    await f.clock.advance(10 * 60_000);
+    assert.equal(f.sent.length, 4);
+});
+
+test('local JSON write retries and memory pressure alert immediately but do not repeatedly ping', async t => {
+    const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+    const json = '[WW LOG] Guild Application local JSON storage cannot write: EACCES';
+    const memory = '[RUNTIME MEMORY] WARNING: 420.0/512.0 MiB (82.0%; container).';
+    f.consoleObject.warn(json); f.consoleObject.warn(memory); await settle();
+    assert.equal(f.sent.length, 2);
+    await f.clock.advance(30 * 60_000);
+    f.consoleObject.warn(json); f.consoleObject.warn(memory);
+    assert.equal(f.sent.length, 2);
+    f.consoleObject.log('[WW LOG] Guild Application local JSON storage restored.');
+    f.consoleObject.log('[RUNTIME MEMORY] Recovered below 75%: 370.0/512.0 MiB (container).');
+    await settle();
+    assert.equal(f.sent.length, 4);
+});
+
+test('gateway interruptions wait one minute and require every disconnected shard to recover', async t => {
+    const f = fixture(), client = new EventEmitter(); t.after(() => f.logger.stop());
+    f.logger.watchGateway(client); f.logger.watchGateway(client); f.logger.start();
+    client.emit(Events.ShardReady, 0);
+    client.emit(Events.ShardDisconnect, { code: 1006 }, 0);
+    await f.clock.advance(59_999);
+    assert.equal(f.sent.length, 0);
+    client.emit(Events.ShardReconnecting, 0);
+    client.emit(Events.ShardDisconnect, { code: 1006 }, 1);
+    await f.clock.advance(1);
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].statusKey, 'discord:gateway');
+    client.emit(Events.ShardResume, 0, 4); await settle();
+    assert.equal(f.sent.length, 1);
+    client.emit(Events.ShardReady, 1); await settle();
+    assert.equal(f.sent[1].replyTo, 'message-1');
+    // A later 59-second interruption stays local.
+    client.emit(Events.ShardDisconnect, {}, 0);
+    await f.clock.advance(59_000);
+    client.emit(Events.ShardResume, 0, 1);
+    await f.clock.advance(60_000);
+    assert.equal(f.sent.length, 2);
+    f.logger.stop();
+    assert.equal(client.eventNames().length, 0);
+    assert.equal(f.clock.timers.size, 0);
+});
+
+test('recovery delivery retries without another warning ping and preserves a new concurrent outage', async t => {
+    let resolveRecovery;
+    const sent = [];
+    const f = fixture({ send: event => {
+        sent.push(event);
+        if (sent.length === 2) return new Promise(resolve => { resolveRecovery = resolve; });
+        if (sent.length === 3) return null;
+        return { id: `message-${sent.length}` };
+    } });
+    t.after(() => f.logger.stop()); f.logger.start();
+    const service = timedServices[0];
+    f.consoleObject.warn(service.warning); await f.clock.advance(service.delay);
+    f.consoleObject.log(service.recovery);
+    f.consoleObject.warn(service.warning);
+    resolveRecovery(null); await settle();
+    await f.clock.advance(30_000); // First retry also fails.
+    await f.clock.advance(60_000); // Second retry succeeds.
+    assert.deepEqual(sent.map(event => event.status), ['unavailable', 'recovered', 'recovered', 'recovered']);
+    assert.equal(sent[1].nonce, sent[2].nonce);
+    assert.equal(sent[2].nonce, sent[3].nonce);
+    assert.ok(sent.slice(1).every(event => event.replyTo === 'message-1'));
+    await f.clock.advance(service.delay - 90_000);
+    assert.equal(sent[4].status, 'unavailable');
+    assert.notEqual(sent[4].nonce, sent[0].nonce);
+    f.consoleObject.log(service.recovery); await settle();
+    assert.equal(sent[5].replyTo, 'message-5');
+});
+
+test('an outage that heals during failed delivery is reported once when delivery resumes', async t => {
+    let available = false;
+    const sent = [];
+    const f = fixture({ send: event => { sent.push(event); return available ? { id: `message-${sent.length}` } : null; } });
+    t.after(() => f.logger.stop()); f.logger.start();
+    const service = timedServices[0];
+    f.consoleObject.warn(service.warning); await f.clock.advance(service.delay);
+    f.consoleObject.log(service.recovery); await settle();
+    available = true;
+    await f.clock.advance(30_000);
+    assert.deepEqual(sent.map(event => event.status), ['unavailable', 'unavailable', 'recovered']);
+    assert.equal(sent[0].nonce, sent[1].nonce);
+    assert.equal(sent[2].replyTo, 'message-2');
+});
+
+test('synchronous send failures do not leave extra timers and shutdown cancels delayed alerts', async () => {
+    const f = fixture({ send: () => { throw new Error('Offline'); } }); f.logger.start();
+    f.consoleObject.warn(timedServices[0].warning);
+    f.consoleObject.warn(timedServices[3].warning);
+    f.consoleObject.warn('[RUNTIME MEMORY] WARNING: 420.0/512.0 MiB (82.0%; container).');
+    assert.equal(f.clock.timers.size, 1);
+    await f.clock.advance(5 * 60_000);
+    assert.equal(f.clock.timers.size, 1);
+    f.logger.stop();
+    assert.equal(f.clock.timers.size, 0);
+    await f.clock.advance(10 * 60_000);
+    assert.equal(f.logger.incidents.pending.size, 0);
+});
+
+test('registration failure allows startup to continue, retries with backoff and confirms recovery', async t => {
+    const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+    let calls = 0;
+    const registration = new CommandRegistration({ consoleObject: f.consoleObject,
+        schedule: f.clock.schedule, cancel: f.clock.cancel,
+        register: async () => { if (++calls < 4) throw new Error('Discord REST unavailable'); } });
+    t.after(() => registration.stop());
+    await assert.doesNotReject(registration.start());
+    assert.equal(calls, 1);
+    await f.clock.advance(60_000); assert.equal(calls, 2);
+    await f.clock.advance(120_000); assert.equal(calls, 3);
+    await f.clock.advance(120_000);
+    assert.equal(f.sent.length, 1); // Five minutes from the first failure.
+    await f.clock.advance(120_000); assert.equal(calls, 4);
+    assert.deepEqual(f.sent.map(event => event.status), ['unavailable', 'recovered']);
+    assert.equal(f.clock.timers.size, 0);
+    await registration.start();
+    assert.equal(calls, 4);
+});
+
+test('a command registration retry that succeeds within five minutes creates no Discord alerts', async t => {
+    const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+    let calls = 0;
+    const registration = new CommandRegistration({ consoleObject: f.consoleObject,
+        schedule: f.clock.schedule, cancel: f.clock.cancel,
+        register: async () => { if (++calls === 1) throw new Error('Temporary outage'); } });
+    t.after(() => registration.stop());
+    await registration.start(); await f.clock.advance(60_000);
+    await f.clock.advance(10 * 60_000);
+    assert.equal(calls, 2);
+    assert.equal(f.sent.length, 0);
+});
+
+test('registration attempts cannot overlap and abort discards an in-flight result', async t => {
+    const f = fixture(); t.after(() => f.logger.stop());
+    const controller = new AbortController();
+    let calls = 0, finish;
+    const registration = new CommandRegistration({ signal: controller.signal, consoleObject: f.consoleObject,
+        schedule: f.clock.schedule, cancel: f.clock.cancel,
+        register: () => { calls++; return new Promise(resolve => { finish = resolve; }); } });
+    const attempt = registration.start();
+    await registration.start();
+    assert.equal(calls, 1);
+    controller.abort(); finish(); await attempt;
+    assert.equal(f.printed.length, 1); // Only the initial "Registering..." line.
+    assert.equal(f.clock.timers.size, 0);
+    await registration.start();
+    assert.equal(calls, 1);
+});
+
+test('registration retries stop on shutdown and never start for an already aborted bootstrap', async t => {
+    const f = fixture(); t.after(() => f.logger.stop());
+    const controller = new AbortController();
+    let calls = 0;
+    const options = { signal: controller.signal, consoleObject: f.consoleObject,
+        schedule: f.clock.schedule, cancel: f.clock.cancel,
+        register: async () => { calls++; throw new Error('Offline'); } };
+    const registration = new CommandRegistration(options);
+    await registration.start();
+    assert.equal(calls, 1);
+    assert.equal(f.clock.timers.size, 1);
+    controller.abort();
+    assert.equal(f.clock.timers.size, 0);
+    await f.clock.advance(10 * 60_000);
+    assert.equal(calls, 1);
+    await new CommandRegistration(options).start();
+    assert.equal(calls, 1);
+});
+
+test('member audit database failures wait five minutes and recover after synchronization succeeds', async t => {
+    const { MemberAuditHistory } = require('../utils/memberAuditHistory.js');
+    const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+    for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, f.consoleObject[level]);
+    let offline = true;
+    const history = new MemberAuditHistory({ db: { hasRequiredConfig: true, query: async () => {
+        if (offline) throw Object.assign(new Error('Connection refused'), { code: 'ECONNREFUSED' });
+        return [[], []];
+    } } });
+    await history.restore();
+    assert.equal(f.sent.length, 0);
+    await f.clock.advance(5 * 60_000);
+    assert.equal(f.sent[0].statusKey, 'database:mysql');
+    offline = false; await history.restore(); await settle();
+    assert.equal(f.sent[1].replyTo, 'message-1');
+});
+
+test('a failed member audit JSON save alerts immediately instead of becoming a database outage', t => {
+    const { MemberAuditHistory } = require('../utils/memberAuditHistory.js');
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-history-alert-'));
+    t.after(() => fs.rmdirSync(directory));
+    const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+    for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, f.consoleObject[level]);
+    const filePath = path.join(directory, 'history.json');
+    const history = new MemberAuditHistory({ storageMode: 'json', filePath });
+    const write = fs.writeFileSync;
+    t.mock.method(fs, 'writeFileSync', (file, ...args) => {
+        if (file === `${filePath}.tmp`) throw Object.assign(new Error('Permission denied'), { code: 'EACCES' });
+        return write(file, ...args);
+    });
+    history.recordJoin({ id: 'member', guild: { id: 'guild' }, joinedTimestamp: 1000 });
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].level, 'error');
+    assert.match(f.sent[0].message, /local JSON storage failed/u);
+    assert.equal(f.sent[0].statusKey, undefined);
+    assert.equal(f.logger.incidents.active.size, 0);
+});
+
+test('corrupt member audit database JSON alerts immediately and does not falsely announce recovery', async t => {
+    const { MemberAuditHistory } = require('../utils/memberAuditHistory.js');
+    const f = fixture(); t.after(() => f.logger.stop()); f.logger.start();
+    for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, f.consoleObject[level]);
+    let corrupt = true;
+    const history = new MemberAuditHistory({ db: { hasRequiredConfig: true, query: async sql => [
+        !sql.startsWith('CREATE') && corrupt ? [{ state_json: '{ invalid JSON' }] : [], []
+    ] } });
+    await history.restore();
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].level, 'error');
+    assert.match(f.sent[0].message, /data is corrupted/u);
+    corrupt = false; await history.restore();
+    await f.clock.advance(10 * 60_000);
+    assert.equal(f.sent.length, 1);
+});
+
+test('a retrospective database duration does not change the nonce of an unconfirmed alert retry', async t => {
+    const sent = [];
+    const f = fixture({ send: event => { sent.push(event); return null; } });
+    t.after(() => f.logger.stop()); f.logger.start();
+    f.consoleObject.warn(timedServices[0].warning);
+    await f.clock.advance(5 * 60_000);
+    f.consoleObject.warn('[DB LOG] MySQL is still unavailable after 6m (ECONNREFUSED).');
+    await f.clock.advance(30_000);
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0].nonce, sent[1].nonce);
 });

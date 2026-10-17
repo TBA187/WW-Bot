@@ -8,7 +8,12 @@ const { readJsonObject, writeJsonIfChanged } = require('./jsonFile.js');
 // Retain only the latest membership transition per user, with a bounded store.
 class MemberAuditHistory {
     constructor({ db, filePath, storageMode = process.env.STORAGE_MODE, shutdownSignal, retryMs = 30000,
-        maxEntries = 5000, onError = error => console.warn('[WW LOG] Member audit history unavailable; JSON recovery remains active:', error.message) } = {}) {
+        maxEntries = 5000, onError = (error, { localJson = false } = {}) => {
+            if (localJson) console.error('[WW LOG] Member audit local JSON storage failed:', error);
+            else if (error instanceof SyntaxError || error.message === 'Invalid MySQL member audit record.') {
+                console.error('[WW LOG] Member audit data is corrupted; review is required:', error);
+            } else console.warn('[WW LOG] Member audit history unavailable; JSON recovery remains active:', error);
+        } } = {}) {
         Object.assign(this, { db, shutdownSignal, retryMs });
         this.storageMode = String(storageMode || 'auto').toLowerCase();
         this.dirty = new Set();
@@ -31,7 +36,7 @@ class MemberAuditHistory {
                     if (this.entries.has(key)) this.dirty.add(key);
                 }
                 this.prune();
-            } catch (error) { this.onError(error); }
+            } catch (error) { this.onError(error, { localJson: true }); }
         }
     }
 
@@ -63,7 +68,7 @@ class MemberAuditHistory {
         this.prune();
         if (!this.filePath) return;
         try { writeJsonIfChanged(this.filePath, `${this.filePath}.tmp`, { version: 2, members: [...this.entries.values()], pending: [...this.dirty] }); }
-        catch (error) { this.onError(error); }
+        catch (error) { this.onError(error, { localJson: true }); }
     }
 
     changed(entry, at = Date.now()) {

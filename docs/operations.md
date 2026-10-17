@@ -123,6 +123,22 @@ Maintenance runs at startup, rollover and every hour. Defaults retain the newest
 
 Invalid values use defaults. Retention is at least one file; storage values are at least zero. Unrelated files are left alone. If file logging is unavailable, console logging continues.
 
+## Discord diagnostic alerts
+
+Bot warnings and errors use the existing `logChannelID` and mention `ownerID`. Confirmed recovery replies to the original alert without another mention.
+Console and monthly logs record failures immediately; Discord waits for persistent service outages:
+
+| Problem | Discord alert timing |
+| --- | --- |
+| JSON save failures, corrupted data, unexpected errors, failed background jobs | Immediately |
+| MySQL outages and feature storage fallbacks, Discord REST warmup, command registration | After 5 minutes |
+| PRO forum outages, including application and shop scans | After 10 minutes |
+| Discord Gateway disconnection | After 1 minute |
+| Memory pressure | Immediately |
+
+Alerts contain fixed summaries rather than raw exceptions, credentials, SQL or payment details. Alert delivery is separate from commands and uses bounded in-memory incident tracking with retry delays. Incident tracking resets when the process restarts; a stopped process cannot send an alert.
+Routine reconnects, successful operations and normal cleanup remain in console/file logs.
+
 ## OCR memory lifecycle
 
 Gold, Silver, and guild-application OCR use a shared queue and a lazily started helper process. The helper handles image downloading, preparation, and recognition using consistent Tesseract settings and parsing logic.
