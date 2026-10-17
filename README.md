@@ -63,6 +63,8 @@ Console output and error stacks are mirrored to monthly files under `data/logs/`
 
 ## Development
 
+See [AGENTS.md](AGENTS.md) for development conventions, testing requirements, and recovery safeguards.
+
 Run syntax checks and the automated test suite:
 
 ```sh

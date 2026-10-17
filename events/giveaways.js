@@ -22,11 +22,14 @@ const GIVEAWAY_FOOTER_TEXT = 'All winners are selected completely at random!';
 const GIVEAWAY_BUTTON_ID = 'ww_giveaway:join_leave';
 const GIVEAWAY_PARTICIPANTS_BUTTON_ID = 'ww_giveaway:participants';
 const GIVEAWAY_PAGE_PREFIX = 'ww_giveaway:page';
+const GIVEAWAY_WINNERS_PREFIX = 'ww_giveaway:winners';
 const MAX_WINNERS = 100;
 const REROLL_AUTOCOMPLETE_WINDOW_MS = 48 * 60 * 60 * 1000;
 const GIVEAWAY_RECOVERY_WINDOW_MS = REROLL_AUTOCOMPLETE_WINDOW_MS;
 const GIVEAWAY_LIST_PAGE_SIZE = 10;
 const PARTICIPANTS_PAGE_SIZE = 30;
+const WINNERS_PAGE_SIZE = 20;
+const WINNER_PAGINATION_TTL_MS = 5 * 60 * 1000;
 const STORAGE_VERSION = 2;
 const GIVEAWAY_END_PACING_MS = 1000;
 const GIVEAWAY_EDIT_DELAY_MS = 1500;
@@ -1458,7 +1461,9 @@ function buildGiveawayEmbed(giveaway, { participantCount = 0 } = {}) {
     if (winnerIds.length) {
         embed.addFields({
             name: winnerFieldName(winnerIds),
-            value: fieldValue(winnerIds.map(userId => `<@${userId}>`).join(', ')),
+            value: fieldValue(winnerIds.length > WINNERS_PAGE_SIZE
+                ? `${winnerIds.length} winners. Select View winners on the draw announcement for the full list.`
+                : winnerIds.map(userId => `<@${userId}>`).join(', ')),
             inline: false
         });
     }
@@ -1567,7 +1572,9 @@ async function pacedGiveawayMessageEdit(message, payload) {
             now - (GIVEAWAY_MESSAGE_EDITS.lastMessageEditAt.get(messageKey) || 0)
         );
         await wait(Math.max(0, routeWait, messageWait));
-        return await message.edit(payload);
+        const currentPayload = typeof payload === 'function' ? await payload() : payload;
+        if (!currentPayload) return;
+        return await message.edit(currentPayload);
     } finally {
         const finishedAt = Date.now();
         const messageKey = `${message.channelId || message.channel?.id || 'unknown'}:${message.id}`;
@@ -1589,27 +1596,29 @@ function refreshGiveawayMessage(client, config, giveaway, { disabled = null } = 
     const giveawayId = String(giveaway.giveaway_id);
     let pending = GIVEAWAY_REFRESHES.get(giveawayId);
     if (!pending) {
-        pending = { giveaway: null, disabled: null, dirty: false, promise: null };
+        pending = { disabled: null, dirty: false, promise: null };
         GIVEAWAY_REFRESHES.set(giveawayId, pending);
     }
 
-    pending.giveaway = clone(giveaway);
-    pending.disabled = disabled;
+    pending.disabled = pending.disabled === true || disabled === true ? true : disabled;
     pending.dirty = true;
     if (pending.promise) return pending.promise;
 
     pending.promise = (async () => {
-        while (pending.dirty) {
-            pending.dirty = false;
-            await refreshGiveawayMessageNow(client, config, pending.giveaway, { disabled: pending.disabled });
+        try {
+            while (pending.dirty) {
+                pending.dirty = false;
+                await refreshGiveawayMessageNow(client, config, giveawayId, { disabled: pending.disabled });
+            }
+        } finally {
+            GIVEAWAY_REFRESHES.delete(giveawayId);
         }
-    })().finally(() => {
-        GIVEAWAY_REFRESHES.delete(giveawayId);
-    });
+    })();
     return pending.promise;
 }
 
-async function refreshGiveawayMessageNow(client, config, giveaway, { disabled = null } = {}) {
+async function refreshGiveawayMessageNow(client, config, giveawayId, { disabled = null } = {}) {
+    const giveaway = await config.giveawayStore.getGiveaway(giveawayId);
     if (!giveaway?.message_id) return;
     const channel = await getChannel(client, giveaway.channel_id);
     if (!channel) return;
@@ -1621,14 +1630,18 @@ async function refreshGiveawayMessageNow(client, config, giveaway, { disabled = 
         return;
     }
 
-    const entries = await config.giveawayStore.listEntries(giveaway.giveaway_id, { activeOnly: true });
-    const embed = buildGiveawayEmbed(giveaway, { participantCount: entries.length });
-    const shouldDisable = disabled ?? giveaway.status !== GIVEAWAY_ACTIVE;
-    await pacedGiveawayMessageEdit(message, {
-        content: giveawayMessageContent(giveaway),
-        embeds: [embed],
-        components: buildGiveawayComponents(giveaway, { disabled: shouldDisable }),
-        allowedMentions: { parse: [] }
+    await pacedGiveawayMessageEdit(message, async () => {
+        const entries = await config.giveawayStore.listEntries(giveawayId, { activeOnly: true });
+        // The entry refresh may have waited behind an end or reroll while edits were paced.
+        const current = await config.giveawayStore.getGiveaway(giveawayId);
+        if (!current || String(current.message_id) !== String(message.id)
+            || String(current.channel_id) !== String(giveaway.channel_id)) return null;
+        return {
+            content: giveawayMessageContent(current),
+            embeds: [buildGiveawayEmbed(current, { participantCount: entries.length })],
+            components: buildGiveawayComponents(current, { disabled: disabled === true || current.status !== GIVEAWAY_ACTIVE }),
+            allowedMentions: { parse: [] }
+        };
     }).catch(() => { });
 }
 
@@ -1703,10 +1716,11 @@ async function renewGiveawayClaim(store, giveawayId, claim, onWriteStart) {
     }
 }
 
-async function publishGiveawayEnd(client, config, giveaway, winnerIds, { announceInteraction, requireMysql, endClaim, onWriteStart }) {
+async function publishGiveawayEnd(client, config, giveaway, winnerIds, { announceInteraction, requireMysql, endClaim, onWriteStart,
+    drawId = giveaway.end_draw_id }) {
     await refreshGiveawayMessage(client, config, giveaway, { disabled: true });
     await renewGiveawayClaim(config.giveawayStore, giveaway.giveaway_id, endClaim, onWriteStart);
-    const delivery = await announceGiveawayDraw(client, giveaway, winnerIds, { drawType: 'end', interaction: announceInteraction });
+    const delivery = await announceGiveawayDraw(client, giveaway, winnerIds, { drawType: 'end', interaction: announceInteraction, drawId });
     if (!delivery) return giveaway;
     await renewGiveawayClaim(config.giveawayStore, giveaway.giveaway_id, endClaim, onWriteStart);
     onWriteStart?.();
@@ -1740,7 +1754,7 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
             const winnerIds = (previousEndDraw.winner_user_ids || []).map(String);
             const endedAt = previousEndDraw.drawn_at || utcNowIso();
             if (endAnnouncementPending(current)) return [await publishGiveawayEnd(client, config, current, winnerIds,
-                { announceInteraction, requireMysql, endClaim, onWriteStart }), winnerIds];
+                { announceInteraction, requireMysql, endClaim, onWriteStart, drawId: previousEndDraw.draw_id }), winnerIds];
             await renewGiveawayClaim(config.giveawayStore, giveawayId, endClaim, onWriteStart);
             onWriteStart?.();
             const savedRecovery = await config.giveawayStore.updateGiveaway(giveawayId, {
@@ -1824,18 +1838,31 @@ async function endGiveawayLocked(client, config, giveaway, { actor = null, drawT
             { announceInteraction, requireMysql, endClaim, onWriteStart }), winnerIds];
     }
     await refreshGiveawayMessage(client, config, updated, { disabled: true });
-    await announceGiveawayDraw(client, updated, winnerIds, { drawType, interaction: announceInteraction });
-    return [updated, winnerIds];
+    await announceGiveawayDraw(client, updated, winnerIds, { drawType, interaction: announceInteraction,
+        drawId: savedDraw?.draw_id || drawId });
+    return [updated, winnerIds, savedDraw || draw];
 }
 
-async function announceGiveawayDraw(client, giveaway, winnerIds, { drawType, interaction = null }) {
+function drawWinnerComponents(giveaway, winnerIds, drawId) {
+    if (winnerIds.length <= WINNERS_PAGE_SIZE || !drawId) return [];
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`${GIVEAWAY_WINNERS_PREFIX}:${giveaway.giveaway_id}:${winnerDrawKey(drawId)}`)
+            .setLabel('View winners').setStyle(ButtonStyle.Secondary)
+    )];
+}
+
+async function announceGiveawayDraw(client, giveaway, winnerIds, { drawType, interaction = null, drawId = null }) {
     const content = drawAnnouncementContent(giveaway, winnerIds, { drawType });
+    const paginated = winnerIds.length > WINNERS_PAGE_SIZE;
+    if (paginated && !drawId) return null;
+    const controls = paginated ? { components: drawWinnerComponents(giveaway, winnerIds, drawId) } : {};
+    const allowedMentions = paginated ? { parse: [], users: [], roles: [], repliedUser: false } : { users: winnerIds };
     if (interaction) {
         try {
             if (interaction.deferred || interaction.replied) {
-                return await interaction.editReply({ content, allowedMentions: { users: winnerIds } }) || {};
+                return await interaction.editReply({ content, allowedMentions, ...controls }) || {};
             } else {
-                return await interaction.reply({ content, allowedMentions: { users: winnerIds } }) || {};
+                return await interaction.reply({ content, allowedMentions, ...controls }) || {};
             }
         } catch {
             // The command handler will finish the deferred response with its own status message.
@@ -1850,9 +1877,10 @@ async function announceGiveawayDraw(client, giveaway, winnerIds, { drawType, int
         const delivery = drawType === 'end' ? { nonce: crypto.createHash('sha256')
             .update(`giveaway-end:${giveaway.giveaway_id}`).digest('hex').slice(0, 24), enforceNonce: true } : {};
         if (message) {
-            return await message.reply({ content, allowedMentions: { users: winnerIds, repliedUser: false }, failIfNotExists: false, ...delivery }) || {};
+            return await message.reply({ content, allowedMentions: { ...allowedMentions, repliedUser: false },
+                failIfNotExists: false, ...controls, ...delivery }) || {};
         } else {
-            return await channel.send({ content, allowedMentions: { users: winnerIds }, ...delivery }) || {};
+            return await channel.send({ content, allowedMentions, ...controls, ...delivery }) || {};
         }
     } catch {
         // Announcement failure should not undo an ended giveaway.
@@ -1872,6 +1900,9 @@ function drawAnnouncementContent(giveaway, winnerIds, { drawType }) {
     const heading = `${emoji}  ${linkTextToGiveaway(giveaway, title)}`;
     if (!winnerIds.length) {
         return `### ${heading}\n- Nobody joined this giveaway.`;
+    }
+    if (winnerIds.length > WINNERS_PAGE_SIZE) {
+        return `### ${heading}\n- **${winnerIds.length} winners** won **${prize}**! Select **View winners** to see the full list.`;
     }
     const mentions = winnerIds.map(userId => `<@${userId}>`).join(', ');
     return `### ${heading}\n- Congratulations ${mentions}! You won **${prize}  <:man_of_culture:1186287184106496112>**`;
@@ -1908,6 +1939,10 @@ async function handleGiveawayButton(interaction, config) {
     }
     if (interaction.customId === GIVEAWAY_PARTICIPANTS_BUTTON_ID) {
         await handleParticipantsButton(interaction, config);
+        return true;
+    }
+    if (interaction.customId.startsWith(`${GIVEAWAY_WINNERS_PREFIX}:`)) {
+        await handleWinnersButton(interaction, config);
         return true;
     }
     if (interaction.customId.startsWith(`${GIVEAWAY_PAGE_PREFIX}:`)) {
@@ -2027,6 +2062,49 @@ async function handleParticipantsButton(interaction, config) {
     await sendParticipantEmbeds(interaction, config, giveaway);
 }
 
+function winnerDrawKey(drawId) {
+    return crypto.createHash('sha256').update(String(drawId)).digest('hex').slice(0, 16);
+}
+
+async function handleWinnersButton(interaction, config) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const match = /^ww_giveaway:winners:(.+):([a-f0-9]{16})$/.exec(interaction.customId);
+    const giveaway = match && await config.giveawayStore.getGiveaway(match[1]);
+    if (!giveaway || String(giveaway.guild_id) !== String(interaction.guildId)) {
+        await interaction.editReply('That giveaway could not be found.');
+        return;
+    }
+    const draws = await config.giveawayStore.listDraws(giveaway.giveaway_id);
+    const draw = draws.find(candidate => winnerDrawKey(candidate.draw_id) === match[2]);
+    if (!draw) {
+        await interaction.editReply('The saved winner list could not be found. Please try again.');
+        return;
+    }
+    await sendEmbedFollowUp(interaction, buildWinnerEmbeds(giveaway, draw), {
+        expiresAfterMs: WINNER_PAGINATION_TTL_MS, allowedMentions: { parse: [] }
+    });
+}
+
+function buildWinnerEmbeds(giveaway, draw) {
+    const winnerIds = draw.winner_user_ids || [];
+    const pages = chunked(winnerIds, WINNERS_PAGE_SIZE);
+    if (!pages.length) pages.push([]);
+    return pages.map((winnerPage, pageIndex) => {
+        const embed = new EmbedBuilder()
+            .setTitle(draw.draw_type === 'reroll' ? 'Rerolled winners' : 'Giveaway winners')
+            .setColor(colorInt(giveaway.color_hex || DEFAULT_GIVEAWAY_COLOR))
+            .setDescription(winnerPage.map((userId, index) => `${pageIndex * WINNERS_PAGE_SIZE + index + 1}. <@${userId}>`)
+                .join('\n') || 'No winners were selected.')
+            .addFields({ name: 'Prize', value: String(giveaway.prize || 'the prize').slice(0, 1024), inline: false })
+            .setFooter({ text: `Page ${pageIndex + 1}/${pages.length} • ${winnerIds.length} winners` });
+        const drawnAt = discordTimestampPair(draw.drawn_at);
+        if (drawnAt) embed.addFields({ name: 'Drawn', value: drawnAt, inline: true });
+        const link = messageLink(giveaway);
+        if (link) embed.addFields({ name: 'Giveaway', value: `[Jump to Giveaway](${link})`, inline: true });
+        return embed;
+    });
+}
+
 function giveawayHasEnded(giveaway, now = new Date()) {
     if (giveaway.status !== GIVEAWAY_ACTIVE) return true;
     const endsAt = giveawayEntryCutoff(giveaway);
@@ -2039,20 +2117,25 @@ async function sendParticipantEmbeds(interaction, config, giveaway) {
     await sendEmbedFollowUp(interaction, embeds);
 }
 
-async function sendEmbedFollowUp(interaction, embeds) {
+async function sendEmbedFollowUp(interaction, embeds, { expiresAfterMs = null, allowedMentions } = {}) {
     const [embed] = embeds;
+    const mentions = allowedMentions ? { allowedMentions } : {};
     if (embeds.length <= 1) {
-        await interaction.editReply({ embeds: [embed] });
+        await interaction.editReply({ embeds: [embed], ...mentions });
         return;
     }
-    const session = createPaginationSession(interaction.user.id, embeds);
-    await interaction.editReply({ embeds: [embed], components: buildPaginationComponents(session) });
+    const session = createPaginationSession(interaction.user.id, embeds, { expiresAfterMs, allowedMentions });
+    await interaction.editReply({ embeds: [embed], components: buildPaginationComponents(session), ...mentions });
 }
 
-function createPaginationSession(ownerId, embeds) {
+function createPaginationSession(ownerId, embeds, { expiresAfterMs, allowedMentions } = {}) {
     const id = crypto.randomBytes(6).toString('hex');
-    const session = { id, ownerId, embeds, index: 0, createdAt: Date.now() };
+    const session = { id, ownerId, embeds, index: 0, createdAt: Date.now(), allowedMentions };
     PAGINATION_SESSIONS.set(id, session);
+    if (expiresAfterMs) {
+        session.expiresAt = session.createdAt + expiresAfterMs;
+        setTimeout(() => PAGINATION_SESSIONS.delete(id), expiresAfterMs).unref?.();
+    }
     return session;
 }
 
@@ -2076,8 +2159,9 @@ function buildPaginationComponents(session) {
 async function handlePaginationButton(interaction) {
     const [, , sessionId, direction] = interaction.customId.split(':');
     const session = PAGINATION_SESSIONS.get(sessionId);
-    if (!session) {
-        await interaction.reply({ content: 'This pagination expired. Run the command again.', flags: MessageFlags.Ephemeral });
+    if (!session || session.expiresAt <= Date.now()) {
+        PAGINATION_SESSIONS.delete(sessionId);
+        await interaction.reply({ content: 'This pagination expired. Reopen the list from its original button or command.', flags: MessageFlags.Ephemeral });
         return;
     }
     if (interaction.user.id !== session.ownerId) {
@@ -2088,7 +2172,8 @@ async function handlePaginationButton(interaction) {
     session.index = direction === 'next'
         ? Math.min(session.embeds.length - 1, session.index + 1)
         : Math.max(0, session.index - 1);
-    await interaction.update({ embeds: [session.embeds[session.index]], components: buildPaginationComponents(session) });
+    await interaction.update({ embeds: [session.embeds[session.index]], components: buildPaginationComponents(session),
+        ...(session.allowedMentions ? { allowedMentions: session.allowedMentions } : {}) });
 }
 
 function buildParticipantEmbeds(giveaway, entries, guild = null) {
@@ -2354,7 +2439,9 @@ function shouldRestrictGiveawayChannel(config) {
 }
 
 function drawSummary(action, giveaway, winnerIds, guild = null) {
-    const winners = winnerIds.length ? winnerIds.map(userId => `<@${userId}>`).join(', ') : 'No winners';
+    const winners = winnerIds.length > WINNERS_PAGE_SIZE
+        ? `${winnerIds.length} selected. Select View winners on the draw announcement for the full list.`
+        : winnerIds.length ? winnerIds.map(userId => `<@${userId}>`).join(', ') : 'No winners';
     const label = winnerIds.length === 1 ? 'Winner' : 'Winners';
     const giveawayLabel = giveawayDisplayLabel(giveaway, { guild });
     const giveawayLink = linkTextToGiveaway(giveaway, giveawayLabel);
@@ -2454,6 +2541,7 @@ module.exports = {
     canManageGiveaways,
     createGiveawayStore,
     drawSummary,
+    drawWinnerComponents,
     endGiveaway,
     giveawayAutocomplete,
     giveawayChannelOnlyError,

@@ -13,6 +13,7 @@ const {
     canManageGiveaways,
     deleteGiveawayMessage,
     drawSummary,
+    drawWinnerComponents,
     endGiveaway,
     giveawayAutocomplete,
     giveawayChannelOnlyError,
@@ -519,9 +520,9 @@ class Giveaways {
             return interaction.editReply(err.message);
         }
 
-        let rerolled, winnerIds;
+        let rerolled, winnerIds, draw;
         try {
-            [rerolled, winnerIds] = await endGiveaway(interaction.client, this.config, record, {
+            [rerolled, winnerIds, draw] = await endGiveaway(interaction.client, this.config, record, {
                 actor: interaction.user,
                 drawType: 'reroll',
                 winnerCount,
@@ -540,7 +541,9 @@ class Giveaways {
         if (interaction.replied) {
             await interaction.followUp({ content: summary, flags: MessageFlags.Ephemeral });
         } else if (interaction.deferred) {
-            await interaction.editReply({ content: summary });
+            const components = drawWinnerComponents(rerolled, winnerIds, draw?.draw_id);
+            await interaction.editReply({ content: summary,
+                ...(components.length ? { components, allowedMentions: { parse: [] } } : {}) });
         } else {
             await interaction.reply({ content: summary, flags: MessageFlags.Ephemeral });
         }
