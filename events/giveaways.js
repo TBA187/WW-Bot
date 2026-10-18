@@ -1405,18 +1405,19 @@ function createGiveawayStore(options = {}) {
     return new GiveawayStore(options);
 }
 
-function buildGiveawayComponents(giveaway, { disabled = false } = {}) {
+function buildGiveawayComponents(giveaway, { disabled = false, drawId = null } = {}) {
     if (giveaway.status === GIVEAWAY_DELETED) return [];
     if (giveaway.status === GIVEAWAY_ENDED) {
-        return [
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(GIVEAWAY_PARTICIPANTS_BUTTON_ID)
-                    .setLabel('Participants')
-                    .setEmoji('👥')
-                    .setStyle(ButtonStyle.Secondary)
-            )
-        ];
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(GIVEAWAY_PARTICIPANTS_BUTTON_ID)
+                .setLabel('Participants')
+                .setEmoji('👥')
+                .setStyle(ButtonStyle.Primary)
+        );
+        const [winnerRow] = drawWinnerComponents(giveaway, giveaway.winner_user_ids || [], drawId);
+        if (winnerRow) row.addComponents(...winnerRow.components);
+        return [row];
     }
 
     return [
@@ -1431,10 +1432,33 @@ function buildGiveawayComponents(giveaway, { disabled = false } = {}) {
     ];
 }
 
+async function giveawayMessageDraws(store, giveaway) {
+    if (giveaway?.status !== GIVEAWAY_ENDED || !(giveaway.winner_user_ids?.length > WINNERS_PAGE_SIZE)
+        || (giveaway.end_draw_id && !giveaway.last_rerolled_at) || typeof store.listDraws !== 'function') return [];
+    return store.listDraws(giveaway.giveaway_id);
+}
+
+function giveawayMessageDrawId(giveaway, draws) {
+    if (!giveaway.last_rerolled_at && giveaway.end_draw_id) return giveaway.end_draw_id;
+    const draw = draws.find(candidate => candidate.draw_type === (giveaway.last_rerolled_at ? 'reroll' : 'end')
+        && (!giveaway.last_rerolled_at || candidate.drawn_at === giveaway.last_rerolled_at)
+        && JSON.stringify(candidate.winner_user_ids || []) === JSON.stringify(giveaway.winner_user_ids || []));
+    return draw?.draw_id || null;
+}
+
+function giveawayDescription(giveaway) {
+    const host = String(giveaway.host_text || 'White Walkers Team');
+    const hostText = /^(?:<@|@)/u.test(host) ? host : `@${host}`;
+    const details = `<:man_of_culture:1186287184106496112>\u2002**Host:** ${hostText}\n`
+        + `🎁\u2002**Prize:** ${giveaway.prize || 'Unknown'}`;
+    const description = normalizeGiveawayDescription(giveaway.description);
+    return description ? `${details}\n\n${description}` : details;
+}
+
 function buildGiveawayEmbed(giveaway, { participantCount = 0 } = {}) {
     const embed = new EmbedBuilder()
         .setTitle(giveawayEmbedTitle(giveaway))
-        .setDescription(normalizeGiveawayDescription(giveaway.description) || null)
+        .setDescription(giveawayDescription(giveaway))
         .setColor(giveawayEmbedColor(giveaway))
         .setTimestamp(new Date());
 
@@ -1442,28 +1466,26 @@ function buildGiveawayEmbed(giveaway, { participantCount = 0 } = {}) {
         embed.setURL(DEFAULT_GIVEAWAY_TITLE_URL);
     }
 
-    embed.addFields(
-        { name: '<:man_of_culture:1186287184106496112> Host', value: fieldValue(giveaway.host_text || 'White Walkers Team'), inline: true },
-        { name: '🎁 Prize', value: fieldValue(giveaway.prize || 'Unknown'), inline: true },
-        { name: '🏆 Winners', value: fieldValue(giveaway.winners_total || 1), inline: true },
-        { name: '👥 Participants', value: fieldValue(participantCount), inline: true }
-    );
+    if (giveaway.status !== GIVEAWAY_ENDED) {
+        embed.addFields({ name: '🏆 Winners', value: String(giveaway.winners_total || 1), inline: true });
+    }
+    embed.addFields({ name: '👥 Participants', value: String(participantCount), inline: true });
 
     const endsAt = giveaway.status === GIVEAWAY_ENDED ? giveaway.ended_at : giveaway.ends_at;
     const endsFieldName = giveaway.status === GIVEAWAY_ENDED ? '❌ Giveaway ended!' : '⏳ Ends';
-    embed.addFields({ name: endsFieldName, value: fieldValue(discordTimestamp(endsAt, 'R') || 'Unknown'), inline: true });
+    embed.addFields({ name: endsFieldName, value: discordTimestamp(endsAt, 'R') || 'Unknown', inline: true });
 
     if (giveaway.status === GIVEAWAY_DELETED) {
-        embed.addFields({ name: '📌 Status', value: fieldValue('Deleted'), inline: false });
+        embed.addFields({ name: '📌 Status', value: 'Deleted', inline: false });
     }
 
     const winnerIds = giveaway.winner_user_ids || [];
     if (winnerIds.length) {
         embed.addFields({
             name: winnerFieldName(winnerIds),
-            value: fieldValue(winnerIds.length > WINNERS_PAGE_SIZE
-                ? `${winnerIds.length} winners. Select View winners on the draw announcement for the full list.`
-                : winnerIds.map(userId => `<@${userId}>`).join(', ')),
+            value: winnerIds.length > WINNERS_PAGE_SIZE
+                ? `**${winnerIds.length} winners.**\nPress the **View Winners** button for the full winner list.`
+                : winnerIds.map(userId => `<@${userId}>`).join(', '),
             inline: false
         });
     }
@@ -1472,7 +1494,7 @@ function buildGiveawayEmbed(giveaway, { participantCount = 0 } = {}) {
     if (requiredRoleIds.length) {
         embed.addFields({
             name: requiredRolesFieldName(requiredRoleIds),
-            value: fieldValue(roleMentions(requiredRoleIds)),
+            value: roleMentions(requiredRoleIds),
             inline: false
         });
     }
@@ -1503,27 +1525,23 @@ function giveawayEmbedColor(giveaway) {
     return colorInt(giveaway.color_hex || DEFAULT_GIVEAWAY_COLOR);
 }
 
-function fieldValue(value) {
-    return `- **${value}**`;
-}
-
 function requiredRolesFieldName(roleIds) {
     return `🔒 ${roleIds.length === 1 ? 'Required Role' : 'Required Roles'}`;
 }
 
 function winnerFieldName(winnerIds) {
-    return `🏆 ${winnerIds.length === 1 ? 'Winner' : 'Winners'}`;
+    return `🏆 Winners (${winnerIds.length})`;
 }
 
 function giveawayMessageContent(giveaway) {
     if ([GIVEAWAY_ENDED, GIVEAWAY_DELETED].includes(giveaway.status)) {
-        return '### 🎉  Giveaway Ended!';
+        return '**🎉  Giveaway Ended!**';
     }
 
     const lines = [];
     const pingRoleIds = normalizeRoleIds(giveaway.ping_role_ids);
     if (pingRoleIds.length) lines.push(roleMentions(pingRoleIds));
-    lines.push('### 🎉  Active Giveaway!  🎉');
+    lines.push('**🎉  Active Giveaway!  🎉**');
     return lines.join('\n');
 }
 
@@ -1538,12 +1556,13 @@ function applyGiveawayFooter(embed) {
 
 async function replyWithGiveawayMessage(interaction, giveaway, config) {
     const entries = await config.giveawayStore.listEntries(giveaway.giveaway_id, { activeOnly: true });
+    const draws = await giveawayMessageDraws(config.giveawayStore, giveaway);
     const embed = buildGiveawayEmbed(giveaway, { participantCount: entries.length });
     const file = logoFile();
     const payload = {
         content: giveawayMessageContent(giveaway),
         embeds: [embed],
-        components: buildGiveawayComponents(giveaway),
+        components: buildGiveawayComponents(giveaway, { drawId: giveawayMessageDrawId(giveaway, draws) }),
         allowedMentions: { parse: [], roles: normalizeRoleIds(giveaway.ping_role_ids) }
     };
     if (file) payload.files = [file];
@@ -1633,13 +1652,18 @@ async function refreshGiveawayMessageNow(client, config, giveawayId, { disabled 
     await pacedGiveawayMessageEdit(message, async () => {
         const entries = await config.giveawayStore.listEntries(giveawayId, { activeOnly: true });
         // The entry refresh may have waited behind an end or reroll while edits were paced.
-        const current = await config.giveawayStore.getGiveaway(giveawayId);
+        let current = await config.giveawayStore.getGiveaway(giveawayId);
+        const draws = await giveawayMessageDraws(config.giveawayStore, current);
+        if (draws.length || current?.last_rerolled_at) {
+            current = await config.giveawayStore.getGiveaway(giveawayId);
+        }
         if (!current || String(current.message_id) !== String(message.id)
             || String(current.channel_id) !== String(giveaway.channel_id)) return null;
         return {
             content: giveawayMessageContent(current),
             embeds: [buildGiveawayEmbed(current, { participantCount: entries.length })],
-            components: buildGiveawayComponents(current, { disabled: disabled === true || current.status !== GIVEAWAY_ACTIVE }),
+            components: buildGiveawayComponents(current, { disabled: disabled === true || current.status !== GIVEAWAY_ACTIVE,
+                drawId: giveawayMessageDrawId(current, draws) }),
             allowedMentions: { parse: [] }
         };
     }).catch(() => { });
@@ -1847,7 +1871,7 @@ function drawWinnerComponents(giveaway, winnerIds, drawId) {
     if (winnerIds.length <= WINNERS_PAGE_SIZE || !drawId) return [];
     return [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`${GIVEAWAY_WINNERS_PREFIX}:${giveaway.giveaway_id}:${winnerDrawKey(drawId)}`)
-            .setLabel('View winners').setStyle(ButtonStyle.Secondary)
+            .setLabel('View Winners').setEmoji('🏆').setStyle(ButtonStyle.Success)
     )];
 }
 
@@ -1902,10 +1926,10 @@ function drawAnnouncementContent(giveaway, winnerIds, { drawType }) {
         return `### ${heading}\n- Nobody joined this giveaway.`;
     }
     if (winnerIds.length > WINNERS_PAGE_SIZE) {
-        return `### ${heading}\n- **${winnerIds.length} winners** won **${prize}**! Select **View winners** to see the full list.`;
+        return `### ${heading}\n- **${winnerIds.length} winners** won **${prize}**!\nSelect **View Winners** to see the full list.`;
     }
     const mentions = winnerIds.map(userId => `<@${userId}>`).join(', ');
-    return `### ${heading}\n- Congratulations ${mentions}! You won **${prize}  <:man_of_culture:1186287184106496112>**`;
+    return `### ${heading}\n- **Congratulations** ${mentions}!\nYou won **${prize}  <:man_of_culture:1186287184106496112>**`;
 }
 
 function linkTextToGiveaway(giveaway, text) {
@@ -2091,16 +2115,16 @@ function buildWinnerEmbeds(giveaway, draw) {
     if (!pages.length) pages.push([]);
     return pages.map((winnerPage, pageIndex) => {
         const embed = new EmbedBuilder()
-            .setTitle(draw.draw_type === 'reroll' ? 'Rerolled winners' : 'Giveaway winners')
+            .setTitle(`${draw.draw_type === 'reroll' ? 'Rerolled Winners' : 'Giveaway Winners'} (${winnerIds.length})`)
             .setColor(colorInt(giveaway.color_hex || DEFAULT_GIVEAWAY_COLOR))
-            .setDescription(winnerPage.map((userId, index) => `${pageIndex * WINNERS_PAGE_SIZE + index + 1}. <@${userId}>`)
+            .setDescription(winnerPage.map((userId, index) => `**${pageIndex * WINNERS_PAGE_SIZE + index + 1}.** <@${userId}>`)
                 .join('\n') || 'No winners were selected.')
             .addFields({ name: 'Prize', value: String(giveaway.prize || 'the prize').slice(0, 1024), inline: false })
             .setFooter({ text: `Page ${pageIndex + 1}/${pages.length} • ${winnerIds.length} winners` });
         const drawnAt = discordTimestampPair(draw.drawn_at);
-        if (drawnAt) embed.addFields({ name: 'Drawn', value: drawnAt, inline: true });
+        if (drawnAt) embed.addFields({ name: 'Drawn', value: drawnAt, inline: false });
         const link = messageLink(giveaway);
-        if (link) embed.addFields({ name: 'Giveaway', value: `[Jump to Giveaway](${link})`, inline: true });
+        if (link) embed.addFields({ name: 'Giveaway', value: `[Jump to Giveaway](${link})`, inline: false });
         return embed;
     });
 }
@@ -2177,13 +2201,14 @@ async function handlePaginationButton(interaction) {
 }
 
 function buildParticipantEmbeds(giveaway, entries, guild = null) {
+    const winners = new Set(giveaway.status === GIVEAWAY_ENDED ? (giveaway.winner_user_ids || []).map(String) : []);
     const pages = chunked(entries, PARTICIPANTS_PAGE_SIZE);
     if (!pages.length) pages.push([]);
     return pages.map((pageEntries, pageIndex) => {
         const embed = applyGiveawayFooter(new EmbedBuilder()
-            .setTitle(`Participants - ${giveawayDisplayLabel(giveaway, { guild })}`)
+            .setTitle(`Participants - ${giveawayDisplayLabel(giveaway, { guild })}`.slice(0, 256))
             .setColor(colorInt(giveaway.color_hex || DEFAULT_GIVEAWAY_COLOR))
-            .setDescription(participantPageDescription(pageEntries, pageIndex, entries.length))
+            .setDescription(participantPageDescription(pageEntries, pageIndex, entries.length, winners))
             .setTimestamp(new Date()));
 
         embed.addFields(
@@ -2196,12 +2221,13 @@ function buildParticipantEmbeds(giveaway, entries, guild = null) {
     });
 }
 
-function participantPageDescription(entries, pageIndex, totalEntries) {
+function participantPageDescription(entries, pageIndex, totalEntries, winners) {
     if (!entries.length) return 'No active participants found.';
     const offset = pageIndex * PARTICIPANTS_PAGE_SIZE;
     const lines = entries.map((entry, index) => {
         const joinedAt = discordTimestampPair(entry.joined_at) || 'Unknown';
-        return `**${offset + index + 1}.** <@${entry.user_id}> - Joined: ${joinedAt}`;
+        const trophy = winners.has(String(entry.user_id)) ? ' 🏆' : '';
+        return `**${offset + index + 1}.** <@${entry.user_id}>${trophy} - Joined: ${joinedAt}`;
     });
     const shownTo = offset + entries.length;
     return `${lines.join('\n')}\n\nShowing ${offset + 1}-${shownTo} of ${totalEntries} participant(s).`;
@@ -2440,7 +2466,7 @@ function shouldRestrictGiveawayChannel(config) {
 
 function drawSummary(action, giveaway, winnerIds, guild = null) {
     const winners = winnerIds.length > WINNERS_PAGE_SIZE
-        ? `${winnerIds.length} selected. Select View winners on the draw announcement for the full list.`
+        ? `${winnerIds.length} selected. Select View Winners on the giveaway or draw announcement for the full list.`
         : winnerIds.length ? winnerIds.map(userId => `<@${userId}>`).join(', ') : 'No winners';
     const label = winnerIds.length === 1 ? 'Winner' : 'Winners';
     const giveawayLabel = giveawayDisplayLabel(giveaway, { guild });

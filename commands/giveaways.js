@@ -55,7 +55,7 @@ class Giveaways {
                     )
                     .addIntegerOption(o =>
                         o.setName('winners')
-                            .setDescription('Number of winners to draw.')
+                            .setDescription('Winners to draw (max 100). Only 20 winners are pinged. For more, a View Winners button is included.')
                             .setRequired(true)
                             .setMinValue(1)
                             .setMaxValue(100)
