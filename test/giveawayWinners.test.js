@@ -33,7 +33,7 @@ function fixture({ count = 100, entries = count } = {}) {
         async updateGiveaway(id, changes) { assert.equal(id, initial.giveaway_id); current = { ...current, ...changes }; return copy(current); }
     };
     const sent = [];
-    const channel = { messages: { fetch: async () => null }, async send(payload) {
+    const channel = { messages: { async fetch() { throw new Error('Message not available in offline fixture'); } }, async send(payload) {
         sent.push(payload);
         return { id: `announcement-${sent.length}` };
     } };
@@ -174,17 +174,107 @@ test('the original giveaway follows the latest reroll while its older announceme
     assert.equal(currentId, controls(f.sent[1])[0].custom_id);
     assert.notEqual(currentId, firstId);
     for (const [customId, draw] of [[firstId, f.draws[0]], [currentId, f.draws[1]]]) {
-        const viewer = click(customId);
+        const viewer = click(customId, { message: { id: customId === currentId ? '400000000000000000' : '500000000000000000' } });
         await giveaways.handleGiveawayButton(viewer.interaction, { giveawayStore: f.store });
         assert.deepEqual(mentions(viewer.edits[0]), draw.winner_user_ids.slice(0, 20));
     }
+    const oldOriginal = click(firstId, { message: { id: '400000000000000000' } });
+    await giveaways.handleGiveawayButton(oldOriginal.interaction, { giveawayStore: f.store });
+    assert.deepEqual(mentions(oldOriginal.edits[0]), f.draws[1].winner_user_ids.slice(0, 20));
 });
 
-test('ended participant pages mark exactly the current winners with trophies across 250 participants', async () => {
+for (const originalMessage of [true, false]) {
+    test(`${originalMessage ? 'original' : 'historical'} winner buttons resolve the correct saved draw when a reroll completes during lookup`, async t => {
+        const f = fixture({ count: 21, entries: 63 });
+        await f.end();
+        await f.store.updateGiveaway(f.initial.giveaway_id, { message_id: '400000000000000000' });
+        const viewer = click(controls(f.sent[0])[0].custom_id, {
+            message: { id: originalMessage ? '400000000000000000' : '500000000000000000' }
+        });
+        const loading = Promise.withResolvers(), release = Promise.withResolvers();
+        t.after(() => release.resolve());
+        let reads = 0;
+        const store = { ...f.store,
+            async listDraws() {
+                assert.deepEqual(viewer.replies, [{ flags: MessageFlags.Ephemeral }]);
+                const snapshot = await f.store.listDraws();
+                if (++reads === 1) {
+                    loading.resolve();
+                    await release.promise;
+                }
+                return snapshot;
+            },
+            async saveDraw() { assert.fail('Viewing winners must not create a draw'); },
+            async updateGiveaway() { assert.fail('Viewing winners must not change the giveaway'); }
+        };
+        const pending = giveaways.handleGiveawayButton(viewer.interaction, { giveawayStore: store });
+        await loading.promise;
+        await f.end({ drawType: 'reroll' });
+        release.resolve();
+        await pending;
+        const expected = f.draws[originalMessage ? 1 : 0];
+        assert.deepEqual(mentions(viewer.edits[0]), expected.winner_user_ids.slice(0, 20));
+        assert.equal(reads, originalMessage ? 2 : 1);
+        assert.deepEqual(viewer.edits[0].allowedMentions, { parse: [] });
+        assertPayloadLimits(viewer.edits[0]);
+    });
+}
+
+test('an original-message lookup stops after bounded retries when each read races another reroll', async () => {
+    const f = fixture({ count: 21, entries: 105 });
+    await f.end();
+    await f.store.updateGiveaway(f.initial.giveaway_id, { message_id: '400000000000000000' });
+    let reads = 0;
+    const store = { ...f.store,
+        async listDraws() {
+            assert.ok(++reads <= 3, 'Draw lookup must not retry indefinitely');
+            const snapshot = await f.store.listDraws();
+            await f.end({ drawType: 'reroll' });
+            return snapshot;
+        },
+        async saveDraw() { assert.fail('A lookup must not draw new winners'); }
+    };
+    const viewer = click(controls(f.sent[0])[0].custom_id, { message: { id: '400000000000000000' } });
+    await giveaways.handleGiveawayButton(viewer.interaction, { giveawayStore: store });
+    assert.equal(reads, 3);
+    assert.match(viewer.edits[0], /winner list couldn’t be loaded.*try again/);
+    assert.equal(f.draws.length, 4);
+});
+
+test('an original-message button never substitutes an older saved draw when the current reroll is missing', async () => {
+    const f = fixture({ count: 21, entries: 42 });
+    await f.end();
+    await f.end({ drawType: 'reroll' });
+    await f.store.updateGiveaway(f.initial.giveaway_id, { message_id: '400000000000000000' });
+    const store = { ...f.store, async listDraws() { return [copy(f.draws[0])]; } };
+    const viewer = click(controls(f.sent[0])[0].custom_id, { message: { id: '400000000000000000' } });
+    await giveaways.handleGiveawayButton(viewer.interaction, { giveawayStore: store });
+    assert.deepEqual(viewer.edits, ['The winner list couldn’t be loaded. Please try again.']);
+});
+
+test('participant pages mark the current reroll after slow entry reads across all 250 participants', async t => {
     const f = fixture({ count: 100, entries: 250 });
-    const [ended, selected] = await f.end();
-    const viewer = click('ww_giveaway:participants');
-    await giveaways.sendParticipantEmbeds(viewer.interaction, { giveawayStore: f.store }, ended);
+    const [ended] = await f.end();
+    const viewer = click('ww_giveaway:participants', { message: { id: '400000000000000000' } });
+    const loading = Promise.withResolvers(), release = Promise.withResolvers();
+    t.after(() => release.resolve());
+    const store = { ...f.store,
+        async getByMessageId() { return [ended.giveaway_id, copy(ended)]; },
+        async listEntries(id, options) {
+            assert.deepEqual(viewer.replies, [{ flags: MessageFlags.Ephemeral }]);
+            assert.equal(id, ended.giveaway_id);
+            assert.deepEqual(options, { activeOnly: true });
+            const entries = await f.store.listEntries();
+            loading.resolve();
+            await release.promise;
+            return entries;
+        }
+    };
+    const pending = giveaways.handleGiveawayButton(viewer.interaction, { giveawayStore: store });
+    await loading.promise;
+    const [, selected] = await f.end({ drawType: 'reroll' });
+    release.resolve();
+    await pending;
     let page = viewer.edits[0];
     const rows = [];
     for (;;) {
@@ -201,12 +291,14 @@ test('ended participant pages mark exactly the current winners with trophies acr
     assert.deepEqual(rows.map(row => row.number), Array.from({ length: 250 }, (_, index) => index + 1));
     assert.equal(new Set(rows.map(row => row.id)).size, 250);
     assert.deepEqual(rows.filter(row => row.trophy).map(row => row.id).sort(), [...selected].sort());
-    assert.ok(rows.every(row => row.joined.includes('<t:')));
+    const joinedAt = Math.floor(Date.parse(f.initial.starts_at) / 1000);
+    assert.ok(rows.every(row => row.joined === `<t:${joinedAt}:F> (<t:${joinedAt}:R>)`));
 });
 
 test('active participant lists have no winner trophies and ended lists follow the latest reroll', async () => {
     const f = fixture({ count: 1, entries: 50 });
     const viewer = click('ww_giveaway:participants');
+    await f.store.updateGiveaway(f.initial.giveaway_id, { winner_user_ids: [f.participants[0].user_id] });
     await giveaways.sendParticipantEmbeds(viewer.interaction, { giveawayStore: f.store }, {
         ...f.initial, winner_user_ids: [f.participants[0].user_id]
     });
@@ -228,6 +320,15 @@ test('active participant lists have no winner trophies and ended lists follow th
     }
     assert.deepEqual(seen, latestWinners);
     assert.equal(ended.status, 'ended');
+});
+
+test('participant lookup reports a removed giveaway instead of using its stale winner snapshot', async () => {
+    const f = fixture({ count: 1 });
+    const [ended] = await f.end();
+    const viewer = click('ww_giveaway:participants');
+    const store = { ...f.store, async getGiveaway() { return null; } };
+    await giveaways.sendParticipantEmbeds(viewer.interaction, { giveawayStore: store }, ended);
+    assert.deepEqual(viewer.edits, ['That giveaway could not be found.']);
 });
 
 test('zero-participant endings show plain zero totals, no winner field and no winner button', async () => {
@@ -383,6 +484,7 @@ test('end and historical reroll buttons resolve their saved draws after a store 
     const storeOptions = { storageMode: 'json', dataFile: path.join(directory, 'giveaways.json'),
         db: { async query() { assert.fail('Winner history must not query MySQL'); } } };
     const persisted = giveaways.createGiveawayStore(storeOptions);
+    await f.store.updateGiveaway(f.initial.giveaway_id, { message_id: '400000000000000000' });
     persisted.localSaveGiveaway(f.initial.giveaway_id, await f.store.getGiveaway(f.initial.giveaway_id), false);
     for (const draw of f.draws) persisted.localSaveDraw(draw.draw_id, draw, false);
     const viewer = click(controls(f.sent[0])[0].custom_id);
@@ -397,7 +499,7 @@ test('end and historical reroll buttons resolve their saved draws after a store 
     await restarted.handleGiveawayButton(oldPrivatePage.interaction, {});
     assert.match(oldPrivatePage.replies[0].content, /expired/);
     for (const [index, announcement] of f.sent.entries()) {
-        const reopened = click(controls(announcement)[0].custom_id);
+        const reopened = click(controls(announcement)[0].custom_id, { message: { id: `announcement-${index + 1}` } });
         await restarted.handleGiveawayButton(reopened.interaction, { giveawayStore: restored });
         assert.deepEqual(mentions(reopened.edits[0]), f.draws[index].winner_user_ids.slice(0, 20));
         const last = click(controls(reopened.edits[0])[1].custom_id);
@@ -405,6 +507,9 @@ test('end and historical reroll buttons resolve their saved draws after a store 
         assert.deepEqual(mentions(last.updates[0]), f.draws[index].winner_user_ids.slice(20));
         assert.equal(reopened.edits[0].embeds[0].toJSON().title, `${index ? 'Rerolled Winners' : 'Giveaway Winners'} (21)`);
     }
+    const original = click(controls(f.sent[0])[0].custom_id, { message: { id: '400000000000000000' } });
+    await restarted.handleGiveawayButton(original.interaction, { giveawayStore: restored });
+    assert.deepEqual(mentions(original.edits[0]), f.draws.at(-1).winner_user_ids.slice(0, 20));
 });
 
 test('missing draws and cross-guild winner buttons never substitute the latest winners', async () => {
@@ -420,7 +525,7 @@ test('missing draws and cross-guild winner buttons never substitute the latest w
     const missing = click(publicId);
     await giveaways.handleGiveawayButton(missing.interaction, { giveawayStore: store });
     assert.equal(drawReads, 1);
-    assert.match(missing.edits[0], /saved winner list could not be found/);
+    assert.match(missing.edits[0], /winner list couldn’t be loaded/);
 });
 
 test('failed acknowledgement of a winner click stops before accessing storage', async () => {

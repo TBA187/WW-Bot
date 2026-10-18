@@ -2093,15 +2093,33 @@ function winnerDrawKey(drawId) {
 async function handleWinnersButton(interaction, config) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const match = /^ww_giveaway:winners:(.+):([a-f0-9]{16})$/.exec(interaction.customId);
-    const giveaway = match && await config.giveawayStore.getGiveaway(match[1]);
+    let giveaway = match && await config.giveawayStore.getGiveaway(match[1]);
     if (!giveaway || String(giveaway.guild_id) !== String(interaction.guildId)) {
         await interaction.editReply('That giveaway could not be found.');
         return;
     }
-    const draws = await config.giveawayStore.listDraws(giveaway.giveaway_id);
-    const draw = draws.find(candidate => winnerDrawKey(candidate.draw_id) === match[2]);
+    const isOriginalMessage = interaction.message?.id && giveaway.message_id
+        && String(interaction.message.id) === String(giveaway.message_id);
+    let draws = await config.giveawayStore.listDraws(giveaway.giveaway_id);
+    let draw;
+    if (isOriginalMessage) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            giveaway = await config.giveawayStore.getGiveaway(match[1]);
+            if (!giveaway || String(giveaway.guild_id) !== String(interaction.guildId)
+                || String(giveaway.message_id) !== String(interaction.message.id)) {
+                await interaction.editReply('That giveaway could not be found.');
+                return;
+            }
+            const drawId = giveaway.status === GIVEAWAY_ENDED ? giveawayMessageDrawId(giveaway, draws) : null;
+            draw = draws.find(candidate => candidate.draw_id === drawId);
+            if (draw || attempt === 2) break;
+            draws = await config.giveawayStore.listDraws(giveaway.giveaway_id);
+        }
+    } else {
+        draw = draws.find(candidate => winnerDrawKey(candidate.draw_id) === match[2]);
+    }
     if (!draw) {
-        await interaction.editReply('The saved winner list could not be found. Please try again.');
+        await interaction.editReply('The winner list couldn’t be loaded. Please try again.');
         return;
     }
     await sendEmbedFollowUp(interaction, buildWinnerEmbeds(giveaway, draw), {
@@ -2137,7 +2155,12 @@ function giveawayHasEnded(giveaway, now = new Date()) {
 
 async function sendParticipantEmbeds(interaction, config, giveaway) {
     const entries = await config.giveawayStore.listEntries(giveaway.giveaway_id, { activeOnly: true });
-    const embeds = buildParticipantEmbeds(giveaway, entries, interaction.guild);
+    const current = await config.giveawayStore.getGiveaway(giveaway.giveaway_id);
+    if (!current) {
+        await interaction.editReply('That giveaway could not be found.');
+        return;
+    }
+    const embeds = buildParticipantEmbeds(current, entries, interaction.guild);
     await sendEmbedFollowUp(interaction, embeds);
 }
 
