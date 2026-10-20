@@ -1,3 +1,4 @@
+// Share paginated guild member loads while keeping caller cancellation independent.
 'use strict';
 
 const { Collection } = require('discord.js');

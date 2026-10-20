@@ -1,6 +1,4 @@
-// -----------------------------------------
-// Auto Send Welcome Message to new members
-// -----------------------------------------
+// Welcome new guild members in the configured welcome channel.
 
 const { AttachmentBuilder } = require('discord.js');
 

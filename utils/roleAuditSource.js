@@ -1,3 +1,4 @@
+// Identify role changes made by bot commands, rewards and self-role panels.
 'use strict';
 
 const { selfRoleChannelID } = require('../config.json');

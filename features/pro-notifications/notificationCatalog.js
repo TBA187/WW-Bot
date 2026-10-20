@@ -1,3 +1,4 @@
+// Define the game-event notifications available to the guild and its members.
 const NOTIFICATION_DEFINITIONS = [
     {
         key: 'alto_mare',

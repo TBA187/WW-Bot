@@ -26,6 +26,8 @@ Optional database connection settings:
 
 Shared connection retry backoff limits repeated connection attempts during outages. Recovery-capable features retain their pending writes until synchronization succeeds.
 
+An unreadable guild-settings, dungeon or notification recovery file is preserved with a `.corrupt-*` suffix and is not reset to empty state. Resolve the file error or restore a verified backup before restarting. Pending local updates must be retained when repairing a file.
+
 ## Server configuration
 
 | Configuration | Purpose |
@@ -109,7 +111,7 @@ Runtime state files are ignored by Git; bundled reference data under `data/` is 
 
 ## Runtime logs
 
-Standard output, errors and full stack traces are appended to UTF-8 monthly files. Log entries use UTC timestamps in `[YYYY-MM-DD HH:MM:SS]` format; component labels remain visible. Grouped command inventories use one timestamp on their header. Monthly filename rollover follows `botTimezone`.
+Standard output, errors and full stack traces are appended to UTF-8 monthly files. Log entries use UTC timestamps. Monthly filename rollover follows `botTimezone`.
 
 Maintenance runs at startup, rollover and every hour. Defaults retain the newest 12 matching monthly files, including the active month. Completed months are removed oldest first when matching logs exceed 100 MiB or free disk space falls below 100 MiB; low-space recovery targets 150 MiB free. The active monthly file is always retained.
 

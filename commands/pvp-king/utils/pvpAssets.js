@@ -1,3 +1,4 @@
+// Supplies the shared images and footer branding used by PvP King messages.
 const path = require('path');
 const { AttachmentBuilder } = require('discord.js');
 
@@ -22,8 +23,6 @@ const pvpBannerImage = 'attachment://serverBanner.png';
 const createPvpFooter = serverName => ({
     text: `WW PvP King Dominion${serverName ? ` • ${serverName}` : ''}`,
     iconURL: 'attachment://serverLogo.png'
-    // text: `WW PvP King System • WW`,
-    // iconURL: interaction.guild.iconURL()
 });
 
 const createPvpLogFooter = serverName => ({

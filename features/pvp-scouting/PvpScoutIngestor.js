@@ -699,13 +699,37 @@ class PvpScoutIngestor {
     }
 
     async handleDelete(message) {
-        if (!message?.id || String(message.channelId || message.channel?.id || '') !== this.channelId) return;
-        if (!canArchiveMessage(message, this.client.user?.id)) return;
-        await this.enqueue(async () => {
-            await this.store.markDeleted(message.id, this.channelId);
-            await this.rebuildGroups();
+        return this.handleDeleteBulk([message]);
+    }
+
+    async handleDeleteBulk(messages) {
+        const eligible = [...messages].filter(message => message?.id
+            && String(message.channelId || message.channel?.id || '') === this.channelId
+            && canArchiveMessage(message, this.client.user?.id));
+        if (!eligible.length) return;
+        const errors = [];
+        const deleted = await this.enqueue(async () => {
+            const saved = [];
+            for (const message of eligible) {
+                try {
+                    await this.store.markDeleted(message.id, this.channelId);
+                    saved.push(message);
+                } catch (error) {
+                    errors.push(error);
+                }
+            }
+            // A bulk delete needs one regroup, even when some writes failed.
+            if (saved.length) await this.rebuildGroups();
+            return saved;
         });
-        await this.feedback.remove(message.id);
+        for (const message of deleted) {
+            try {
+                await this.feedback.remove(message.id);
+            } catch (error) {
+                errors.push(error);
+            }
+        }
+        if (errors.length) throw new AggregateError(errors, 'Some deleted scouting messages could not be updated.');
     }
 
     async rebuildGroups() {

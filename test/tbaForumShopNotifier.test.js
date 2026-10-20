@@ -4,8 +4,33 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     TbaForumShopNotifier,
+    splitMessage,
     splitQuotedMessage
 } = require('../features/tba-forum-shops/TbaForumShopNotifier.js');
+
+test('long quoted posts keep embeds valid and send every customer reply chunk', async () => {
+    const sent = [];
+    const owner = { async send(payload) { sent.push(payload); return { id: `dm-${sent.length}` }; } };
+    const notifier = new TbaForumShopNotifier({
+        client: { users: { cache: new Map([['owner', owner]]) } }, ownerID: 'owner'
+    });
+    const bodyText = 'Customer reply. '.repeat(700);
+    await notifier.notify({ key: 'forumShop', name: 'Shop', emoji: '🛒', topicUrl: 'https://example.com/shop/' }, {
+        forumUsername: 'Customer', postUrl: 'https://example.com/shop/#findComment-1',
+        postedAt: '2026-10-18T12:00:00Z', quotedBodyText: 'Original offer. '.repeat(500), bodyText
+    });
+    const embed = sent[0].embeds[0].toJSON();
+    const characters = embed.title.length + embed.description.length + embed.footer.text.length
+        + embed.fields.reduce((total, field) => total + field.name.length + field.value.length, 0);
+    assert.ok(characters <= 6000, `embed contains ${characters} characters`);
+    const replyChunks = embed.fields.filter(field => field.name.startsWith('Message Content')).map(field => field.value);
+    replyChunks.push(...sent.slice(1).map(payload => {
+        assert.ok(payload.content.length <= 2000);
+        assert.deepEqual(payload.allowedMentions, { parse: [] });
+        return payload.content.replace('**Message Content (continued):**\n', '');
+    }));
+    assert.deepEqual(replyChunks, splitMessage(bodyText));
+});
 
 test('quoted message formatting makes every line small and italic', () => {
     assert.deepEqual(splitQuotedMessage('First line\nSecond line'), [

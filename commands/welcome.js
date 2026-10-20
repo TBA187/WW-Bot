@@ -1,6 +1,4 @@
-// ----------------------
-// /Welcome Command
-// ----------------------
+// Welcomes a newly joined Discord guild member.
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 
 class Welcome {

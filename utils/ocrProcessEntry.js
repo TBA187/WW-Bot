@@ -1,8 +1,8 @@
 'use strict';
 
+// Handles OCR requests in a separate process without loading the bot's services.
 const fs = require('node:fs');
 
-// This entry point loads only OCR, never bot configuration, Discord or MySQL.
 function serveOcrProcess(createWorker = (...args) => require('tesseract.js').createWorker(...args)) {
     let pool;
     let queue = Promise.resolve();

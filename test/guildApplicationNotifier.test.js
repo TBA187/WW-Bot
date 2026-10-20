@@ -5,6 +5,25 @@ const assert = require('node:assert/strict');
 const { MessagePayload } = require('discord.js');
 const { GuildApplicationNotifier } = require('../features/guild-applications/discord/GuildApplicationNotifier.js');
 
+test('long application answers stay within Discord embed limits and retain the source link', () => {
+    const notifier = new GuildApplicationNotifier();
+    const postUrl = 'https://example.com/forum/#findComment-999';
+    const payload = notifier.buildNormalPayload({
+        postUrl, ign: 'Applicant', age: '25', country: 'Denmark',
+        interests: 'Hunting and battles. '.repeat(500),
+        extraInformation: 'Available every evening. '.repeat(500),
+        postedAt: '2026-10-18T12:00:00Z'
+    }, []);
+    const embed = payload.embeds[0].toJSON();
+    const characters = embed.title.length + embed.footer.text.length
+        + embed.fields.reduce((total, field) => total + field.name.length + field.value.length, 0);
+    assert.ok(characters <= 6000, `embed contains ${characters} characters`);
+    assert.ok(embed.fields.length <= 25);
+    assert.ok(embed.fields.every(field => field.value.length <= 1024));
+    assert.equal(embed.fields.at(-1).name, 'Screenshot of Trainer Card');
+    assert.ok(embed.fields.find(field => field.name === 'Full Application').value.includes(postUrl));
+});
+
 function fakeMessage(id, channel) {
     return {
         id,
@@ -35,6 +54,59 @@ function fakeChannel(id, sent) {
     };
     return channel;
 }
+
+test('temporary fetch failures for a saved application message cannot create a duplicate', async () => {
+    const sent = [];
+    const officer = fakeChannel('officer-channel', sent);
+    const failure = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+    officer.messages.fetch = async () => { throw failure; };
+    const notifier = new GuildApplicationNotifier({
+        client: { channels: { cache: new Map([[officer.id, officer]]) } },
+        officerChannelID: officer.id
+    });
+    const record = { postId: '100', postUrl: 'https://example.com/#findComment-100', officerMessageId: 'already-sent' };
+    await assert.rejects(notifier.notify(record), error => error === failure);
+    assert.equal(sent.length, 0);
+    assert.equal(record.officerMessageId, 'already-sent');
+});
+
+test('a deleted application message can still be replaced on retry', async () => {
+    const sent = [];
+    const officer = fakeChannel('officer-channel', sent);
+    officer.messages.fetch = async input => {
+        if (typeof input === 'string') throw Object.assign(new Error('Unknown Message'), { code: 10008 });
+        return new Map();
+    };
+    const notifier = new GuildApplicationNotifier({
+        client: { channels: { cache: new Map([[officer.id, officer]]) } },
+        officerChannelID: officer.id
+    });
+    const record = { postId: '100', postUrl: 'https://example.com/#findComment-100', officerMessageId: 'deleted' };
+    const result = await notifier.notify(record);
+    assert.equal(sent.length, 1);
+    assert.notEqual(result.officerMessageId, 'deleted');
+    assert.equal(result.notificationStatus, 'notified_no_poll');
+});
+
+test('temporary fetch failures for a saved poll retain its ID without sending a replacement', async () => {
+    const sent = [];
+    const officer = fakeChannel('officer-channel', sent);
+    const court = fakeChannel('court-channel', sent);
+    officer.messages.fetch = async () => fakeMessage('existing-officer', officer);
+    const failure = Object.assign(new Error('Missing Permissions'), { code: 50013 });
+    court.messages.fetch = async () => { throw failure; };
+    const notifier = new GuildApplicationNotifier({
+        client: { channels: { cache: new Map([[officer.id, officer], [court.id, court]]) } },
+        officerChannelID: officer.id, courtHouseChannelID: court.id
+    });
+    const record = {
+        postId: '100', postUrl: 'https://example.com/#findComment-100',
+        ign: 'Applicant', ignConfidence: 1, officerMessageId: 'existing-officer', pollMessageId: 'existing-poll'
+    };
+    await assert.rejects(notifier.notify(record), error => error === failure);
+    assert.equal(sent.length, 0);
+    assert.equal(record.pollMessageId, 'existing-poll');
+});
 
 test('creates an immutable 24-hour poll, cross-links both messages, and only pings Officers', async () => {
     const sent = [];

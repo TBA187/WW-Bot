@@ -57,6 +57,30 @@ for (const [mode, options] of [
         assert.deepEqual(run, before);
         assert.deepEqual(calls, []);
     });
+
+    test(`reminder changes for ${mode} report success only after persistence completes`, async () => {
+        const { command, interaction, calls } = fixture(options);
+        let accept, entered;
+        const saving = new Promise(resolve => { accept = resolve; });
+        const started = new Promise(resolve => { entered = resolve; });
+        command.saveRuns = async () => { calls.push('save'); entered(); await saving; };
+        const pending = command.executeReminderCommand(interaction);
+        await started;
+        assert.deepEqual(calls.map(call => typeof call === 'string' ? call : call[0]), ['defer', 'save']);
+        accept();
+        await pending;
+        assert.match(calls.at(-1)[1].content, /Dungeon reminders updated/u);
+    });
+
+    test(`failed reminder persistence for ${mode} restores state without claiming success`, async () => {
+        const { command, run, interaction, calls } = fixture(options);
+        command.saveRuns = async () => { throw new Error('disk full'); };
+        await assert.rejects(command.executeReminderCommand(interaction), /disk full/);
+        assert.equal(run.remindersEnabled, true);
+        assert.equal(run.reminderCounter, 2);
+        assert.equal(calls.some(call => call[0] === 'edit'), false);
+        assert.equal(command.runButtonQueues.size, 0);
+    });
 }
 
 test('a run closing while acknowledgement is pending cannot be re-enabled', async () => {
@@ -67,4 +91,23 @@ test('a run closing while acknowledgement is pending cannot be re-enabled', asyn
         await command.executeReminderCommand(interaction);
         assert.equal(run.remindersEnabled, false);
     }
+});
+
+test('a dungeon close waits until a reminder change has finished saving', async () => {
+    const { command, run, interaction } = fixture({ active_dungeon_runs: 'run', post_reminder: 'no' });
+    let accept, entered;
+    const saving = new Promise(resolve => { accept = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    command.saveRuns = async () => { entered(); await saving; };
+    const reminder = command.executeReminderCommand(interaction);
+    await started;
+    let closed = false;
+    command.closeRunNow = async () => { closed = true; run.closed = true; };
+    const close = command.closeRun(run.id, 'deadline', {});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(closed, false);
+    accept();
+    await Promise.all([reminder, close]);
+    assert.equal(closed, true);
+    assert.equal(command.runButtonQueues.size, 0);
 });

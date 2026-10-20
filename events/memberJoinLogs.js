@@ -1,3 +1,4 @@
+// Record member joins with profile details and available membership history.
 'use strict';
 
 const { buildMemberAuditPayload, auditActor, formatDiscordTime } = require('../utils/memberAuditEmbeds.js');

@@ -1,3 +1,4 @@
+// Log invite creation and deletion with the available audit details.
 const path = require('node:path');
 const { AttachmentBuilder, AuditLogEvent, EmbedBuilder, InviteTargetType, escapeMarkdown } = require('discord.js');
 const { findModerationAuditEntry } = require('./memberExit.js');

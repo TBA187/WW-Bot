@@ -1,7 +1,4 @@
-/**
- * @fileoverview Manage the private message-builder preview, modals and owner-bound editing sessions.
- * Validate drafts before sending or updating messages and record configured audit entries.
- */
+// Manage private message previews, owner-bound editing sessions, and confirmed publication.
 'use strict';
 const { randomBytes } = require('node:crypto');
 const { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelSelectMenuBuilder, ChannelType, CheckboxBuilder, EmbedBuilder, FileUploadBuilder, LabelBuilder, MessageFlags, ModalBuilder, RadioGroupBuilder, StringSelectMenuBuilder, TextDisplayBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
@@ -15,6 +12,7 @@ const FIELD_EDIT_MARKER = '\u2063';
 const CLEAR_FIELD_NOTE = '-# **Note:** Leave fields empty to clear them from the embed!';
 const MENTIONS = { parse: ['everyone', 'users', 'roles'], repliedUser: false };
 const NO_MENTIONS = { parse: [], repliedUser: false };
+const PREVIEW_BUSY = 'This preview is still updating. Wait for it to finish, then try again.';
 const COLOR_PRESETS = [
     ['Crimson', 'crimson', '#DC143C', '🔴'], ['Blood Moon', '#5A0000', '#5A0000', '🔴'], ['Orange', 'orange', '#FFA500', '🟠'], ['Coral', '#FF7F50', '#FF7F50', '🟠'], ['Gold', 'gold', '#D4AF37', '🟡'], ['Yellow', 'yellow', '#FFFF00', '🟡'], ['Neon Green', 'neon green', '#39FF14', '🟢'], ['Green', 'green', '#008000', '🟢'], ['Lime', '#00FF00', '#00FF00', '🟢'], ['Cyan', 'cyan', '#00FFFF', '🟦'], ['Teal', 'teal', '#008080', '🟦'], ['Blue', 'blue', '#0000FF', '🟦'], ['Navy Blue', 'navy blue', '#000080', '🟦'], ['Royal Blue', 'royal blue', '#4169E1', '🔵'], ['Electric Blue', '#00BFFF', '#00BFFF', '🔵'], ['Violet', 'violet', '#8A2BE2', '🟣'], ['Purple', 'purple', '#800080', '🟣'], ['Midnight Purple', 'dark purple', '#4B0082', '🟣'], ['Magenta', '#FF00FF', '#FF00FF', '🟣'], ['Hot Pink', 'hot pink', '#FF69B4', '🩷'], ['Brown', '#8B4513', '#8B4513', '🟤'], ['Copper', '#B87333', '#B87333', '🟤'], ['Silver', 'silver', '#C0C0C0', '⚪'], ['White', 'white', '#FFFFFF', '⚪'], ['Black', 'black', '#000000', '⚫']
 ];
@@ -61,6 +59,7 @@ class EmbedBuilderSession {
         this.modalContexts = new Map();
         this.activeIds = new Set();
         this.processing = false;
+        this.updating = false;
         this.committed = false;
         this.validationActive = Boolean(draft.messageContent || draft.messageAttachments.length || draft.hasEmbedProperties());
         controller.sessions.set(this.sessionId, this);
@@ -203,8 +202,17 @@ class EmbedBuilderSession {
         await interaction.editReply({ content, embeds: this.previewEmbeds(), components });
         this.confirmView();
     }
-    async cancel(interaction) { this.finish(); await interaction.deferUpdate(); await interaction.editReply({ content: 'Embed builder canceled.', embeds: [], attachments: [], components: [] }); }
+    async cancel(interaction) {
+        if (this.updating) return privateError(interaction, PREVIEW_BUSY);
+        if (this.processing || this.committed) return privateError(interaction, 'This message has already been processed.');
+        this.processing = true;
+        try { await interaction.deferUpdate(); }
+        catch (error) { this.processing = false; throw error; }
+        this.finish();
+        await interaction.editReply({ content: 'Embed builder canceled.', embeds: [], attachments: [], components: [] });
+    }
     async commit(interaction) {
+        if (this.updating) return privateError(interaction, PREVIEW_BUSY);
         const errors = validateEmbedDraft(this.draft);
         if (errors.length) {
             this.markChanged();
@@ -237,13 +245,13 @@ class EmbedBuilderSession {
                 result = await this.target.channel.send({ content: this.draft.messageContent || null, embeds, files, allowedMentions: MENTIONS });
         }
         catch (error) {
-            this.processing = false;
             this.controller.logError('Custom embed operation failed', error);
             try {
                 await interaction.editReply({ content: this.builderContent('### Message not saved\nDiscord could not complete the request. No success was recorded.'), embeds: this.previewEmbeds(), components: this.view() });
                 this.confirmView();
             }
             catch { }
+            finally { this.processing = false; }
             return;
         }
         this.processing = false;
@@ -259,6 +267,15 @@ class EmbedBuilderSession {
         catch (error) {
             this.controller.logError('Custom embed audit log failed', error);
         }
+    }
+    async updatePreview(interaction, work) {
+        if (this.updating) return privateError(interaction, PREVIEW_BUSY);
+        if (this.processing || this.committed || this.controller.sessions.get(this.sessionId) !== this)
+            return privateError(interaction, 'This message has already been processed.');
+        // Imports, attachment reads and destination lookups must finish before publication can start.
+        this.updating = true;
+        try { return await work(); }
+        finally { this.updating = false; }
     }
     async audit(interaction, message) {
         const ignored = this.config.ignoredLogChannels || [];
@@ -457,6 +474,14 @@ class BuilderController {
             await privateError(interaction, 'This embed builder belongs to another user.');
             return { handled: true };
         }
+        if (session.processing || session.committed) {
+            await privateError(interaction, 'This message has already been processed.');
+            return { handled: true };
+        }
+        if (session.updating) {
+            await privateError(interaction, PREVIEW_BUSY);
+            return { handled: true };
+        }
         return { session };
     }
     async handleButton(interaction) {
@@ -470,51 +495,49 @@ class BuilderController {
         if (!action)
             return true;
         try {
-            switch (action.action) {
-                case 'modal':
-                    await interaction.showModal(builderModal(session, action.kind));
-                    break;
-                case 'commit':
-                    await session.commit(interaction);
-                    break;
-                case 'cancel':
-                    await session.cancel(interaction);
-                    break;
-                case 'back':
-                    await session.showPage(interaction, 'builder');
-                    break;
-                case 'json':
-                    await session.showPage(interaction, 'json');
-                    break;
-                case 'color':
-                    await session.showPage(interaction, 'color');
-                    break;
-                case 'fields':
-                    await session.showPage(interaction, 'fields');
-                    break;
-                case 'import':
-                    await interaction.showModal(builderModal(session, 'import'));
-                    break;
-                case 'export':
-                    await this.exportJson(interaction, session);
-                    break;
-                case 'color_custom':
-                    await interaction.showModal(builderModal(session, 'color'));
-                    break;
-                case 'color_remove':
-                    session.draft.color = '';
-                    session.markChanged();
-                    await session.showPage(interaction, 'color');
-                    break;
-                case 'field_add':
-                    if (session.draft.fields.length >= MAX_FIELDS)
-                        await privateError(interaction, 'An embed can contain at most 25 fields.');
-                    else
-                        await interaction.showModal(builderModal(session, 'field'));
-                    break;
-                default: if (action.action.startsWith('field_'))
-                    await this.fieldAction(interaction, session, action);
-            }
+            if (action.action === 'commit') await session.commit(interaction);
+            else if (action.action === 'cancel') await session.cancel(interaction);
+            else await session.updatePreview(interaction, async () => {
+                switch (action.action) {
+                    case 'modal':
+                        await interaction.showModal(builderModal(session, action.kind));
+                        break;
+                    case 'back':
+                        await session.showPage(interaction, 'builder');
+                        break;
+                    case 'json':
+                        await session.showPage(interaction, 'json');
+                        break;
+                    case 'color':
+                        await session.showPage(interaction, 'color');
+                        break;
+                    case 'fields':
+                        await session.showPage(interaction, 'fields');
+                        break;
+                    case 'import':
+                        await interaction.showModal(builderModal(session, 'import'));
+                        break;
+                    case 'export':
+                        await this.exportJson(interaction, session);
+                        break;
+                    case 'color_custom':
+                        await interaction.showModal(builderModal(session, 'color'));
+                        break;
+                    case 'color_remove':
+                        session.draft.color = '';
+                        session.markChanged();
+                        await session.showPage(interaction, 'color');
+                        break;
+                    case 'field_add':
+                        if (session.draft.fields.length >= MAX_FIELDS)
+                            await privateError(interaction, 'An embed can contain at most 25 fields.');
+                        else
+                            await interaction.showModal(builderModal(session, 'field'));
+                        break;
+                    default: if (action.action.startsWith('field_'))
+                        await this.fieldAction(interaction, session, action);
+                }
+            });
         }
         catch (error) {
             this.logError('Embed builder component failed', error);
@@ -533,16 +556,18 @@ class BuilderController {
         if (!action)
             return true;
         try {
-            if (action.action === 'color_preset') {
-                session.draft.color = normalizeEmbedColor(interaction.values[0]);
-                session.markChanged();
-                await session.showPage(interaction, 'color');
-            }
-            else if (action.action === 'field_select') {
-                const index = Number(interaction.values[0]);
-                if (Number.isInteger(index) && session.draft.fields[index])
-                    await session.showPage(interaction, 'fields', index, `Selected field ${index + 1}: ${fieldDisplayText(session.draft.fields[index].name)}`);
-            }
+            await session.updatePreview(interaction, async () => {
+                if (action.action === 'color_preset') {
+                    session.draft.color = normalizeEmbedColor(interaction.values[0]);
+                    session.markChanged();
+                    await session.showPage(interaction, 'color');
+                }
+                else if (action.action === 'field_select') {
+                    const index = Number(interaction.values[0]);
+                    if (Number.isInteger(index) && session.draft.fields[index])
+                        await session.showPage(interaction, 'fields', index, `Selected field ${index + 1}: ${fieldDisplayText(session.draft.fields[index].name)}`);
+                }
+            });
         }
         catch (error) {
             this.logError('Embed builder component failed', error);
@@ -588,9 +613,11 @@ class BuilderController {
         const context = session.modalContexts.get(interaction.customId);
         if (!context || context.expiresAt <= Date.now())
             return true;
-        session.modalContexts.delete(interaction.customId);
         try {
-            await this.submitModal(interaction, session, context);
+            await session.updatePreview(interaction, async () => {
+                session.modalContexts.delete(interaction.customId);
+                await this.submitModal(interaction, session, context);
+            });
         }
         catch (error) {
             if (!(error instanceof DraftValidationError)) {

@@ -128,6 +128,31 @@ test('new applications are stored before one officer notification is sent', asyn
     assert.equal(data.records.find(item => item.postId === '2').notificationStatus, 'notified');
 });
 
+test('posts repeated across fetched pages produce one application notification', async t => {
+    const file = tempFile();
+    t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
+    const first = forumPost(1, 100, '2026-06-01T12:00:00.000Z');
+    const next = forumPost(2, 200, '2026-07-13T11:00:00.000Z');
+    const notifications = [];
+    let lastPage = 1;
+    const forum = {
+        async fetchPage(page) {
+            return { lastPage, posts: page === 1 ? (lastPage === 1 ? [first] : [first, next]) : [next] };
+        },
+        async downloadPostImages() { return []; }
+    };
+    const monitor = makeMonitor([], notifications, file, [], 24, forum);
+    await monitor.runOnce();
+    lastPage = 2;
+    await monitor.runOnce();
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(notifications, ['2']);
+    const record = data.records.find(item => item.postId === '2');
+    assert.equal(record.classification, 'application');
+    assert.equal(record.notificationStatus, 'notified');
+    assert.equal(record.officerMessageId, 'officer-2');
+});
+
 test('repeat applications from the same forum user are announced without a waiting period', async () => {
     const posts = [forumPost(1, 9001, '2026-07-12T12:00:00.000Z')];
     const notifications = [];

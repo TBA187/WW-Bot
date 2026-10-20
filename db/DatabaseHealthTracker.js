@@ -1,3 +1,4 @@
+// Tracks database outages and spaces recovery probes without repeating status logs.
 class DatabaseUnavailableError extends Error {
     constructor(lastError, retryAfterMs = 0) {
         const causeCode = lastError?.causeCode || lastError?.code || 'UNKNOWN';

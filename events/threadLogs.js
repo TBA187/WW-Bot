@@ -1,6 +1,4 @@
-// ==================================================
-// LOG Thread Events (Channel Threads & Forum Posts)
-// ==================================================
+// Log thread creation, deletion, and updates, including forum posts.
 
 const { AuditLogEvent, ChannelType } = require('discord.js');
 const {

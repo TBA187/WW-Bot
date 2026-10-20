@@ -1,3 +1,4 @@
+// Let members choose their own in-game notification subscriptions.
 const {
     ActionRowBuilder,
     AttachmentBuilder,

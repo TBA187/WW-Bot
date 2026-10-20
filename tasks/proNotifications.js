@@ -1,3 +1,4 @@
+// Schedule game-event reminders at fixed UTC times for opted-in members.
 const MINUTE_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;

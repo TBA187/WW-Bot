@@ -1,6 +1,4 @@
-// ----------------------------------------------------
-// Dungeon recruitment reminder hook
-// ----------------------------------------------------
+// Dungeon recruitment reminders hook.
 module.exports = {
     name: 'messageCreate',
     async execute(message, config) {

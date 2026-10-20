@@ -1,6 +1,4 @@
-// ===============================
-// Level System - Command Handler
-// ===============================
+// Record command activity and award XP without delaying command responses.
 const xpSettings = require('../../config/xpConfig');
 const { getXPTracksForUser, calculateXpBoostMultiplier } = require('../../utils/xpHelper');
 const { processXp } = require('../../utils/xpEngine');
@@ -9,19 +7,19 @@ const { recordRawActivity, getXpTypeFromTrackInfo } = require('../../utils/xpDbH
 module.exports = {
     name: 'interactionCreate',
     async execute(interaction, commandConfig) {
-        // 1) Only track actual slash commands
+        // Only track actual slash commands
         if (!interaction.isCommand()) return;
 
-        // 2) Ignore bots and DM commands
+        // Ignore bots and DM commands
         if (interaction.user.bot || !interaction.guild) return;
 
-        // 3) Check if COMMAND XP is globally disabled
+        // Check if COMMAND XP is globally disabled
         if (!xpSettings.sources.commands) return;
 
-        // 4) Extract message data for processing
+        // Extract message data for processing
         const { user, guild, channelId, member } = interaction;
 
-        // 5) Hand over to xpHelper.js - Shared logic to check for Master Blacklist, Special XP Tracks, and Global XP Check
+        // Hand over to xpHelper.js - Shared logic to check for Master Blacklist, Special XP Tracks, and Global XP Check
         const tracksToAward = await getXPTracksForUser(member, channelId, commandConfig.db);
         if (tracksToAward.length === 0) return;
 
@@ -32,14 +30,14 @@ module.exports = {
             await recordRawActivity(commandConfig.db, user.id, guild.id, displayName, trackKey, 'command');
         }
 
-        // 6) Calculate XP for COMMANDS (No length bonus XP for Commands)
+        // Calculate XP for COMMANDS (No length bonus XP for Commands)
         let xpGained = Math.floor(Math.random() * (xpSettings.commandXp.max - xpSettings.commandXp.min + 1)) + xpSettings.commandXp.min;
 
-        // 7) Apply XP Boosts if any enabled, else use base 1.0x multiplier
+        // Apply XP Boosts if any enabled, else use base 1.0x multiplier
         const boostMultiplier = calculateXpBoostMultiplier(member, channelId, 'commands');
         xpGained = Math.floor(xpGained * boostMultiplier);
 
-        // 8) Hand over to xpEngine.js - Shared logic to process XP, update DB, and handle level-ups.
+        // Hand over to xpEngine.js - Shared logic to process XP, update DB, and handle level-ups.
         for (const trackInfo of tracksToAward) {
             // Use a separate cooldown string for commands so chatting and commanding don't conflict
             const trackKey = getXpTypeFromTrackInfo(trackInfo);

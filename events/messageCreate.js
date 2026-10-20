@@ -1,6 +1,4 @@
-// ====================
-// Create Bot Messages
-// ====================
+// Handle the write and welcome prefix commands and log published messages.
 
 const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const path = require('path');
@@ -39,7 +37,7 @@ module.exports = {
         { name: 'welcome', prefixes: ['!', '?'] }
     ],
     async execute(message, config) {
-        if (message.author.bot) return;
+        if (message.author.bot || !message.guild || !message.member) return;
         if (!message.content.startsWith('?') && !message.content.startsWith('!')) return;
 
         const allowedRoles = [config.leaderRoleID, config.adminRoleID, config.officerRoleID];

@@ -26,7 +26,8 @@ function fixture(t) {
     const members = new Collection();
     const sent = new Map();
     const deletedThreads = [];
-    const collector = () => new EventEmitter();
+    const historyMessages = new Map();
+    const collector = () => Object.assign(new EventEmitter(), { resetTimer() {} });
     const message = () => ({ url: 'https://discord.com/channels/guild/channel/message',
         createMessageComponentCollector: collector });
     const channel = id => ({ id, messages: { fetch: async () => new Collection() },
@@ -37,10 +38,23 @@ function fixture(t) {
         channels.set(id, channel(id));
     }
     for (const id of [appConfig.historyThreadID, appConfig.historySilverThreadID]) {
+        const entries = new Collection();
+        historyMessages.set(id, entries);
         const thread = Object.assign(Object.create(ThreadChannel.prototype), {
             id, isThread: () => true,
-            send: async payload => { sent.get(id).push(payload); return message(); },
-            messages: { fetch: async () => new Collection([['entry', { delete: async () => deletedThreads.push(id) }]]) }
+            send: async payload => {
+                sent.get(id).push(payload);
+                const entry = { ...message(), id: `entry-${sent.get(id).length}`, author: { id: 'bot' },
+                    createdTimestamp: Date.now(), embeds: payload.embeds,
+                    delete: async () => { deletedThreads.push(id); entries.delete(entry.id); } };
+                entries.set(entry.id, entry);
+                return entry;
+            },
+            messages: { fetch: async ({ before, limit = 100 } = {}) => {
+                const ordered = [...entries].reverse();
+                const start = before ? ordered.findIndex(([messageId]) => messageId === before) + 1 : 0;
+                return new Collection(ordered.slice(start, start + limit));
+            } }
         });
         sent.set(id, []);
         channels.set(id, thread);
@@ -109,7 +123,7 @@ function fixture(t) {
         assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
         fs.rmSync(dir, { recursive: true, force: true });
     });
-    return { stores, config, sent, deletedThreads, roles, members, interaction, client };
+    return { stores, config, sent, deletedThreads, historyMessages, roles, members, interaction, client };
 }
 
 function load(name, config) {
@@ -211,6 +225,169 @@ test('same challenger can open both challenges and buttons write only the origin
     assert.equal(await f.stores.silver.getCooldown('target'), null);
 });
 
+test('large history replies retain every reign within Discord content limits on both servers', async t => {
+    const f = fixture(t);
+    for (const server of ['gold', 'silver']) {
+        const rows = Array.from({ length: 16 }, (_, index) => ({
+            king_id: String(index), king_name: `${server} King ${String(index).padStart(2, '0')} ${'x'.repeat(20)}`,
+            created_at: '2026-01-01 00:00:00', total_wins_after: index + 1, streak_after: 1
+        }));
+        t.mock.method(f.stores[server], 'historyAscending', async () => rows);
+        t.mock.method(f.stores[server], 'countStats', async () => 16);
+        t.mock.method(f.stores[server], 'countHistory', async () => 16);
+        const i = f.interaction(server);
+        i.options.getInteger = () => 15;
+        await load('pvp_history', f.config).execute(i);
+        assert.ok(i.responses.length > 1);
+        assert.ok(i.responses.every(payload => payload.content.length <= 2000));
+        assert.ok(i.responses.every(payload => payload.allowedMentions.parse.length === 0));
+        const content = i.responses.map(payload => payload.content).join('');
+        for (const row of rows) assert.equal(content.split(row.king_name).length - 1, 1);
+        assert.match(content, /Last 15 entries/u);
+        assert.match(content, /is the current PvP King/u);
+        assert.ok(content.includes(server === 'gold' ? f.config.historyThreadID : f.config.historySilverThreadID));
+    }
+});
+
+test('challenge acceptance saves before announcing and ignores simultaneous or stale requests on each server', async t => {
+    const f = fixture(t); await seed(f);
+    const command = load('pvp_challenge', f.config);
+    for (const server of ['gold', 'silver']) {
+        const store = f.stores[server], write = store.upsertChallengeCooldown.bind(store);
+        let release, started;
+        const entered = new Promise(resolve => { started = resolve; });
+        const gate = new Promise(resolve => { release = resolve; });
+        const save = t.mock.method(store, 'upsertChallengeCooldown', async (...args) => {
+            started(); await gate; return write(...args);
+        });
+        const accept = () => {
+            const i = f.interaction(server, `${server}-king`);
+            i.customId = `pvp_accept_${server}-king_challenger`;
+            return i;
+        };
+        const channelId = server === 'gold' ? f.config.pvpKingChannelID : f.config.pvpKingSilverChannelID;
+        const first = command.handleButton(accept());
+        await entered;
+        const duplicate = accept();
+        await command.handleButton(duplicate);
+        assert.match(body(duplicate), /already being processed/u);
+        assert.equal(f.sent.get(channelId).length, 0, 'no success is announced before persistence completes');
+        release(); await first;
+        assert.equal(save.mock.calls.length, 1);
+        assert.equal(f.sent.get(channelId).length, 1);
+        const stored = await store.getCooldown('challenger');
+        const stale = accept();
+        await load('pvp_challenge', f.config).handleButton(stale);
+        assert.match(body(stale), /active cooldown/u);
+        assert.equal(save.mock.calls.length, 1, 'an old request cannot extend the cooldown after a restart');
+        assert.equal(f.sent.get(channelId).length, 1);
+        assert.deepEqual(await store.getCooldown('challenger'), stored);
+    }
+});
+
+test('challenge persistence failures publish no acceptance and release the response guard', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'warn', () => {});
+    const command = load('pvp_challenge', f.config);
+    for (const server of ['gold', 'silver']) {
+        const store = f.stores[server], write = store.upsertChallengeCooldown.bind(store);
+        let calls = 0;
+        t.mock.method(store, 'upsertChallengeCooldown', async (...args) => {
+            if (++calls === 1) throw Object.assign(new Error('Write failed'), { code: 'PVP_DATABASE_UNAVAILABLE' });
+            return write(...args);
+        });
+        const accept = () => {
+            const i = f.interaction(server, `${server}-king`);
+            i.customId = `pvp_accept_${server}-king_challenger`;
+            return i;
+        };
+        const failed = accept();
+        await command.handleButton(failed);
+        const channelId = server === 'gold' ? f.config.pvpKingChannelID : f.config.pvpKingSilverChannelID;
+        assert.match(body(failed), /Could not confirm.*cooldown was saved/u);
+        assert.equal(f.sent.get(channelId).length, 0);
+        assert.equal(await store.getCooldown('challenger'), null);
+        await command.handleButton(accept());
+        assert.equal(calls, 2);
+        assert.equal(f.sent.get(channelId).length, 1);
+    }
+});
+
+test('failed challenge announcements retain the saved cooldown and warn against accepting twice', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'warn', () => {});
+    for (const server of ['gold', 'silver']) {
+        const command = load('pvp_challenge', f.config);
+        const i = f.interaction(server, `${server}-king`);
+        i.customId = `pvp_accept_${server}-king_challenger`;
+        const send = t.mock.method(i.channel, 'send', async () => {
+            throw Object.assign(new Error('Missing permissions'), { code: 50013 });
+        });
+        await command.handleButton(i);
+        assert.match(body(i), /cooldown is saved.*Discord updates failed/u);
+        assert.match(body(i), /do not accept this request again/u);
+        const stored = await f.stores[server].getCooldown('challenger');
+        assert.equal(stored.king_id, `${server}-king`);
+        await command.handleButton(i);
+        assert.equal(send.mock.calls.length, 1);
+        assert.deepEqual(await f.stores[server].getCooldown('challenger'), stored);
+    }
+});
+
+test('crown notifications split large challenger lists without dropping or repeating mentions', async t => {
+    const f = fixture(t); await seed(f);
+    const ids = Array.from({ length: 150 }, (_, index) => String(100000000000000000n + BigInt(index)));
+    for (const server of ['gold', 'silver']) {
+        const store = f.stores[server], record = store.recordCrownEvent.bind(store);
+        t.mock.method(store, 'recordCrownEvent', async options => ({ ...await record(options),
+            usersToNotify: ids.map(challenger_id => ({ challenger_id })) }));
+        await load('pvp_crown', f.config).execute(f.interaction(server));
+        const messages = f.sent.get(server === 'gold' ? f.config.pvpKingChannelID : f.config.pvpKingSilverChannelID);
+        assert.equal(messages.length, 2);
+        assert.ok(messages.every(payload => payload.content.length <= 2000));
+        assert.deepEqual(messages.flatMap(payload => payload.content.split(' ')), ids.map(id => `<@${id}>`));
+        assert.ok(messages.every(payload => payload.allowedMentions.parse.join() === 'users'));
+    }
+});
+
+test('stale leaderboard clicks stay on valid pages and expired updates cannot reject the collector', async t => {
+    const f = fixture(t);
+    t.mock.method(console, 'warn', () => {});
+    for (const server of ['gold', 'silver']) {
+        const rows = Array.from({ length: 11 }, (_, index) => ({ user_id: String(index), king_name: `King ${index}`,
+            total_wins: 11 - index, longest_streak: 1, first_crowned: Date.now(), crowned_at: Date.now() }));
+        t.mock.method(f.stores[server], 'listStats', async () => rows);
+        t.mock.method(f.stores[server], 'countStats', async () => rows.length);
+        t.mock.method(f.stores[server], 'getHistoryInfo', async () => ({ totalKingEntries: 11 }));
+        const i = f.interaction(server);
+        await load('pvp_leaderboard', f.config).execute(i);
+        const collect = i.collectors[0].listeners('collect')[0];
+        const click = f.interaction(server);
+        click.isStringSelectMenu = () => false;
+        click.isButton = () => true;
+        for (const [customId, page] of [['prev_page', 1], ['next_page', 2], ['next_page', 2], ['prev_page', 1], ['prev_page', 1]]) {
+            click.customId = customId;
+            await collect(click);
+            assert.match(click.responses.at(-1).embeds[0].toJSON().footer.text, new RegExp(`Page ${page} of 2`));
+        }
+        click.update = async () => { throw Object.assign(new Error('Expired'), { code: 10062 }); };
+        await assert.doesNotReject(collect(click));
+    }
+});
+
+test('an expired cooldown button acknowledgement never changes notification preferences', async t => {
+    const f = fixture(t);
+    t.mock.method(console, 'log', () => {});
+    for (const server of ['gold', 'silver']) {
+        const i = f.interaction(server);
+        await load('pvp_cooldown', f.config).execute(i);
+        const click = f.interaction(server);
+        click.deferUpdate = async () => { throw Object.assign(new Error('Expired'), { code: 10062 }); };
+        await assert.doesNotReject(i.collectors[0].listeners('collect')[0](click));
+        assert.equal(await f.stores[server].getCooldown('challenger'), null);
+    }
+});
+
 test('Silver crown and delayed reverse update only Silver role, stats, and history thread', async t => {
     const f = fixture(t);
     await seed(f);
@@ -236,6 +413,197 @@ test('Silver crown and delayed reverse update only Silver role, stats, and histo
     assert.equal(f.roles.get(f.config.pvpKingSilverRoleID).members.first().id, 'silver-king');
     assert.deepEqual(f.deletedThreads, [f.config.historySilverThreadID]);
     assert.equal((await f.stores.silver.latestHistory()).king_id, 'silver-king');
+});
+
+test('reverse confirmations recheck Officer permissions before changing either archive', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'log', () => {});
+    for (const server of ['gold', 'silver']) {
+        const i = f.interaction(server);
+        const before = f.stores[server].serializeState();
+        await load('pvp_reverse', f.config).execute(i);
+        const click = f.interaction(server);
+        click.customId = 'confirm_reverse';
+        click.member = { roles: { cache: new Collection() } };
+        await i.collectors[0].listeners('collect')[0](click);
+        assert.match(body(click), /No permission/u);
+        assert.equal(click.responses[0].flags, MessageFlags.Ephemeral);
+        assert.deepEqual(f.stores[server].serializeState(), before);
+    }
+});
+
+test('Gold and Silver reversals delete their crown entry and leave newer moderator posts alone', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'log', () => {});
+    for (const server of ['gold', 'silver']) {
+        await load('pvp_crown', f.config).execute(f.interaction(server));
+        const threadId = server === 'gold' ? f.config.historyThreadID : f.config.historySilverThreadID;
+        const entries = f.historyMessages.get(threadId);
+        const crown = entries.first();
+        let moderatorDeleted = false;
+        entries.set('moderator-post', { ...crown, id: 'moderator-post', author: { id: 'moderator' },
+            delete: async () => { moderatorDeleted = true; } });
+        const i = f.interaction(server);
+        await load('pvp_reverse', f.config).execute(i);
+        const click = f.interaction(server);
+        click.customId = 'confirm_reverse';
+        await i.collectors[0].listeners('collect')[0](click);
+        assert.equal(moderatorDeleted, false);
+        assert.equal(entries.has(crown.id), false);
+        assert.equal(entries.has('moderator-post'), true);
+        assert.match(body(i), /Reversal complete/u);
+        assert.equal((await f.stores[server].latestHistory()).king_id, `${server}-king`);
+    }
+    assert.deepEqual(f.deletedThreads, [f.config.historyThreadID, f.config.historySilverThreadID]);
+});
+
+for (const scenario of ['missing', 'ambiguous']) {
+    test(`${scenario} crown history matches keep messages intact and report the saved reversal on both servers`, async t => {
+        const f = fixture(t); await seed(f);
+        t.mock.method(console, 'log', () => {});
+        t.mock.method(console, 'warn', () => {});
+        for (const server of ['gold', 'silver']) {
+            await load('pvp_crown', f.config).execute(f.interaction(server));
+            const threadId = server === 'gold' ? f.config.historyThreadID : f.config.historySilverThreadID;
+            const entries = f.historyMessages.get(threadId);
+            const crown = entries.first();
+            if (scenario === 'missing') crown.author = { id: 'moderator' };
+            else entries.set('duplicate-entry', { ...crown, id: 'duplicate-entry' });
+            const i = f.interaction(server);
+            await load('pvp_reverse', f.config).execute(i);
+            const click = f.interaction(server);
+            click.customId = 'confirm_reverse';
+            await i.collectors[0].listeners('collect')[0](click);
+            assert.equal((await f.stores[server].latestHistory()).king_id, `${server}-king`);
+            assert.equal(entries.has(crown.id), true);
+            assert.match(body(i), /reversal is saved/u);
+            assert.match(body(i), /No history message was deleted/u);
+            assert.match(body(i), /Do not run.*pvp_reverse.*again/u);
+            assert.doesNotMatch(body(i), /Reversal complete/u);
+        }
+        assert.deepEqual(f.deletedThreads, []);
+    });
+}
+
+test('a crown recorded during history lookup makes the reversal stale without deleting its matched message', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'log', () => {});
+    for (const server of ['gold', 'silver']) {
+        await load('pvp_crown', f.config).execute(f.interaction(server));
+        const threadId = server === 'gold' ? f.config.historyThreadID : f.config.historySilverThreadID;
+        const thread = f.client.channels.cache.get(threadId);
+        const fetch = thread.messages.fetch.bind(thread.messages);
+        let newerHistory;
+        t.mock.method(thread.messages, 'fetch', async options => {
+            const messages = await fetch(options);
+            const result = await f.stores[server].recordCrownEvent({
+                newKingId: 'target', newKingName: 'New King', isDefense: true
+            });
+            newerHistory = result.history;
+            return messages;
+        });
+        const i = f.interaction(server);
+        await load('pvp_reverse', f.config).execute(i);
+        const click = f.interaction(server);
+        click.customId = 'confirm_reverse';
+        await i.collectors[0].listeners('collect')[0](click);
+        assert.equal((await f.stores[server].latestHistory()).id, newerHistory.id);
+        assert.equal(f.historyMessages.get(threadId).size, 1);
+        assert.match(body(i), /latest PvP crown changed/u);
+        assert.doesNotMatch(body(i), /Reversal complete/u);
+    }
+    assert.deepEqual(f.deletedThreads, []);
+});
+
+for (const originalEntryPresent of [true, false]) {
+    test(`a new matching crown posted during reversal stays intact when the original entry is ${originalEntryPresent ? 'present' : 'missing'}`, async t => {
+        const f = fixture(t); await seed(f);
+        t.mock.method(console, 'log', () => {});
+        t.mock.method(console, 'warn', () => {});
+        for (const server of ['gold', 'silver']) {
+            await load('pvp_crown', f.config).execute(f.interaction(server));
+            const threadId = server === 'gold' ? f.config.historyThreadID : f.config.historySilverThreadID;
+            const entries = f.historyMessages.get(threadId);
+            const original = entries.first();
+            if (!originalEntryPresent) entries.clear();
+            const reverse = f.stores[server].reverseLatestCrownEvent.bind(f.stores[server]);
+            let laterDeleted = false;
+            t.mock.method(f.stores[server], 'reverseLatestCrownEvent', async options => {
+                const result = await reverse(options);
+                entries.set('later-crown', { ...original, id: 'later-crown',
+                    delete: async () => { laterDeleted = true; entries.delete('later-crown'); } });
+                return result;
+            });
+            const i = f.interaction(server);
+            await load('pvp_reverse', f.config).execute(i);
+            const click = f.interaction(server);
+            click.customId = 'confirm_reverse';
+            await i.collectors[0].listeners('collect')[0](click);
+            assert.equal(laterDeleted, false);
+            assert.equal(entries.has('later-crown'), true);
+            assert.equal(entries.has(original.id), false);
+            assert.match(body(i), originalEntryPresent ? /Reversal complete/u : /No history message was deleted/u);
+        }
+        assert.equal(f.deletedThreads.length, originalEntryPresent ? 2 : 0);
+    });
+}
+
+test('failed role restoration reports the saved reversal and keeps the current King assigned', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'warn', () => {});
+    for (const server of ['gold', 'silver']) {
+        await load('pvp_crown', f.config).execute(f.interaction(server));
+        const i = f.interaction(server);
+        await load('pvp_reverse', f.config).execute(i);
+        t.mock.method(f.members.get(`${server}-king`).roles, 'add', async () => {
+            throw Object.assign(new Error('Missing permissions'), { code: 50013 });
+        });
+        const click = f.interaction(server);
+        click.customId = 'confirm_reverse';
+        await assert.doesNotReject(i.collectors[0].listeners('collect')[0](click));
+        assert.equal((await f.stores[server].latestHistory()).king_id, `${server}-king`);
+        const roleId = server === 'gold' ? f.config.pvpKingRoleID : f.config.pvpKingSilverRoleID;
+        assert.equal(f.roles.get(roleId).members.first().id, 'target');
+        assert.match(body(i), /reversal is saved/u);
+        assert.match(body(i), /Do not run.*pvp_reverse.*again/u);
+        assert.doesNotMatch(body(i), /Reversal complete/u);
+    }
+});
+
+test('a missing reverse history thread reports incomplete Discord updates after saving', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'warn', () => {});
+    await load('pvp_crown', f.config).execute(f.interaction('silver'));
+    const i = f.interaction('silver');
+    await load('pvp_reverse', f.config).execute(i);
+    f.client.channels.cache.delete(f.config.historySilverThreadID);
+    const click = f.interaction('silver');
+    click.customId = 'confirm_reverse';
+    await assert.doesNotReject(i.collectors[0].listeners('collect')[0](click));
+    assert.equal((await f.stores.silver.latestHistory()).king_id, 'silver-king');
+    assert.equal(f.roles.get(f.config.pvpKingSilverRoleID).members.first().id, 'silver-king');
+    assert.match(body(i), /reversal is saved/u);
+    assert.match(body(i), /Do not run.*pvp_reverse.*again/u);
+    assert.doesNotMatch(body(i), /Reversal complete/u);
+});
+
+test('expired reversal acknowledgements and timeout edits cannot reject their collectors', async t => {
+    const f = fixture(t); await seed(f);
+    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'warn', () => {});
+    const i = f.interaction('gold');
+    const before = f.stores.gold.serializeState();
+    await load('pvp_reverse', f.config).execute(i);
+    const click = f.interaction('gold');
+    click.customId = 'confirm_reverse';
+    click.update = async () => { throw Object.assign(new Error('Expired'), { code: 10062 }); };
+    await assert.doesNotReject(i.collectors[0].listeners('collect')[0](click));
+    assert.deepEqual(f.stores.gold.serializeState(), before);
+    i.editReply = async () => { throw Object.assign(new Error('Expired'), { code: 10062 }); };
+    i.collectors[0].emit('end', new Collection());
+    await new Promise(resolve => setImmediate(resolve));
 });
 
 test('crown starts acknowledgement synchronously and waits for acceptance before fetching members or saving', async t => {

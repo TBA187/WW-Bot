@@ -1,3 +1,4 @@
+// Build role panels. Handles self-service role selections and color previews.
 const {
     ActionRowBuilder,
     AttachmentBuilder,

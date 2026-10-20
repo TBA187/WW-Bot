@@ -1,7 +1,7 @@
-// =======================================================================
-// LOG Channel Events (Text, Voice, Forum, Announcement & Stage Channels)
-// =======================================================================
+// Log channel creation, deletion, and permission or configuration changes.
 
+// Category moves and rapid overwrite changes can outpace the audit log cache.
+// TODO: Correlate category deletion and bulk permission events before attributing them.
 // BUG: When moving a Channel to another Category, it says "Unknow User", otherwise the rest works!
 // BUG: When Creating/Deleting many Role/Member Permission Overwrites fast in a Channel, the bot sometimes ...
 // ... logs duplicates of some of the Role/Memebr events for both Create/Delete! Bulk updating many Channel overwrites at the same time works perfect!
@@ -21,6 +21,11 @@ const {
 } = require('../utils/logHelpers.js');
 
 const channelUpdateCache = new Map();
+
+function scheduleChannelUpdate(oldChannel, channelId, config) {
+    return setTimeout(() => processBatchedUpdate(oldChannel, channelId, config)
+        .catch(error => console.error('[WW LOG] Channel update log failed:', error)), 2500);
+}
 
 function normalizeForumLayout(value) {
     return value === 1 || value === 2 ? value : 0;
@@ -46,9 +51,7 @@ function forumReactionKey(emoji) {
 }
 
 module.exports = {
-    // ---------------------------
-    // Handle Channel Creation ✅
-    // ---------------------------
+    // Channel creation.
     async handleChannelCreate(channel, config) {
         if (!channel.guild) return;
 
@@ -76,29 +79,8 @@ module.exports = {
         const { name: typeName, emoji: typeEmoji } = getChannelTypeInfo(channel.type);
         const channelLabel = channel.type === ChannelType.GuildText ? 'Channel' : typeName;
         const parent = channel.parent ? `${channel.parent.name}` : '*Uncategorized!*';
-        const parentID = channel.parent ? `${channel.parent.id}` : '*No Category ID!*';
         const isCategory = channel.type === ChannelType.GuildCategory;
 
-        // ----- Collect details for Forum Channels -----
-        let details = [];
-        details.push(`- **Name:** <#${channel.id}>`);
-        details.push(`- **Type:** ${typeName}\u2002${typeEmoji}`);
-        details.push(`- **Category:** ${parent} (\`${parentID}\`)`);
-
-        if (channel.topic) details.push(`- **Topic:** \`\`\`${channel.topic}\`\`\``);
-        if (channel.rateLimitPerUser) details.push(`- **Slowmode:** \`${channel.rateLimitPerUser}s\``);
-        if (channel.nsfw) details.push(`- **Age-Restricted:** \`Yes\``);
-        if (channel.bitrate) details.push(`- **Bitrate:** \`${channel.bitrate / 1000}kbps\``);
-        if (channel.userLimit) details.push(`- **User Limit:** \`${channel.userLimit}\``);
-
-        if (channel.type === ChannelType.GuildForum) {
-            if (channel.availableTags && channel.availableTags.length > 0) {
-                details.push(`- **Tags Configured:** ${channel.availableTags.length}`);
-            }
-            details.push(`- **Require Tags:** \`${channel.flags?.has('RequireTag') ? 'Yes' : 'No'}\``);
-        }
-
-        // ----- Default Channels -----
         const viewPerms = formatViewChannelPerms(channel.permissionOverwrites.cache, channel.guild, typeName);
 
         const fields = isCategory ? [
@@ -125,9 +107,7 @@ module.exports = {
         await logChannel.send(logPayload);
     },
 
-    // ---------------------------
-    // Handle Channel Deletion ❌
-    // ---------------------------
+    // Channel deletion.
     async handleChannelDelete(channel, config) {
         if (!channel.guild) return;
 
@@ -166,31 +146,25 @@ module.exports = {
         await logChannel.send(logPayload);
     },
 
-    // ---------------------------
-    // Handle Channel Updates 🔄
-    // ---------------------------
+    // Batch channel updates before comparing their settings.
     async handleChannelUpdate(oldChannel, newChannel, config) {
+        if (config.shutdownSignal?.aborted) return;
         if (!newChannel.guild || !newChannel.guild.channels.cache.has(newChannel.id)) return;
         if (isBlockedLogChannel(newChannel.id, config.ignoredLogChannels)) return;
 
         const channelId = newChannel.id;
 
-        // Handle Channel Batch Updates
+        // Keep the first snapshot while Discord delivers the rest of the same edit.
         if (channelUpdateCache.has(channelId)) {
             const cached = channelUpdateCache.get(channelId);
-            clearTimeout(cached.timeout); // If this channel is already in the queue, reset the timer!
+            clearTimeout(cached.timeout);
 
-            cached.timeout = setTimeout(() => {
-                processBatchedUpdate(cached.oldChannel, channelId, config);
-            }, 2500); // Wait 2.5 seconds for changes to settle
+            cached.timeout = scheduleChannelUpdate(cached.oldChannel, channelId, config);
 
             return;
         }
 
-        // If it's the first change, create a new entry in the queue
-        const timeout = setTimeout(() => {
-            processBatchedUpdate(oldChannel, channelId, config);
-        }, 2500);
+        const timeout = scheduleChannelUpdate(oldChannel, channelId, config);
 
         channelUpdateCache.set(channelId, { oldChannel, timeout });
     }
@@ -198,6 +172,7 @@ module.exports = {
 
 async function processBatchedUpdate(oldChannel, channelId, config) {
     channelUpdateCache.delete(channelId);
+    if (config.shutdownSignal?.aborted) return;
 
     const newChannel = oldChannel.guild.channels.cache.get(channelId);
     if (!newChannel) return;
@@ -206,6 +181,7 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
     if (!logChannel) return;
 
     await sleep(1500);
+    if (config.shutdownSignal?.aborted) return;
     let logEntry = null;
     try {
         const fetchedLogs = await newChannel.guild.fetchAuditLogs({ limit: 100 });
@@ -223,7 +199,7 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
         });
     } catch (err) { console.error(err); }
 
-    const executor = logEntry ? {
+    const executor = logEntry?.executor ? {
         mention: `<@${logEntry.executor.id}>`,
         username: logEntry.executor.tag,
         id: logEntry.executor.id
@@ -240,19 +216,19 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
     // ---------------------------
     let changes = [];
 
-    // 1) Name Change
+    // Name change
     if (oldChannel.name !== newChannel.name) {
         changes.push(`- **Name Updated:**\u2002\`${oldChannel.name}\`  ➔  \`${newChannel.name}\``);
     }
 
-    // 2) Topic/Description
+    // Topic or description.
     if ((oldChannel.topic || '') !== (newChannel.topic || '')) {
         const oldT = oldChannel.topic || '*No topic*';
         const newT = newChannel.topic || '*No topic*';
         changes.push(`- **Topic Changed:**\n**From:** \`\`\`${oldT}\`\`\`\n**To:** \`\`\`${newT}\`\`\``);
     }
 
-    // 3) Slowmode (Rate Limit)
+    // Slowmode (rate limit).
     if (oldChannel.rateLimitPerUser !== newChannel.rateLimitPerUser) {
         const formatSlow = (s) => (s === undefined || s === null) ? 'Off' : (s === 0 ? 'Off' : `${s}s`);
         const oldS = formatSlow(oldChannel.rateLimitPerUser);
@@ -260,17 +236,17 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
         if (oldS !== newS) changes.push(`- **Slowmode:** \`${oldS}\` ➔ \`${newS}\``);
     }
 
-    // 4) Age-Restricted Channel (NSFW Status)
+    // Age-restricted channel (NSFW status).
     if (oldChannel.nsfw !== newChannel.nsfw) {
         changes.push(`- **Age-Restricted (NSFW):** \`${oldChannel.nsfw ? 'Enabled' : 'Disabled'}\` ➔ \`${newChannel.nsfw ? 'Enabled' : 'Disabled'}\``);
     }
 
-    // 5) Type Change
+    // Channel type.
     if (oldChannel.type !== newChannel.type) {
         changes.push(`- **Channel Type:** \`${oldTypeName}\` ➔ \`${typeName}\``);
     }
 
-    // 6) Hide After Inactivity
+    // Hide threads after inactivity.
     const archiveChange = logEntry?.changes?.find(c => c.key === 'default_auto_archive_duration');
     const oldArchive = archiveChange ? archiveChange.old : oldChannel.defaultAutoArchiveDuration;
     const newArchive = archiveChange ? archiveChange.new : newChannel.defaultAutoArchiveDuration;
@@ -288,28 +264,28 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
         if (oldD !== newD) changes.push(`- **Hide Threads after inactivity:** \`${oldD}\` ➔ \`${newD}\``);
     }
 
-    // 7.1) Voice Channel: Bitrate
+    // Voice channel bitrate.
     if (oldChannel.bitrate !== newChannel.bitrate) {
         changes.push(`- **Bitrate:** \`${oldChannel.bitrate / 1000}kbps\` ➔ \`${newChannel.bitrate / 1000}kbps\``);
     }
 
-    // 7.2) Voice Channel: User Limit
+    // Voice channel user limit.
     if (oldChannel.userLimit !== newChannel.userLimit) {
         changes.push(`- **User Limit:** \`${oldChannel.userLimit || '∞'}\` ➔ \`${newChannel.userLimit || '∞'}\``);
     }
 
-    // 7.3) Voice Channel: Region Override
+    // Voice channel region override.
     if (oldChannel.rtcRegion !== newChannel.rtcRegion) {
         changes.push(`- **Region Override:** \`${oldChannel.rtcRegion || 'Automatic'}\` ➔ \`${newChannel.rtcRegion || 'Automatic'}\``);
     }
 
-    // 7.4) Voice Channel: Video Quality Mode
+    // Voice channel video quality.
     if (oldChannel.videoQualityMode !== newChannel.videoQualityMode) {
         const getVQM = (mode) => mode === 1 ? 'Auto' : (mode === 2 ? '720p/1080p' : 'Unknown');
         changes.push(`- **Video Quality:** \`${getVQM(oldChannel.videoQualityMode)}\` ➔ \`${getVQM(newChannel.videoQualityMode)}\``);
     }
 
-    // 8) Forum Channels Specifics
+    // Forum layout, sorting, reactions, slowmode, and tags.
     if (newChannel.type === ChannelType.GuildForum) {
         const oldLayout = normalizeForumLayout(oldChannel.defaultForumLayout);
         const newLayout = normalizeForumLayout(newChannel.defaultForumLayout);
@@ -358,17 +334,17 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
         });
     }
 
-    // 9) Category (Parent)
+    // Parent category.
     if (oldChannel.parentId !== newChannel.parentId) {
         changes.push(`- **Category changed:** \`${oldChannel.parent?.name || '*None*'}\` ➔ \`${newChannel.parent?.name || '*None*'}\``);
     }
 
-    // 10) Category Permissions Sync Status
+    // Category permission sync.
     if (Boolean(oldChannel.permissionsLocked) !== Boolean(newChannel.permissionsLocked)) {
         changes.push(`- **Category Sync:** \`${newChannel.permissionsLocked ? 'Synced with Category' : 'Custom Permissions'}\``);
     }
 
-    // 11) Channel Permission Overwrites
+    // Role and member permission overwrites.
     const oldOverwrites = oldChannel.permissionOverwrites.cache;
     const newOverwrites = newChannel.permissionOverwrites.cache;
     if (!oldOverwrites.equals(newOverwrites)) {
@@ -444,7 +420,7 @@ async function processBatchedUpdate(oldChannel, channelId, config) {
         fields
     );
 
-    await logChannel.send(logPayload);
+    if (!config.shutdownSignal?.aborted) await logChannel.send(logPayload);
 }
 
 module.exports.normalizeForumLayout = normalizeForumLayout;

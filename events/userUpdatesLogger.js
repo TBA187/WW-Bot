@@ -1,7 +1,4 @@
-// ========================================
-// --------- Detect User Updates ---------
-// Server/Global Avatar, Username & Nickname updates
-// ========================================
+// Log profile and guild-member changes and maintain the profile lookup cache.
 
 const path = require('node:path');
 const { AttachmentBuilder, AuditLogEvent, EmbedBuilder, escapeMarkdown } = require('discord.js');

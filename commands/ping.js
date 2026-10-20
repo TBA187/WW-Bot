@@ -1,7 +1,4 @@
-/**
- * @fileoverview Report gateway latency and measured reply latency through /ping.
- * Provides a public connectivity check for White Walker members.
- */
+// Report gateway and reply latency through the public ping command.
 'use strict';
 
 const { SlashCommandBuilder } = require('discord.js');

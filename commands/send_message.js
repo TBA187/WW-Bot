@@ -1,7 +1,4 @@
-/**
- * @fileoverview Expose /send_message and Edit Bot Embed (Officer) for Leaders, Admins and Officers.
- * Open private message previews for composing, importing and editing posts before publication.
- */
+// Open private message builders for staff to compose or edit bot messages.
 'use strict';
 const { SlashCommandBuilder, ContextMenuCommandBuilder, ApplicationCommandType, ChannelType, MessageFlags } = require('discord.js');
 const { EmbedDraft, draftFromMessage, expandLiteralLineBreaks, applyWhiteWalkerBrandingDefaults } = require('../features/message-builder/draft.js');
@@ -72,9 +69,17 @@ class SendMessage {
             }, draft: draftFromMessage(message) });
         await session.open(interaction);
     }
-    handleButton(interaction) { return this.controller.handleButton(interaction); }
-    handleSelect(interaction) { return this.controller.handleSelect(interaction); }
+    async handleComponent(interaction, method) {
+        if (!interaction.customId?.startsWith('send_message:')) return false;
+        if (!this.canBuild(interaction.member)) {
+            await interaction.reply({ content: '### No permission!', flags: MessageFlags.Ephemeral });
+            return true;
+        }
+        return this.controller[method](interaction);
+    }
+    handleButton(interaction) { return this.handleComponent(interaction, 'handleButton'); }
+    handleSelect(interaction) { return this.handleComponent(interaction, 'handleSelect'); }
     handleSelectMenu(interaction) { return this.handleSelect(interaction); }
-    handleModal(interaction) { return this.controller.handleModal(interaction); }
+    handleModal(interaction) { return this.handleComponent(interaction, 'handleModal'); }
 }
 module.exports = SendMessage;

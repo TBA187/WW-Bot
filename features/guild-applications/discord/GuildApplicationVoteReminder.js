@@ -8,6 +8,7 @@ const {
     VOTE_REMINDER_INTERVAL_MS
 } = require('../constants.js');
 const { findRecentBotMessage } = require('../../../utils/discordMessageHistory.js');
+const { shutdownError } = require('../../../utils/abortable.js');
 
 class GuildApplicationVoteReminder {
     constructor(options = {}) {
@@ -21,11 +22,13 @@ class GuildApplicationVoteReminder {
         this.interval = null;
         this.running = false;
         this.started = false;
+        this.stopped = false;
     }
 
     async start() {
         if (this.started) return;
         this.started = true;
+        this.stopped = false;
         this.interval = setInterval(() => {
             this.runOnce().catch(error => console.error('[WW LOG] Guild Application vote reminder failed:', error));
         }, this.intervalMs);
@@ -34,9 +37,14 @@ class GuildApplicationVoteReminder {
     }
 
     stop() {
+        this.stopped = true;
         if (this.interval) clearInterval(this.interval);
         this.interval = null;
         this.started = false;
+    }
+
+    checkRunning() {
+        if (this.stopped) throw shutdownError();
     }
 
     async getGuild() {
@@ -62,6 +70,7 @@ class GuildApplicationVoteReminder {
 
         // REST pagination avoids the gateway member-search request used by guild.members.fetch().
         while (true) {
+            this.checkRunning();
             const members = await guild.members.list({ limit: 1000, after, cache: false });
             for (const member of members.values()) {
                 if (!member.user?.bot && member.roles?.cache?.has(this.officerRoleId)) officerIds.add(member.id);
@@ -82,6 +91,7 @@ class GuildApplicationVoteReminder {
         for (const answer of pollMessage.poll.answers.values()) {
             let after;
             while (true) {
+                this.checkRunning();
                 const voters = await answer.voters.fetch({ limit: 100, after });
                 for (const user of voters.values()) {
                     if (!user.bot) voterIds.add(user.id);
@@ -120,11 +130,13 @@ class GuildApplicationVoteReminder {
     }
 
     async processCandidate(record, now, officerIds, courtChannel) {
+        this.checkRunning();
         const stage = this.reminderStage(record, now);
         if (!stage) return false;
 
         const pollMessage = await courtChannel.messages.fetch(record.pollMessageId);
         const voterIds = await this.fetchPollVoterIds(pollMessage);
+        this.checkRunning();
         const officerVotes = [...voterIds].filter(userId => officerIds.has(userId)).length;
         const requiredVotes = Math.ceil(officerIds.size / 2);
 
@@ -152,6 +164,7 @@ class GuildApplicationVoteReminder {
                     + 'duplicate send skipped.'
                 );
             } else {
+                this.checkRunning();
                 reminder = await courtChannel.send({
                     content: this.reminderContent(record, stage.hours),
                     allowedMentions: { parse: [], roles: [this.officerRoleId] }
@@ -166,25 +179,32 @@ class GuildApplicationVoteReminder {
     }
 
     async runOnce() {
-        if (this.running) return false;
+        if (this.stopped || this.running) return false;
         this.running = true;
         try {
             const now = this.clock();
             const candidates = await this.store.voteReminderCandidates(now);
+            this.checkRunning();
             if (!candidates.length) return true;
 
             const guild = await this.getGuild();
+            this.checkRunning();
             const courtChannel = await this.getCourtChannel();
+            this.checkRunning();
             const officerIds = await this.fetchOfficerIds(guild);
 
             for (const record of candidates) {
                 try {
                     await this.processCandidate(record, now, officerIds, courtChannel);
                 } catch (error) {
+                    if (error.code === 'BOT_SHUTTING_DOWN') return false;
                     console.error(`[WW LOG] Guild Application vote reminder ${record.postId} failed:`, error);
                 }
             }
             return true;
+        } catch (error) {
+            if (error.code === 'BOT_SHUTTING_DOWN') return false;
+            throw error;
         } finally {
             this.running = false;
         }

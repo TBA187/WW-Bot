@@ -1,3 +1,4 @@
+// Publish and refresh role panels and route their interactive controls.
 const {
     ChannelType,
     MessageFlags,

@@ -1,6 +1,4 @@
-// ==========================
-// Utility - XP Database Helper
-// ==========================
+// Load XP tracks, rewards and activity totals with cached outage fallbacks.
 
 const { getXpStore } = require('./xpStore');
 

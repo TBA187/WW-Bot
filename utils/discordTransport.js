@@ -1,5 +1,6 @@
 'use strict';
 
+// Keeps interaction callbacks responsive and records Discord request timings.
 const { AsyncLocalStorage } = require('node:async_hooks');
 const diagnostics = require('node:diagnostics_channel');
 const { performance } = require('node:perf_hooks');

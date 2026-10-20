@@ -1,6 +1,4 @@
-// =====================================================
-// LOG MEMBER LEAVE, KICK, BAN, UNBAN, AND TIMEOUT EVENTS
-// =====================================================
+// Log member LEAVE, KICK, BAN, UNBAN, & TIMEOUT changes.
 const { AuditLogEvent, Events, escapeMarkdown } = require('discord.js');
 const { buildMemberAuditPayload, auditActor, formatDiscordTime } = require('../utils/memberAuditEmbeds.js');
 const { fetchGuildMemberRoster } = require('../utils/guildMemberRoster.js');

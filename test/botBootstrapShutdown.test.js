@@ -16,7 +16,7 @@ function deferred() {
     return { promise, resolve };
 }
 
-test('actual index startup cannot restore stores, register commands, login or start ready tasks after Ctrl+C', async () => {
+for (const cleanupFailure of [false, true]) test(`actual index startup stops after Ctrl+C${cleanupFailure ? ' even if a cleanup throws' : ''}`, async () => {
     const databaseReady = deferred();
     const calls = [];
     const processHandlers = new Map();
@@ -35,7 +35,7 @@ test('actual index startup cannot restore stores, register commands, login or st
     }
     class FakeStore {
         restore() { calls.push('restore'); return Promise.resolve(); }
-        stopSyncLoop() {}
+        stopSyncLoop() { if (cleanupFailure) throw new Error('Feature cleanup failed'); }
         startSyncLoop() { calls.push('start sync'); }
         autocomplete() { return Promise.resolve([]); }
     }
@@ -87,16 +87,32 @@ test('actual index startup cannot restore stores, register commands, login or st
         'fs': {}, 'path': path
     };
     const root = path.resolve(__dirname, '..');
-    vm.runInNewContext(fs.readFileSync(path.join(root, 'index.js'), 'utf8'), {
-        __dirname: root, require: name => {
-            if (!(name in imports)) throw new Error('Unexpected startup import: ' + name);
-            if (name === './db/db-conn.js') calls.push('database imported');
-            return imports[name];
-        },
-        process: fakeProcess,
-        console: { log() {}, warn() {}, error() {} },
-        setTimeout, clearTimeout, setInterval, clearInterval, Map, Set
-    });
+    const loaded = new Map();
+    function loadLocal(file) {
+        if (loaded.has(file)) return loaded.get(file).exports;
+        const module = { exports: {} };
+        loaded.set(file, module);
+        vm.runInNewContext(fs.readFileSync(file, 'utf8'), {
+            module, exports: module.exports, __dirname: path.dirname(file),
+            require: name => {
+                const normalized = name.startsWith('.')
+                    ? './' + path.relative(root, path.resolve(path.dirname(file), name)).replaceAll('\\', '/') : name;
+                if (normalized === './db/db-conn.js') calls.push('database imported');
+                if (normalized in imports) return imports[normalized];
+                if (normalized === 'node:path') return path;
+                if (normalized === 'node:fs') return {};
+                if (normalized === './features/guild-settings/GuildSettingsStore.js') return {
+                    GuildSettingsStore: class { constructor() { this.cache = new Map(); } stop() {} }
+                };
+                if (normalized.startsWith('./app/')) return loadLocal(path.resolve(root, normalized));
+                throw new Error('Unexpected startup import: ' + normalized);
+            },
+            process: fakeProcess, console: { log() {}, warn() {}, error() {} },
+            setTimeout, clearTimeout, setInterval, clearInterval, Map, Set
+        }, { filename: file });
+        return module.exports;
+    }
+    loadLocal(path.join(root, 'index.js'));
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(calls, ['logging started', 'database imported']);
     await processHandlers.get('SIGINT')();

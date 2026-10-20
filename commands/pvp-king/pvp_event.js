@@ -1,8 +1,5 @@
 // Shows each server's configured PvP event or the preserved finished event results.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_event
-// ----------------------
 const {
     SlashCommandBuilder,
     EmbedBuilder,

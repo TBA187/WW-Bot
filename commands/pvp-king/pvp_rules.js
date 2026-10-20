@@ -1,3 +1,4 @@
+// Shows the PvP King rules.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
 const { SlashCommandBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const path = require('path');

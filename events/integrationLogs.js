@@ -1,6 +1,4 @@
-// ================================
-// LOG Webhook & Integration Events
-// ================================
+// Log webhook and integration changes with their audit context.
 
 const { AuditLogEvent, ChannelType } = require('discord.js');
 

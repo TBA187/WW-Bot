@@ -1,6 +1,4 @@
-// ==========================
-// Utility - XP Helper
-// ==========================
+// Resolve eligible XP tracks and activity multipliers for a guild member.
 const xpSettings = require('../config/xpConfig');
 const { fetchSpecialTracks } = require('./xpDbHelper');
 

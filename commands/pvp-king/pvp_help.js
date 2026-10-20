@@ -1,8 +1,5 @@
+// Lists the PvP King commands and the server channels where members can use them.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_help
-// ----------------------
-
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const { getServerLogo, createPvpFooter } = require('./utils/pvpAssets.js');
 
@@ -12,7 +9,6 @@ class PvPKingHelp {
         this.pvpServerEmoji = config.pvpServerEmoji;
         this.pvpServerColor = config.pvpServerColor;
         this.name = "pvp_help";
-        this.commandMap = config.commandMap;
         this.pvpKingChannelID = config.pvpKingChannelID;
         this.data = new SlashCommandBuilder()
             .setName('pvp_help')
@@ -45,7 +41,7 @@ class PvPKingHelp {
             embeds: [embed],
             files: [getServerLogo()]
         });
-
+        
         // // Loop through all commands
         // for (const command of this.commandMap.values()) {
         //     if (!command.data) continue;

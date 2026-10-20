@@ -1,7 +1,5 @@
+// Shows a member's crown, defense and streak statistics for the selected PvP server.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_stats
-// ----------------------
 const { SlashCommandBuilder, MessageFlags, EmbedBuilder } = require('discord.js');
 const { getServerLogo, createPvpFooter } = require('./utils/pvpAssets.js');
 const { replyMissingMemberOption, stopIfOnCooldown } = require('./utils/pvpHelper.js');
@@ -58,7 +56,6 @@ class PvpStats {
                 .addFields(
                     { name: `🔥\u2002Current Win Streak:\u2002${stats.current_streak ?? 0}`, value: '', inline: false },
                     { name: `⚔️\u2002Longest Streak:\u2002${stats.longest_streak ?? 0}`, value: '', inline: false },
-                    // { name: `💥\u2002Total Dethrones:\u2002${stats.total_crown_losses ?? 0}`, value: '', inline: false },
                     {
                         name: `🏆\u2002Total Wins:\u2002${stats.total_wins ?? 0}`,
                         value:

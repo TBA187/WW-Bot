@@ -1,7 +1,5 @@
+// Shows challenge cooldowns and lets members toggle expiry notifications.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_cooldown
-// ----------------------
 const { SlashCommandBuilder, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
 const { formatNowMinute, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');
 
@@ -52,7 +50,6 @@ class PvpCooldown {
             const lastChallenge = cooldown?.last_challenge;
             let isNotifyEnabled = cooldown?.notify_on_expire === 1;
 
-            // --- Logic for Cooldown State ---
             const lastChallengeDate = lastChallenge ? new Date(lastChallenge + 'Z') : null;
             const cooldownMs = 48 * 60 * 60 * 1000;
             const now = new Date();
@@ -61,7 +58,6 @@ class PvpCooldown {
                 (now - lastChallengeDate < cooldownMs) &&
                 (lastChallengeKing_id === currentKing.id);
 
-            // Helper function to build the message dynamically
             const getMessageContent = (isExpired = false) => {
                 let header = `# ⏱️ PvP King Cooldown Status — ${this.pvpServerName} ${this.pvpServerEmoji}\n`;
                 let statusSection = `### ✅  You do not have any cooldowns!\n- You can challenge the PvP King (<@${currentKing.id}>) with the \`/pvp_challenge\` command in <#${this.pvpKingChannelID}>`;
@@ -94,7 +90,6 @@ class PvpCooldown {
                 return header + statusSection + notifySection;
             };
 
-            // --- Button Logic ---
             const getButtons = (disabled = false) => {
                 const btn = new ButtonBuilder()
                     .setCustomId('toggle_pvp_notify')
@@ -116,12 +111,12 @@ class PvpCooldown {
             });
 
             collector.on('collect', async i => {
-                if (i.user.id !== interaction.user.id) return i.reply({ content: '❌ Not for you!', flags: MessageFlags.Ephemeral });
-
-                await i.deferUpdate();
-
                 try {
-                    // Fetch the MOST RECENT state from the database
+                    if (i.user.id !== interaction.user.id) return await i.reply({ content: '❌ Not for you!', flags: MessageFlags.Ephemeral });
+
+                    await i.deferUpdate();
+
+                    // Another open panel may have changed the preference since this one loaded.
                     const latestCooldown = await this.db.getCooldown(i.user.id);
                     const hasChallenged = Boolean(latestCooldown);
                     const currentDbState = hasChallenged ? (latestCooldown.notify_on_expire === 1) : false;

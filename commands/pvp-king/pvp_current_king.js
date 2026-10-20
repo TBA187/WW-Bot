@@ -1,7 +1,5 @@
+// Displays the current PvP King and their recorded wins.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_current_king
-// ----------------------
 const { SlashCommandBuilder, MessageFlags, EmbedBuilder } = require('discord.js');
 const { getServerLogo, createPvpFooter } = require('./utils/pvpAssets.js');
 const { formatNowMinute, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');

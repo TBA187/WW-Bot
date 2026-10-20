@@ -1,6 +1,4 @@
-// ============================
-// Level System - Rank Command
-// ============================
+// Display a member's XP totals and progress for a global or special track.
 
 const { SlashCommandBuilder, EmbedBuilder, AttachmentBuilder, MessageFlags } = require('discord.js');
 const { formatNumber } = require('../../utils/xpFormatter');
@@ -8,24 +6,7 @@ const xpMath = require('../../utils/xpMath');
 const xpSettings = require('../../config/xpConfig');
 const { resolveXpTrack, fetchXpTrackAutocompleteChoices } = require('../../utils/xpDbHelper');
 const path = require('path');
-
-function formatTrackingSince(value) {
-    if (!value) return 'XP tracking start date is not recorded yet.';
-
-    const date = value instanceof Date ? value : new Date(value);
-    if (Number.isNaN(date.getTime())) return 'XP tracking start date is not recorded yet.';
-
-    const dateParts = new Intl.DateTimeFormat('en-GB', {
-        year: 'numeric',
-        month: 'short',
-        day: '2-digit'
-    }).formatToParts(date);
-    const partByType = Object.fromEntries(dateParts.map(part => [part.type, part.value]));
-    const monthNumber = String(date.getMonth() + 1).padStart(2, '0');
-    const formatted = `${partByType.year}-${monthNumber}-${partByType.day}`;
-
-    return `XP tracked since ${formatted}`;
-}
+const { formatTrackingSince, getTrackRequirementDisplay } = require('../../features/levels/presentation.js');
 
 function formatVoiceTime(minutes) {
     const totalMinutes = Math.max(0, Math.floor(Number(minutes || 0)));
@@ -46,41 +27,6 @@ function capitalizeDisplayName(name) {
     return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
-function getTrackRequirementDisplay(trackInfo) {
-    const roleLabel = trackInfo.roleIds.length === 1 ? 'XP-Role' : 'XP-Roles';
-    const channelLabel = trackInfo.channelIds.length === 1 ? 'XP-Channel' : 'XP-Channels';
-    const commaRoles = trackInfo.roleIds.map(id => `<@&${id}>`).join(', ');
-    const commaChannels = trackInfo.channelIds.map(id => `<#${id}>`).join(', ');
-    const hasRoles = trackInfo.roleIds.length > 0;
-    const hasChannels = trackInfo.channelIds.length > 0;
-
-    if (hasRoles && hasChannels) {
-        return {
-            description: '',
-            fields: [
-                { name: roleLabel, value: trackInfo.roleIds.map(id => `-# <@&${id}>`).join('\n'), inline: true },
-                { name: channelLabel, value: trackInfo.channelIds.map(id => `-# <#${id}>`).join('\n'), inline: true },
-                { name: '\u2002', value: '\u2002', inline: false }
-            ]
-        };
-    }
-
-    if (hasRoles) {
-        return {
-            description: `**${roleLabel}:** ${commaRoles}`,
-            fields: []
-        };
-    }
-
-    if (hasChannels) {
-        return {
-            description: `**${channelLabel}:** ${commaChannels}`,
-            fields: []
-        };
-    }
-
-    return { description: '', fields: [] };
-}
 
 class Rank {
     constructor(config) {
@@ -99,21 +45,22 @@ class Rank {
 
     async execute(interaction) {
         const target = interaction.options.getUser('user') || interaction.user;
-        const targetMember = interaction.options.getMember('user') || interaction.member;
+        const targetMember = interaction.options.getMember('user')
+            || (target.id === interaction.user.id ? interaction.member : null);
         const trackInput = interaction.options.getString('xp_track');
         const guildId = interaction.guild.id;
 
+        await interaction.deferReply();
         const trackInfo = await resolveXpTrack(this.config.db, trackInput);
         if (!trackInfo) {
-            return interaction.reply({
+            await interaction.deleteReply();
+            return interaction.followUp({
                 content: "### Track Not Found\nThis XP track doesn't exist.",
                 flags: MessageFlags.Ephemeral
             });
         }
 
         const track = trackInfo.xpType;
-
-        await interaction.deferReply();
 
         try {
             const [rows] = await this.config.db.query(`

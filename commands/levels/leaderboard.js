@@ -1,6 +1,4 @@
-// ==========================
-// Level System - Leaderboard
-// ==========================
+// Browse guild XP rankings by track and activity type.
 
 const {
     SlashCommandBuilder,
@@ -15,6 +13,8 @@ const {
 const { formatNumber } = require('../../utils/xpFormatter');
 const { resolveXpTrack, fetchXpTrackAutocompleteChoices } = require('../../utils/xpDbHelper');
 const path = require('path');
+const { formatTrackingSince, getTrackRequirementDisplay } = require('../../features/levels/presentation.js');
+
 
 const SORT_OPTIONS = {
     level: {
@@ -78,60 +78,6 @@ function formatVoiceTime(minutes) {
     return `${remainingMinutes}m`;
 }
 
-function formatTrackingSince(value) {
-    if (!value) return 'XP tracking start date is not recorded yet.';
-
-    const date = value instanceof Date ? value : new Date(value);
-    if (Number.isNaN(date.getTime())) return 'XP tracking start date is not recorded yet.';
-
-    const dateParts = new Intl.DateTimeFormat('en-GB', {
-        year: 'numeric',
-        month: 'short',
-        day: '2-digit'
-    }).formatToParts(date);
-    const partByType = Object.fromEntries(dateParts.map(part => [part.type, part.value]));
-    const monthNumber = String(date.getMonth() + 1).padStart(2, '0');
-    const formatted = `${partByType.year}-${monthNumber}-${partByType.day}`;
-
-    return `XP tracked since ${formatted}`;
-}
-
-function getTrackRequirementDisplay(trackInfo) {
-    const roleLabel = trackInfo.roleIds.length === 1 ? 'XP-Role' : 'XP-Roles';
-    const channelLabel = trackInfo.channelIds.length === 1 ? 'XP-Channel' : 'XP-Channels';
-    const commaRoles = trackInfo.roleIds.map(id => `<@&${id}>`).join(', ');
-    const commaChannels = trackInfo.channelIds.map(id => `<#${id}>`).join(', ');
-    const hasRoles = trackInfo.roleIds.length > 0;
-    const hasChannels = trackInfo.channelIds.length > 0;
-
-    if (hasRoles && hasChannels) {
-        return {
-            description: '',
-            fields: [
-                { name: roleLabel, value: trackInfo.roleIds.map(id => `-# <@&${id}>`).join('\n'), inline: true },
-                { name: channelLabel, value: trackInfo.channelIds.map(id => `-# <#${id}>`).join('\n'), inline: true },
-                { name: '\u2002', value: '\u2002', inline: false }
-            ]
-        };
-    }
-
-    if (hasRoles) {
-        return {
-            description: `**${roleLabel}:** ${commaRoles}`,
-            fields: []
-        };
-    }
-
-    if (hasChannels) {
-        return {
-            description: `**${channelLabel}:** ${commaChannels}`,
-            fields: []
-        };
-    }
-
-    return { description: '', fields: [] };
-}
-
 function buildSortMenu(track, sortKey) {
     return new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
@@ -178,16 +124,17 @@ class Leaderboard {
 
     async execute(interaction) {
         const trackInput = interaction.options.getString('xp_track');
+        await interaction.deferReply();
         const trackInfo = await resolveXpTrack(this.config.db, trackInput);
 
         if (!trackInfo) {
-            return interaction.reply({
+            await interaction.deleteReply();
+            return interaction.followUp({
                 content: "### Track Not Found\nThis XP track doesn't exist.",
                 flags: MessageFlags.Ephemeral
             });
         }
 
-        await interaction.deferReply();
         return this.renderLeaderboard(interaction, 1, trackInfo, 'level');
     }
 

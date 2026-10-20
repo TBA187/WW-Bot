@@ -1,6 +1,4 @@
-// ======================================
-// /test to retrieve member Discord Info (filename avoids Node test discovery)
-// ======================================
+// Display member profile details; the filename avoids Node test discovery.
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { buildMemberAuditPayload } = require('../utils/memberAuditEmbeds.js');
 

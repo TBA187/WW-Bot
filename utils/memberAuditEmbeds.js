@@ -1,3 +1,4 @@
+// Build consistent member audit messages with safe names and Discord timestamps.
 'use strict';
 
 const path = require('node:path');

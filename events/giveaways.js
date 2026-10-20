@@ -1,3 +1,4 @@
+// Store giveaway entries, serialize draws, and recover pending Discord deliveries.
 const {
     ActionRowBuilder,
     AttachmentBuilder,

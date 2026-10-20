@@ -2,7 +2,7 @@
 
 // Posts complete applications for Officers, then creates and cross-links the Court House poll.
 const path = require('path');
-const { EmbedBuilder } = require('discord.js');
+const { EmbedBuilder, embedLength } = require('discord.js');
 const { findRecentBotMessage } = require('../../../utils/discordMessageHistory.js');
 const { TOPIC_URL } = require('../constants.js');
 const {
@@ -93,14 +93,22 @@ function splitFieldValue(value, limit = 1024) {
     return chunks;
 }
 
-function addLongField(embed, name, value, inline = false, maxTotalFields = 24) {
+function addLongField(embed, name, value, inline = false, maxTotalFields = 24, maxCharacters = 6000) {
     const chunks = splitFieldValue(value);
-    const fieldsUsed = embed.data.fields?.length || 0;
-    const available = Math.max(0, maxTotalFields - fieldsUsed);
-    chunks.slice(0, available).forEach((chunk, index) => {
-        embed.addFields({ name: index === 0 ? name : `${name} (continued)`, value: chunk, inline: index === 0 && inline });
-    });
-    return chunks.length > available;
+    for (const [index, chunk] of chunks.entries()) {
+        if ((embed.data.fields?.length || 0) >= maxTotalFields) return true;
+        const fieldName = index === 0 ? name : `${name} (continued)`;
+        const available = Math.max(0, maxCharacters - embedLength(embed.data) - fieldName.length);
+        if (!available) return true;
+        const truncated = chunk.length > available;
+        embed.addFields({
+            name: fieldName,
+            value: truncated ? `${chunk.slice(0, available - 1).trimEnd()}…` : chunk,
+            inline: index === 0 && inline
+        });
+        if (truncated) return true;
+    }
+    return false;
 }
 
 function rawApplicationFieldValue(record) {
@@ -165,21 +173,27 @@ class GuildApplicationNotifier {
         const embed = this.createApplicationEmbed(record);
         const narrative = extractNarrativeDetails(record.extraInformation);
         const country = normalizeCountryCandidate(record.country) || narrative.country;
-
-        let contentTruncated = addLongField(embed, 'In-Game Name', record.ign, true);
-        contentTruncated = addLongField(embed, 'Age', record.age, true) || contentTruncated;
-        contentTruncated = addLongField(embed, 'Country', country, true) || contentTruncated;
-        contentTruncated = addLongField(embed, 'Interests in game', cleanForumMetadata(record.interests), false) || contentTruncated;
-        const extraInformation = cleanExtraInformation(record.extraInformation);
-        if (extraInformation) contentTruncated = addLongField(embed, 'Extra Information', extraInformation, false) || contentTruncated;
-        if (contentTruncated) {
-            embed.addFields({ name: 'Full Application', value: `[Read the complete forum post](${record.postUrl})`, inline: false });
-        }
-
         const screenshotValue = availableImages.length
             ? imageCountText(availableImages.length)
             : `${NOT_AVAILABLE}\n${imageCountText(0)}`;
-        addLongField(embed, 'Screenshot of Trainer Card', screenshotValue, false);
+        const fullApplication = { name: 'Full Application', value: `[Read the complete forum post](${record.postUrl})`, inline: false };
+        // Leave room for the screenshot count and source link before filling long answers.
+        const reservedCharacters = 'Screenshot of Trainer Card'.length + screenshotValue.length
+            + fullApplication.name.length + fullApplication.value.length;
+        const addApplicationField = (name, value, inline = false) =>
+            addLongField(embed, name, value, inline, 23, 6000 - reservedCharacters);
+
+        let contentTruncated = addApplicationField('In-Game Name', record.ign, true);
+        contentTruncated = addApplicationField('Age', record.age, true) || contentTruncated;
+        contentTruncated = addApplicationField('Country', country, true) || contentTruncated;
+        contentTruncated = addApplicationField('Interests in game', cleanForumMetadata(record.interests)) || contentTruncated;
+        const extraInformation = cleanExtraInformation(record.extraInformation);
+        if (extraInformation) contentTruncated = addApplicationField('Extra Information', extraInformation) || contentTruncated;
+        if (contentTruncated) {
+            embed.addFields(fullApplication);
+        }
+
+        addLongField(embed, 'Screenshot of Trainer Card', screenshotValue, false, 25);
 
         const files = [logoFile()];
         if (firstImage?.buffer) {
@@ -232,7 +246,13 @@ class GuildApplicationNotifier {
 
     async fetchExistingMessage(channel, messageId) {
         if (!messageId || !channel.messages?.fetch) return null;
-        return channel.messages.fetch(messageId).catch(() => null);
+        try {
+            return await channel.messages.fetch(messageId);
+        } catch (error) {
+            if (Number(error.code) === 10008) return null;
+            // A network or permission failure does not mean the saved message disappeared.
+            throw error;
+        }
     }
 
     async findRecoveredMessage(channel, needles, label, postId) {

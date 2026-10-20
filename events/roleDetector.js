@@ -1,3 +1,4 @@
+// Log role and member-role changes while tracking their audit sources.
 'use strict';
 
 const { AuditLogEvent, AttachmentBuilder, EmbedBuilder, Events } = require('discord.js');

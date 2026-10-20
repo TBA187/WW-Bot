@@ -1,6 +1,4 @@
-// ==========================
-// Utility - XP Formatter
-// ==========================
+// Format XP totals, progress bars and level rewards for Discord messages.
 
 module.exports = {
     /**

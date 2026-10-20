@@ -1,5 +1,6 @@
 'use strict';
 
+// Finds topic pagination and removes posts repeated across fetched pages.
 function pageFromLink(href, topicUrl) {
     if (!href) return 1;
     try {
@@ -31,4 +32,12 @@ function discoverForumLastPage($, topicUrl) {
     return Math.max(...pages);
 }
 
-module.exports = { discoverForumLastPage };
+function uniqueForumPosts(pages) {
+    const posts = new Map();
+    for (const page of pages) {
+        for (const post of page.posts || []) posts.set(String(post.postId), post);
+    }
+    return [...posts.values()];
+}
+
+module.exports = { discoverForumLastPage, uniqueForumPosts };

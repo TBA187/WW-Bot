@@ -1,3 +1,4 @@
+// Reads recovery files safely and replaces changed JSON snapshots atomically.
 const fs = require('fs');
 const path = require('path');
 const crypto = require('node:crypto');

@@ -1,6 +1,4 @@
-// ==========================
-// Utility - XP Engine
-// ==========================
+// Apply confirmed XP awards, level changes and configured role rewards.
 const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const { getTotalXpForLevel } = require('./xpMath');
 const { getXpStore } = require('./xpStore');

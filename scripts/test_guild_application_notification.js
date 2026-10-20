@@ -1,3 +1,4 @@
+// Preview live forum applications; Discord delivery requires an explicit send option.
 'use strict';
 
 require('dotenv').config();

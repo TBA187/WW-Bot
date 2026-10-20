@@ -1,3 +1,4 @@
+// Keep the White Walker role aligned with each member's server tag.
 'use strict';
 
 const { Events, PermissionFlagsBits, Routes } = require('discord.js');

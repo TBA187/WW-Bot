@@ -7,6 +7,74 @@ const path = require('node:path');
 const NotificationStore = require('../features/pro-notifications/NotificationStore.js');
 const { NOTIFICATION_DEFINITIONS } = require('../features/pro-notifications/notificationCatalog.js');
 
+test('corrupt notification state is preserved instead of replaced with default subscriptions', async t => {
+    const dataFile = tempDataFile();
+    t.after(() => fs.rmSync(path.dirname(dataFile), { recursive: true, force: true }));
+    fs.writeFileSync(dataFile, '{pending subscriptions');
+    const store = makeStore({ dataFile, storageMode: 'json' });
+    await assert.rejects(store.restore(), { code: 'JSON_STORE_CORRUPT' });
+    assert.equal(fs.readFileSync(dataFile, 'utf8'), '{pending subscriptions');
+    assert.ok(fs.readdirSync(path.dirname(dataFile)).some(name => name.includes('.corrupt-')));
+});
+
+for (const kind of ['settings', 'subscriptions']) {
+    for (const storageMode of ['json', 'auto']) {
+        test(`failed ${storageMode} notification persistence leaves ${kind} unchanged`, async t => {
+            const dataFile = tempDataFile();
+            t.after(() => fs.rmSync(path.dirname(dataFile), { recursive: true, force: true }));
+            const store = makeStore({ dataFile, db: new FakeDb(), storageMode });
+            await store.restore();
+            await store.setUserSubscriptions('member', ['alto_mare']);
+            const previous = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+            const originalWrite = store.writeJsonData.bind(store);
+            store.writeJsonData = () => { throw new Error('disk full'); };
+            await assert.rejects(kind === 'settings'
+                ? store.setGuildNotificationEnabled('alto_mare', false)
+                : store.setUserSubscriptions('member', []), /disk full/);
+            assert.equal(store.getSetting('alto_mare').enabled, true);
+            assert.deepEqual(store.getUserSubscriptionKeys('member'), ['alto_mare']);
+            assert.deepEqual(store.local, previous);
+            assert.deepEqual(JSON.parse(fs.readFileSync(dataFile, 'utf8')), previous);
+            store.writeJsonData = originalWrite;
+            await store.syncPending();
+            assert.deepEqual(store.local, previous);
+        });
+    }
+
+    test(`notification recovery retains newer ${kind} while an older write is in flight`, async t => {
+        const dataFile = tempDataFile();
+        t.after(() => fs.rmSync(path.dirname(dataFile), { recursive: true, force: true }));
+        const store = makeStore({ dataFile, db: new FakeDb(), storageMode: 'auto' });
+        await store.restore();
+        const key = 'alto_mare';
+        let release, entered;
+        const gate = new Promise(resolve => { release = resolve; });
+        const started = new Promise(resolve => { entered = resolve; });
+        const method = kind === 'settings' ? 'mysqlSaveSetting' : 'mysqlSaveSubscription';
+        const pendingCollection = kind === 'settings' ? 'pendingSettings' : 'pendingSubscriptions';
+        const pendingId = kind === 'settings' ? key : `${key}:member`;
+        const saved = [];
+        let blocked = true;
+        store[method] = async value => {
+            if (blocked) { blocked = false; entered(); await gate; }
+            saved.push(value);
+        };
+        const mutate = enabled => kind === 'settings'
+            ? store.setGuildNotificationEnabled(key, enabled)
+            : store.setUserSubscriptions('member', enabled ? [key] : []);
+        const first = mutate(true);
+        await started;
+        const second = mutate(false);
+        release();
+        await Promise.all([first, second]);
+        assert.ok(store.local[pendingCollection].includes(pendingId));
+        assert.ok(JSON.parse(fs.readFileSync(dataFile, 'utf8'))[pendingCollection].includes(pendingId));
+        await store.syncPending();
+        assert.ok(!store.local[pendingCollection].includes(pendingId));
+        assert.equal(saved.at(-1).enabled, false);
+    });
+}
+
 function tempDataFile() {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-notifications-'));
     return path.join(directory, 'notifications.json');

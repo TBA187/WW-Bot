@@ -1,7 +1,4 @@
-/**
- * @fileoverview Model and validate message drafts, attachments and White Walker embed branding.
- * Share JSON import/export and attachment reconciliation between the message editors.
- */
+// Model message drafts, validate imports, and reconcile embed media and attachments.
 'use strict';
 
 const fs = require('node:fs');

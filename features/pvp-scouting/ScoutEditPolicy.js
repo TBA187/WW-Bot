@@ -1,3 +1,4 @@
+// Allows verified Pokemon species spelling fixes while sending substantive scout edits for review.
 'use strict';
 
 const { diffChars } = require('diff');

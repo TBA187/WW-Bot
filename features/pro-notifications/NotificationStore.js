@@ -1,6 +1,7 @@
+// Persist guild notification settings and member subscriptions with MySQL recovery.
 const fs = require('fs');
 const path = require('path');
-const { writeJsonIfChanged } = require('../../utils/jsonFile.js');
+const { readJsonObject, writeJsonIfChanged } = require('../../utils/jsonFile.js');
 
 const STORAGE_VERSION = 1;
 const SYNC_INTERVAL_MS = 5 * 60 * 1000;
@@ -122,21 +123,16 @@ class NotificationStore {
             return data;
         }
 
-        try {
-            const parsed = JSON.parse(fs.readFileSync(this.dataFile, 'utf8'));
-            return {
-                ...emptyStore(parsed.source || this.getJsonSource()),
-                ...parsed,
-                version: STORAGE_VERSION,
-                settings: parsed.settings && typeof parsed.settings === 'object' ? parsed.settings : {},
-                subscriptions: parsed.subscriptions && typeof parsed.subscriptions === 'object' ? parsed.subscriptions : {},
-                pendingSettings: Array.isArray(parsed.pendingSettings) ? parsed.pendingSettings : [],
-                pendingSubscriptions: Array.isArray(parsed.pendingSubscriptions) ? parsed.pendingSubscriptions : []
-            };
-        } catch (err) {
-            console.error('[PRO NOTIFICATIONS] Failed to read notification JSON storage:', err);
-            return emptyStore(this.getJsonSource());
-        }
+        const parsed = readJsonObject(this.dataFile, value =>
+            ['settings', 'subscriptions'].every(key => value[key] && typeof value[key] === 'object' && !Array.isArray(value[key]))
+            && ['pendingSettings', 'pendingSubscriptions'].every(key => value[key] == null || Array.isArray(value[key])));
+        return {
+            ...emptyStore(parsed.source || this.getJsonSource()),
+            ...parsed,
+            version: STORAGE_VERSION,
+            pendingSettings: parsed.pendingSettings || [],
+            pendingSubscriptions: parsed.pendingSubscriptions || []
+        };
     }
 
     writeJsonData(data = this.local) {
@@ -291,14 +287,15 @@ class NotificationStore {
                 const setting = this.local.settings[notificationKey];
                 if (!setting) continue;
                 await this.mysqlSaveSetting(setting);
-                this.clearPending('pendingSettings', notificationKey);
+                // A newer change may arrive while the previous value is being saved.
+                if (this.local.settings[notificationKey] === setting) this.clearPending('pendingSettings', notificationKey);
             }
 
             for (const id of [...this.local.pendingSubscriptions]) {
                 const subscription = this.local.subscriptions[id];
                 if (!subscription) continue;
                 await this.mysqlSaveSubscription(subscription);
-                this.clearPending('pendingSubscriptions', id);
+                if (this.local.subscriptions[id] === subscription) this.clearPending('pendingSubscriptions', id);
             }
 
             this.writeJsonStore();
@@ -364,12 +361,18 @@ class NotificationStore {
             updated_at: new Date().toISOString()
         }, definition);
 
-        this.local.settings[definition.key] = saved;
-        this.settingsCache.set(definition.key, clone(saved));
+        const previous = this.local;
+        this.local = { ...previous, settings: { ...previous.settings, [definition.key]: saved } };
         if (this.storageMode !== 'json') {
             this.markPending('pendingSettings', definition.key);
         }
-        this.writeJsonStore();
+        try {
+            this.writeJsonStore();
+        } catch (error) {
+            this.local = previous;
+            throw error;
+        }
+        this.settingsCache.set(definition.key, clone(saved));
 
         try {
             await this.syncPending();
@@ -399,6 +402,9 @@ class NotificationStore {
         const id = String(userId);
         const enabled = new Set((enabledKeys || []).map(String));
         const now = new Date().toISOString();
+        const previous = this.local;
+        this.local = { ...previous, subscriptions: { ...previous.subscriptions } };
+        const savedSubscriptions = [];
 
         for (const definition of this.definitions) {
             const idKey = subscriptionId(definition.key, id);
@@ -413,13 +419,21 @@ class NotificationStore {
             });
 
             this.local.subscriptions[idKey] = saved;
-            this.subscriptionsCache.set(idKey, clone(saved));
+            savedSubscriptions.push([idKey, saved]);
             if (this.storageMode !== 'json') {
                 this.markPending('pendingSubscriptions', idKey);
             }
         }
 
-        this.writeJsonStore();
+        try {
+            this.writeJsonStore();
+        } catch (error) {
+            this.local = previous;
+            throw error;
+        }
+        for (const [idKey, saved] of savedSubscriptions) {
+            this.subscriptionsCache.set(idKey, clone(saved));
+        }
 
         try {
             await this.syncPending();

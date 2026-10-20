@@ -1,7 +1,5 @@
+// Displays a sortable, paginated Hall of Fame for the selected PvP server.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_leaderboard
-// ----------------------
 const {
     SlashCommandBuilder,
     EmbedBuilder,
@@ -171,28 +169,33 @@ class PvpLeaderboard {
             });
 
             collector.on('collect', async (i) => {
-                if (i.user.id !== interaction.user.id) {
-                    return i.reply({
-                        content: "### ⚠️  Use the `/pvp_leaderboard` command to open your own menu.",
-                        flags: MessageFlags.Ephemeral
+                try {
+                    if (i.user.id !== interaction.user.id) {
+                        return await i.reply({
+                            content: "### ⚠️  Use the `/pvp_leaderboard` command to open your own menu.",
+                            flags: MessageFlags.Ephemeral
+                        });
+                    }
+
+                    if (i.isStringSelectMenu()) {
+                        currentSort = i.values[0];
+                        currentPage = 0;
+                        applySort();
+                    } else if (i.isButton()) {
+                        // A second click can arrive before Discord displays the disabled button.
+                        if (i.customId === 'prev_page') currentPage = Math.max(0, currentPage - 1);
+                        if (i.customId === 'next_page') currentPage = Math.min(totalPages - 1, currentPage + 1);
+                    }
+
+                    await i.update({
+                        embeds: [generateEmbed(currentPage)],
+                        components: generateComponents(currentPage)
                     });
+
+                    collector.resetTimer();
+                } catch (error) {
+                    console.warn('[WW LOG] PvP leaderboard control failed:', error.code || error.name);
                 }
-
-                if (i.isStringSelectMenu()) {
-                    currentSort = i.values[0];
-                    currentPage = 0;
-                    applySort();
-                } else if (i.isButton()) {
-                    if (i.customId === 'prev_page') currentPage--;
-                    if (i.customId === 'next_page') currentPage++;
-                }
-
-                await i.update({
-                    embeds: [generateEmbed(currentPage)],
-                    components: generateComponents(currentPage)
-                });
-
-                collector.resetTimer();
             });
 
             collector.on('end', () => {

@@ -1,5 +1,6 @@
 'use strict';
 
+// Reads bounded HTTP response bodies and releases streams after failed downloads.
 async function cancelResponseBody(response) {
     try { await response.body?.cancel(); } catch { /* Preserve the original request error. */ }
 }

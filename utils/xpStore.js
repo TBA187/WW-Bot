@@ -1,3 +1,4 @@
+// Persist XP operations and replay them with SQL receipts to prevent duplicate XP awards.
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');

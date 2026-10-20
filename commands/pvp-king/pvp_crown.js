@@ -1,9 +1,8 @@
+// Records crowns and defenses before updating Discord roles, history and announcements.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-const { announceEventWinner } = require('./utils/pvpEvent.js');
+const { announceEventWinner, utcEventDate } = require('./utils/pvpEvent.js');
+const { splitMessageParts } = require('./utils/pvpMessages.js');
 const { setInteractionContext, interactionErrorCode } = require('../../utils/interactionDiagnostics.js');
-// ----------------------
-// /pvp_crown
-// ----------------------
 const { SlashCommandBuilder, MessageFlags, ThreadChannel, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const {
     formatNowMinute,
@@ -160,11 +159,14 @@ class PvpCrownKing {
                             .setFooter({ text: `WW PvP King System • ${this.pvpServerName}`, iconURL: 'attachment://ww_logo.png' })
                             .setTimestamp();
 
-                        await discordStep('cooldown notification', () => pvpKingChannel.send({
-                            content: usersToNotify.join(' '),
-                            embeds: [pvpKingCdEmbed],
-                            files: [logoFile]
-                        }));
+                        for (const content of splitMessageParts(usersToNotify, ' ')) {
+                            await discordStep('cooldown notification', () => pvpKingChannel.send({
+                                content,
+                                embeds: [pvpKingCdEmbed],
+                                files: [logoFile],
+                                allowedMentions: { parse: ['users'] }
+                            }));
+                        }
                     }
                 }
             }
@@ -249,7 +251,8 @@ class PvpCrownKing {
                     .setColor(isDefense ? 0x9b59b6 : this.pvpServerColor)
                     .setThumbnail(newKing.displayAvatarURL())
                     .setFooter({ text: `WW PvP King System • ${this.pvpServerName}`, iconURL: 'attachment://ww_logo.png' })
-                    .setTimestamp();
+                    // Match history to the saved event even if Discord updates took time.
+                    .setTimestamp(crownResult.history?.created_at ? utcEventDate(crownResult.history.created_at) : new Date());
 
                 await historyThread.send({
                     embeds: [crownEmbedEntry],

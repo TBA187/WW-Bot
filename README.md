@@ -72,7 +72,7 @@ node --check index.js
 npm test
 ```
 
-Command modules live in [commands/](commands/), gateway handlers in [events/](events/), feature services in [features/](features/), and shared utilities in [utils/](utils/). Tests live in [test/](test/).
+Application wiring and lifecycle live in [app/](app/), command modules in [commands/](commands/), gateway handlers in [events/](events/), scheduled jobs in [tasks/](tasks/), feature services in [features/](features/), and shared utilities in [utils/](utils/). Tests live in [test/](test/).
 
 ## Attribution
 

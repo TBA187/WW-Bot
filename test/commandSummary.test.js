@@ -8,7 +8,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const vm = require('node:vm');
+const { loadCommands } = require('../app/moduleLoader.js');
+const { BotApplication } = require('../app/BotApplication.js');
+const { REST } = require('discord.js');
 const Module = require('node:module');
 const { SlashCommandBuilder, ContextMenuCommandBuilder, ApplicationCommandType } = require('discord.js');
 const { buildCommandSummary } = require('../utils/commandSummary.js');
@@ -44,8 +46,6 @@ test('startup counts executable commands once and lists subcommands relative to 
 });
 
 test('the actual command loader skips missing instance names while preserving declared routes and internal aliases', () => {
-    const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
-    const loader = source.slice(source.indexOf('        // Load commands'), source.indexOf('        // Register commands dynamically'));
     class MultiCommand {
         constructor() {
             this.name = 'internal-helper';
@@ -57,22 +57,22 @@ test('the actual command loader skips missing instance names while preserving de
     }
     const commandMap = new Map();
     const context = {
-        commandMap, commandConfig: {}, path, __dirname: path.resolve(__dirname, '..'),
-        fs: { readdirSync: () => ['scout-stats.js', 'multi.js'].map(name => ({ name, isDirectory: () => false })) },
-        require: name => {
-            if (name === './commands/scout-stats.js') return ScoutStats;
-            if (name === './commands/multi.js') return MultiCommand;
+        commandMap, commandConfig: {}, rootPath: path.resolve(__dirname, '..'),
+        fileSystem: { readdirSync: () => ['scout-stats.js', 'multi.js'].map(name => ({ name, isDirectory: () => false })) },
+        load: name => {
+            if (path.basename(name) === 'scout-stats.js') return ScoutStats;
+            if (path.basename(name) === 'multi.js') return MultiCommand;
             assert.fail('Unexpected command import: ' + name);
         }
     };
-    vm.runInNewContext(loader + '\nglobalThis.definitions = commandsForDiscord;', context);
+    const definitions = loadCommands(context);
     assert.equal(commandMap.has(undefined), false);
     assert.equal(commandMap.has(''), false);
     assert.ok(commandMap.get('scout-stats') instanceof ScoutStats);
     assert.equal(commandMap.get('real-command'), commandMap.get('internal-helper'));
     assert.equal(commandMap.get('Edit Example'), commandMap.get('internal-helper'));
     assert.deepEqual([...commandMap.keys()], ['scout-stats', 'internal-helper', 'real-command', 'Edit Example']);
-    const result = buildCommandSummary(context.definitions, messageCreate.prefixCommands);
+    const result = buildCommandSummary(definitions, messageCreate.prefixCommands);
     assert.equal(result.counts.total, 5);
     assert.ok(result.lines.includes(' - Standalone slash commands (2): real-command, scout-stats'));
     assert.equal(result.lines.some(line => line.includes('internal-helper')), false);
@@ -127,53 +127,49 @@ test('all current WW command declarations and loaded prefix forms appear in the 
 });
 
 
-test('startup prints dynamic prefix metadata beneath registration before event logs and loads modules once', async () => {
-    const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
-    const start = source.indexOf('        // Register commands dynamically');
-    const end = source.indexOf('        await lifecycle.run(() => client.login(token));', start);
-    const startup = source.slice(start, end) + '        await lifecycle.run(() => client.login(token));';
+test('startup prints dynamic prefix metadata beneath registration before event logs and loads modules once', async t => {
     const output = [], loaded = [], hooks = [];
-    const prefixes = [];
-    const context = {
-        path, __dirname: path.resolve(__dirname, '..'),
-        buildCommandSummary,
-        CommandRegistration: require('../utils/commandRegistration.js').CommandRegistration,
+    const rootPath = path.resolve(__dirname, '..');
+    const fakeStore = { async restore() {}, startSyncLoop() {} };
+    const application = new BotApplication({
+        rootPath, appConfig: { guildId: 'guild' }, commandConfig: {}, commandMap: new Map(),
+        token: 'offline-test-token', clientId: 'application',
         runtimeLogging: { logBlock: lines => output.push(...lines) },
-        commandsForDiscord: [{ name: 'future_command' }], prefixCommands: prefixes,
-        token: 'offline-test-token', clientId: 'application', guildId: 'guild', commandConfig: {},
-        fs: { readdirSync: () => ['future.js', 'future-group.js'].map(name => ({ name, isDirectory: () => false })) },
-        require: file => {
-            loaded.push(file);
-            if (file === './events/future.js') return {
+        fileSystem: { readdirSync: directory => (directory.endsWith('commands') ? ['future.js']
+            : ['future.js', 'future-group.js']).map(name => ({ name, isDirectory: () => false })) },
+        load: file => {
+            loaded.push(path.relative(rootPath, file).replaceAll('\\', '/'));
+            if (file.includes(path.sep + 'commands' + path.sep)) return class {
+                constructor() { this.data = new SlashCommandBuilder().setName('future_command').setDescription('Future'); }
+            };
+            if (file.endsWith('future.js')) return {
                 name: 'messageCreate', execute() {}, prefixCommands: [{ name: 'future', prefixes: ['!', '?'] }]
             };
-            if (file === './events/future-group.js') return {
-                register() { hooks.push('group'); }, prefixCommands: [{ name: 'group', prefixes: ['!'] }]
-            };
-            assert.fail('Unexpected event module: ' + file);
+            return { register() { hooks.push('group'); }, prefixCommands: [{ name: 'group', prefixes: ['!'] }] };
         },
-        REST: class {
-            setToken() { return this; }
-            async put(route, payload) {
-                assert.equal(route, 'guild-route');
-                assert.deepEqual(payload.body, context.commandsForDiscord);
-            }
-        },
-        Routes: { applicationGuildCommands: () => 'guild-route' },
-        lifecycle: { run: task => task(), check() {}, stopping: false },
-        console: { log: line => output.push(line), error: () => assert.fail('Registration failed') },
+        db: { initPromise: Promise.resolve(true), query: async () => [[]] },
+        guildSettings: { async sync() {} }, xpStore: fakeStore, pvpKingStores: { gold: fakeStore, silver: fakeStore },
+        giveawayStore: fakeStore, notificationStore: fakeStore, memberHistory: fakeStore,
+        scoutServers: { async warmAutocomplete() {} }, scoutServerSettings: { async hydratePreferences() {} },
+        lifecycle: { run: task => task(), check() {}, preload: task => task(), stopping: false },
+        consoleObject: { log: line => output.push(line), error: (...args) => assert.fail(JSON.stringify(args)) },
         client: { on: name => hooks.push(name), once: name => hooks.push(name), login: async () => hooks.push('login') }
-    };
-    await vm.runInNewContext('(async () => {' + startup + '\n})()', context);
-    assert.deepEqual(loaded, ['./events/future.js', './events/future-group.js']);
+    });
+    t.mock.method(REST.prototype, 'put', async (route, payload) => {
+        assert.equal(route, '/applications/application/guilds/guild/commands');
+        assert.equal(payload.body[0].name, 'future_command');
+    });
+    await application.bootstrap();
+    assert.deepEqual(loaded, ['commands/future.js', 'events/future.js', 'events/future-group.js']);
     assert.deepEqual(hooks, ['messageCreate', 'group', 'login']);
-    assert.deepEqual(output.slice(0, 5), [
+    const registered = output.indexOf('[WW LOG] Registering Guild slash commands...');
+    assert.deepEqual(output.slice(registered, registered + 5), [
         '[WW LOG] Registering Guild slash commands...',
         '[WW LOG] ✅ Guild slash commands registered to Discord',
         'Loaded 3 commands:',
         ' - Standalone slash commands (1): future_command',
         ' - Prefix commands (2): future (!future / ?future), group (!group)'
     ]);
-    assert.ok(output[5].startsWith('[WW LOG] Registered Event:'));
-    assert.ok(output[6].startsWith('[WW LOG] Registered Event Group:'));
+    assert.ok(output[registered + 5].startsWith('[WW LOG] Registered Event:'));
+    assert.ok(output[registered + 6].startsWith('[WW LOG] Registered Event Group:'));
 });

@@ -3,6 +3,7 @@
 // Reads post IDs, authors, timestamps, and message text from one PRO forum topic.
 const cheerio = require('cheerio');
 const { discoverForumLastPage } = require('../../utils/forumPagination.js');
+const { parseRetryAfter } = require('../../utils/forumRetry.js');
 const { readResponseBuffer, cancelResponseBody } = require('../../utils/readResponseBuffer.js');
 const path = require('path');
 const sharp = require('sharp');
@@ -31,14 +32,6 @@ function cleanText(value) {
         .replace(/[ \u00a0]{2,}/g, ' ')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
-}
-
-function parseRetryAfter(value) {
-    if (!value) return null;
-    const seconds = Number(value);
-    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-    const dateMs = Date.parse(value);
-    return Number.isNaN(dateMs) ? null : Math.max(0, dateMs - Date.now());
 }
 
 class TbaForumShopClient {

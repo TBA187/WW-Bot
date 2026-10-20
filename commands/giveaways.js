@@ -1,3 +1,4 @@
+// Create and manage giveaways through the shared storage and delivery service.
 const {
     ChannelType,
     MessageFlags,

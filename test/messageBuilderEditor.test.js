@@ -291,6 +291,76 @@ test('simultaneous send clicks cannot send the message twice', async () => {
     assert.equal(sends, 1);
 });
 
+test('a failed send finishes restoring its preview before retry or cancellation can start', async () => {
+    let attempts = 0, release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const { controller, session } = fixture({ title: 'Retry after recovery' }, {
+        channel: { async send() {
+            attempts++;
+            if (attempts === 1) throw new Error('offline');
+            return { id: 'sent' };
+        } }
+    });
+    controller.logError = () => {};
+    const pending = session.commit(fakeInteraction({ async editReply() { entered(); await gate; } }));
+    await started;
+    const retry = fakeInteraction(), cancel = fakeInteraction();
+    await session.commit(retry);
+    await session.cancel(cancel);
+    for (const click of [retry, cancel]) {
+        assert.equal(privateResponse(click).content, 'This message has already been processed.');
+        assertPrivate(privateResponse(click));
+    }
+    assert.equal(attempts, 1);
+    assert.equal(controller.sessions.get(session.sessionId), session);
+    release();
+    await pending;
+    assert.equal(session.processing, false);
+    await session.commit(fakeInteraction());
+    assert.equal(attempts, 2);
+    assert.equal(session.committed, true);
+});
+
+test('builder controls cannot cancel or change a message while publication is in progress', async () => {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const { controller, session } = fixture({ title: 'Confirmed title' }, {
+        channel: { async send() { await gate; return { id: 'sent' }; } }
+    });
+    const cancel = buttonInteraction(session, 'Cancel');
+    const pending = session.commit(fakeInteraction());
+    await controller.handleButton(cancel);
+    assert.equal(privateResponse(cancel).content, 'This message has already been processed.');
+    assert.equal(controller.sessions.get(session.sessionId), session);
+    release();
+    await pending;
+    assert.equal(session.committed, true);
+});
+
+test('a failed cancellation acknowledgement leaves the builder session usable', async () => {
+    const { controller, session } = fixture({ title: 'Keep this draft' });
+    const interaction = fakeInteraction({ deferUpdate: async () => { throw new Error('expired'); } });
+    await assert.rejects(session.cancel(interaction), /expired/);
+    assert.equal(controller.sessions.get(session.sessionId), session);
+    assert.equal(session.draft.title, 'Keep this draft');
+    assert.equal(session.processing, false);
+});
+
+test('a commit cannot start while Discord is acknowledging cancellation', async () => {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const { session } = fixture({ title: 'Cancel this draft' }, {
+        channel: { send: async () => assert.fail('Canceled draft was published') }
+    });
+    const cancel = session.cancel(fakeInteraction({ deferUpdate: () => gate }));
+    const commit = fakeInteraction();
+    await session.commit(commit);
+    assert.equal(privateResponse(commit).content, 'This message has already been processed.');
+    release();
+    await cancel;
+});
+
 test('cancel removes all preview contents and closes the session', async () => {
     const { controller, session } = fixture({ title: 'Preview' });
     const interaction = fakeInteraction();
@@ -301,6 +371,96 @@ test('cancel removes all preview contents and closes the session', async () => {
     assert.deepEqual(edit.attachments, []);
     assert.deepEqual(edit.components, []);
     assert.ok(!Array.from(controller.sessions.values()).includes(session));
+});
+
+test('an in-flight JSON import blocks publication and cancellation until its preview is ready', async () => {
+    const { controller, session, sent } = fixture({ messageContent: 'Reviewed original' });
+    let release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const upload = { id: 'json', name: 'message.json', async read() {
+        entered(); await gate; return Buffer.from(JSON.stringify({ content: 'Imported content' }));
+    } };
+    const send = buttonInteraction(session, 'Send');
+    const update = modalInteraction(session, 'import', { message_json_upload: [upload] });
+    const pending = controller.handleModal(update);
+    await started;
+    await controller.handleButton(send);
+    const cancel = fakeInteraction();
+    await session.cancel(cancel);
+    for (const click of [send, cancel]) {
+        assert.match(privateResponse(click).content, /preview is still updating/u);
+        assertPrivate(privateResponse(click));
+    }
+    assert.equal(sent.length, 0);
+    assert.equal(session.draft.messageContent, 'Reviewed original');
+    assert.equal(controller.sessions.get(session.sessionId), session);
+    release(); await pending;
+    assert.equal(session.updating, false);
+    assert.equal(session.draft.messageContent, 'Imported content');
+    assert.match(update.calls.find(([kind]) => kind === 'editReply')[1].content, /JSON imported successfully/u);
+    await session.commit(fakeInteraction());
+    assert.deepEqual(sent.map(payload => payload.content), ['Imported content']);
+    assert.equal(controller.sessions.has(session.sessionId), false);
+});
+
+test('destination lookup must finish before a draft can be sent or canceled', async () => {
+    const { controller, session, sent } = fixture({ messageContent: 'Reviewed message' });
+    let release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const destinationMessages = [];
+    const destination = { id: 'destination', async send(payload) {
+        destinationMessages.push(payload); return { id: 'sent' };
+    } };
+    const update = modalInteraction(session, 'channel', { destination_channel: [{ id: 'destination' }] }, {
+        client: { channels: { cache: new Collection(), async fetch() { entered(); await gate; return destination; } } }
+    });
+    const pending = controller.handleModal(update);
+    await started;
+    const send = fakeInteraction(), cancel = fakeInteraction();
+    await session.commit(send);
+    await session.cancel(cancel);
+    assert.match(privateResponse(send).content, /preview is still updating/u);
+    assert.match(privateResponse(cancel).content, /preview is still updating/u);
+    assert.equal(sent.length, 0);
+    assert.equal(destinationMessages.length, 0);
+    release(); await pending;
+    assert.equal(session.target.channel, destination);
+    assert.equal(session.updating, false);
+    await session.commit(fakeInteraction());
+    assert.equal(destinationMessages.length, 1);
+    assert.equal(sent.length, 0);
+});
+
+test('ordinary edits keep publication blocked until Discord renders the changed preview', async () => {
+    const { controller, session, sent } = fixture({ title: 'Original title' });
+    let release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const update = modalInteraction(session, 'title', { title: 'Updated title' }, {
+        async editReply() { entered(); await gate; }
+    });
+    const pending = controller.handleModal(update);
+    await started;
+    const send = fakeInteraction();
+    await session.commit(send);
+    assert.match(privateResponse(send).content, /preview is still updating/u);
+    assert.equal(sent.length, 0);
+    release(); await pending;
+    await session.commit(fakeInteraction());
+    assert.equal(sent[0].embeds[0].data.title, 'Updated title');
+});
+
+test('a failed import releases the preview guard and leaves the original draft usable', async () => {
+    const { controller, session, sent } = fixture({ messageContent: 'Original content' });
+    controller.logError = () => {};
+    const upload = { id: 'json', name: 'message.json', async read() { throw new Error('offline'); } };
+    await controller.handleModal(modalInteraction(session, 'import', { message_json_upload: [upload] }));
+    assert.equal(session.updating, false);
+    assert.equal(session.draft.messageContent, 'Original content');
+    await session.commit(fakeInteraction());
+    assert.deepEqual(sent.map(payload => payload.content), ['Original content']);
 });
 
 test('footer timestamp input accepts every source NOW alias and UTC datetimes', () => {

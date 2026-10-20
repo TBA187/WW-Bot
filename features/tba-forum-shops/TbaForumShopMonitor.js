@@ -8,6 +8,11 @@ const {
 } = require('./constants.js');
 const { TbaForumRequestError } = require('./TbaForumShopClient.js');
 const { runtimeActivity } = require('../../utils/runtimeActivity.js');
+const { shutdownError } = require('../../utils/abortable.js');
+const { uniqueForumPosts } = require('../../utils/forumPagination.js');
+const { forumRetryDelay } = require('../../utils/forumRetry.js');
+
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function postNumber(value) {
     const number = Number(value);
@@ -15,11 +20,7 @@ function postNumber(value) {
 }
 
 function uniquePosts(pages) {
-    const byId = new Map();
-    for (const page of pages) {
-        for (const post of page.posts || []) byId.set(String(post.postId), post);
-    }
-    return [...byId.values()].sort((a, b) => postNumber(a.postId) - postNumber(b.postId));
+    return uniqueForumPosts(pages).sort((a, b) => postNumber(a.postId) - postNumber(b.postId));
 }
 
 class TbaForumShopMonitor {
@@ -77,10 +78,16 @@ class TbaForumShopMonitor {
         this.started = false;
     }
 
+    checkRunning() {
+        if (this.stopped) throw shutdownError();
+    }
+
     scheduleShop(shop, delayMs) {
+        if (this.stopped) return;
         const existing = this.timers.get(shop.key);
         if (existing) clearTimeout(existing);
 
+        // Longer waits are checked again when this timer expires; Node overflows them to 1ms.
         const timer = setTimeout(async () => {
             this.timers.delete(shop.key);
             if (!this.started) return;
@@ -91,7 +98,7 @@ class TbaForumShopMonitor {
             const state = this.stateFor(shop);
             const retryDelay = Math.max(0, state.nextAttemptAt - this.clock());
             this.scheduleShop(shop, retryDelay || this.intervalMs);
-        }, delayMs);
+        }, Math.min(delayMs, MAX_TIMER_DELAY_MS));
         timer.unref?.();
         this.timers.set(shop.key, timer);
     }
@@ -105,11 +112,7 @@ class TbaForumShopMonitor {
 
     forumFailed(shop, state, error) {
         state.failureCount++;
-        const exponential = Math.min(
-            this.maxBackoffMs,
-            this.intervalMs * (2 ** Math.min(state.failureCount - 1, 6))
-        );
-        const delay = Math.min(this.maxBackoffMs, Math.max(exponential, error.retryAfterMs || 0));
+        const delay = forumRetryDelay(this.intervalMs, state.failureCount, this.maxBackoffMs, error.retryAfterMs);
         state.nextAttemptAt = this.clock() + delay;
         if (!state.forumUnavailable) {
             console.warn(`[WW LOG] ${shop.name} monitor is unavailable. Retrying in ${Math.ceil(delay / 60000)} minute(s):`, error.message);
@@ -125,9 +128,11 @@ class TbaForumShopMonitor {
         const finishActivity = this.activity.begin(`${shop.name} monitoring`);
         try {
             await this.scanShop(shop);
+            this.checkRunning();
             this.forumRestored(shop, state);
             return true;
         } catch (error) {
+            if (error.code === 'BOT_SHUTTING_DOWN') return false;
             if (error instanceof TbaForumRequestError) this.forumFailed(shop, state, error);
             else console.error(`[WW LOG] ${shop.name} monitor failed:`, error);
             return false;
@@ -145,7 +150,9 @@ class TbaForumShopMonitor {
     }
 
     async readablePage(shop, firstPage, page) {
+        this.checkRunning();
         const result = page === 1 ? firstPage : await shop.forumClient.fetchPage(page);
+        this.checkRunning();
         if (!(result.posts || []).length) {
             throw new TbaForumRequestError(`${shop.name} page ${page} did not contain any readable forum posts.`);
         }
@@ -175,9 +182,11 @@ class TbaForumShopMonitor {
     }
 
     async setBaseline(shop, firstPage, lastPage) {
+        this.checkRunning();
         const pages = [firstPage];
         if (lastPage > 1) {
             const finalPage = await shop.forumClient.fetchPage(lastPage);
+            this.checkRunning();
             if (!(finalPage.posts || []).length) {
                 throw new TbaForumRequestError(`The final page of ${shop.name} did not contain any readable forum posts.`);
             }
@@ -194,8 +203,11 @@ class TbaForumShopMonitor {
     }
 
     async scanShop(shop) {
+        this.checkRunning();
         const state = await this.store.getShop(shop.key);
+        this.checkRunning();
         const firstPage = await shop.forumClient.fetchPage(1);
+        this.checkRunning();
         const lastPage = Math.max(1, Number(firstPage.lastPage) || 1);
 
         if (!state?.initialized || state.topicUrl !== shop.topicUrl) {
@@ -208,10 +220,13 @@ class TbaForumShopMonitor {
         const unseen = uniquePosts(pages).filter(post => postNumber(post.postId) > postNumber(state.lastSeenPostId));
 
         for (const post of unseen) {
+            this.checkRunning();
             if (String(post.forumUsername || '').trim().toLowerCase() !== this.ignoredUsername) {
                 const downloadedImages = await shop.forumClient.downloadPostImages(post);
+                this.checkRunning();
                 await this.notifier.notify(shop, post, downloadedImages);
             }
+            // A delivery already in flight must keep its checkpoint even if stop() was called.
             await this.store.updateShop(shop.key, {
                 lastSeenPostId: post.postId,
                 lastPage

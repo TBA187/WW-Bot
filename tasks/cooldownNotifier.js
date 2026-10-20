@@ -1,6 +1,4 @@
-// ======================================================================
-// PvP King System | Send notification when challengers cooldown expires
-// ======================================================================
+// Notify challengers when their Gold or Silver PvP King cooldown expires.
 
 const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const { refreshGuildMembers } = require('../commands/pvp-king/utils/pvpHelper.js');

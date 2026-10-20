@@ -1,3 +1,4 @@
+// Compares saved scout fields and formats report/source IDs for review messages.
 'use strict';
 
 function attachmentIdentity(items = []) {

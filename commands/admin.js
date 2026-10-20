@@ -1,3 +1,5 @@
+// Admin only commands:
+// - Manage guild-wide notification settings.
 const {
     EmbedBuilder,
     MessageFlags,

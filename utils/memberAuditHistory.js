@@ -1,3 +1,4 @@
+// Retain recent membership transitions and replay pending audit records after outages.
 'use strict';
 
 const { GuildMemberFlags } = require('discord.js');

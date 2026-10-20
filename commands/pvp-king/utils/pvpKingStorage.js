@@ -1,3 +1,4 @@
+// Stores each server's PvP results and replays durable JSON operations after MySQL recovers.
 const fs = require('fs');
 const path = require('path');
 const { writeJsonIfChanged } = require('../../../utils/jsonFile.js');

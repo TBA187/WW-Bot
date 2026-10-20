@@ -13,12 +13,11 @@ const {
 } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
-const { writeJsonIfChanged } = require('../utils/jsonFile.js');
+const { readJsonObject, writeJsonIfChanged } = require('../utils/jsonFile.js');
 const { findRecentBotMessage } = require('../utils/discordMessageHistory.js');
 
 const DUNGEON_RUNS_DATA_DIR = path.join(__dirname, '../data');
 const DUNGEON_RUNS_FILE = path.join(DUNGEON_RUNS_DATA_DIR, 'dungeon_runs.json');
-const DUNGEON_RUNS_TEMP_FILE = path.join(DUNGEON_RUNS_DATA_DIR, 'dungeon_runs.json.tmp');
 const DUNGEON_RUNS_STORAGE_VERSION = 1;
 const JSON_SOURCES = {
     MYSQL_FALLBACK: 'mysql_fallback',
@@ -188,7 +187,8 @@ function parseRelativeTime(input, nowMs) {
 
     if (!matched || cleaned.slice(cursor).trim()) return null;
 
-    return new Date(nowMs + totalMs);
+    const result = new Date(nowMs + totalMs);
+    return Number.isFinite(result.getTime()) ? result : null;
 }
 
 function parseDungeonTime(input, nowMs = Date.now()) {
@@ -218,10 +218,14 @@ class DungeonRecruitment {
         this.db = config.db;
         this.onCooldown = config.onCooldown;
         this.activeRuns = new Map();
+        this.runButtonQueues = new Map();
         this.pendingStorageWrite = Promise.resolve();
         this.storageSyncInterval = null;
+        this.stopped = false;
+        this.storageFile = config.dungeonRunsFile || DUNGEON_RUNS_FILE;
+        this.storageTempFile = `${this.storageFile}.tmp`;
         this.mysqlOutage = false;
-        // STORAGE_MODE: auto = MySQL with JSON fallback, mysql = prefer MySQL with JSON fallback, json = local JSON only.
+        // Both database modes retain pending changes in JSON during an outage.
         this.storageMode = this.parseStorageMode(process.env.STORAGE_MODE);
         this.dungeonChannelID = config.dungeonChannelID;
         this.dungeonRoleID = config.dungeonRoleID;
@@ -234,13 +238,29 @@ class DungeonRecruitment {
         ];
 
         this.loadPersistedRuns();
+        this.restoreOnReady = () => {
+            if (this.stopped) return;
+            this.restorePromise = this.restorePersistedRuns()
+                .catch(err => console.error('[WW LOG] Failed to restore Dungeon recruitments:', err));
+        };
         if (this.client?.isReady?.()) {
-            this.restorePersistedRuns().catch(err => console.error('[WW LOG] Failed to restore Dungeon recruitments:', err));
+            this.restoreOnReady();
         } else {
-            this.client?.once?.('clientReady', () => {
-                this.restorePersistedRuns().catch(err => console.error('[WW LOG] Failed to restore Dungeon recruitments:', err));
-            });
+            this.client?.once?.('clientReady', this.restoreOnReady);
         }
+    }
+
+    async stop() {
+        this.stopped = true;
+        this.client?.off?.('clientReady', this.restoreOnReady);
+        if (this.storageSyncInterval) clearInterval(this.storageSyncInterval);
+        this.storageSyncInterval = null;
+        for (const run of this.activeRuns.values()) {
+            if (run.deadlineTimeout) clearTimeout(run.deadlineTimeout);
+            run.deadlineTimeout = null;
+        }
+        await Promise.allSettled([this.restorePromise, ...this.runButtonQueues.values()]);
+        await this.pendingStorageWrite;
     }
 
     buildCommand(commandName) {
@@ -552,8 +572,8 @@ class DungeonRecruitment {
     }
 
     ensureJsonStore() {
-        fs.mkdirSync(DUNGEON_RUNS_DATA_DIR, { recursive: true });
-        if (!fs.existsSync(DUNGEON_RUNS_FILE)) {
+        fs.mkdirSync(path.dirname(this.storageFile), { recursive: true });
+        if (!fs.existsSync(this.storageFile)) {
             this.writeJsonStore([], this.getJsonSource(), false);
         }
     }
@@ -561,30 +581,20 @@ class DungeonRecruitment {
     readJsonStore() {
         this.ensureJsonStore();
 
-        try {
-            const stored = JSON.parse(fs.readFileSync(DUNGEON_RUNS_FILE, 'utf8'));
-            const runs = Array.isArray(stored?.runs) ? stored.runs : [];
-            const source = stored?.source ?? this.getJsonSource();
-            const pendingSync = stored?.pendingSync === true || (source === JSON_SOURCES.MYSQL_FALLBACK && runs.length > 0);
-
-            return { version: DUNGEON_RUNS_STORAGE_VERSION, source, pendingSync, runs };
-        } catch (err) {
-            console.error('[WW LOG] Failed to read Dungeon JSON storage:', err);
-            return { version: DUNGEON_RUNS_STORAGE_VERSION, source: this.getJsonSource(), pendingSync: false, runs: [] };
-        }
+        const stored = readJsonObject(this.storageFile, value => Array.isArray(value.runs));
+        const runs = stored?.runs || [];
+        const source = stored?.source ?? this.getJsonSource();
+        const pendingSync = stored?.pendingSync === true || (source === JSON_SOURCES.MYSQL_FALLBACK && runs.length > 0);
+        return { version: DUNGEON_RUNS_STORAGE_VERSION, source, pendingSync, runs };
     }
 
     writeJsonStore(runs, source, pendingSync) {
-        try {
-            writeJsonIfChanged(DUNGEON_RUNS_FILE, DUNGEON_RUNS_TEMP_FILE, {
-                version: DUNGEON_RUNS_STORAGE_VERSION,
-                source,
-                pendingSync,
-                runs
-            });
-        } catch (err) {
-            console.error('[WW LOG] Failed to save Dungeon JSON storage:', err);
-        }
+        return writeJsonIfChanged(this.storageFile, this.storageTempFile, {
+            version: DUNGEON_RUNS_STORAGE_VERSION,
+            source,
+            pendingSync,
+            runs
+        });
     }
 
     getOpenStoredRuns() {
@@ -629,6 +639,12 @@ class DungeonRecruitment {
 
         let skipped = 0;
         for (const rawRun of store.runs) {
+            const status = rawRun?.status ?? (rawRun?.closed ? 'closed_missing_message' : 'open');
+            if (rawRun?.id && status !== 'open') {
+                // A pending close takes precedence over an older open row from MySQL.
+                this.activeRuns.delete(String(rawRun.id));
+                continue;
+            }
             const run = this.deserializeRun(rawRun);
             if (!run) {
                 if ((rawRun?.status ?? 'open') === 'open') skipped += 1;
@@ -696,9 +712,9 @@ class DungeonRecruitment {
                 assignments = VALUES(assignments),
                 member_names = VALUES(member_names),
                 join_order = VALUES(join_order),
-                status = IF(dungeon_runs.status = 'closed' AND VALUES(status) = 'open', dungeon_runs.status, VALUES(status)),
-                close_reason = IF(dungeon_runs.status = 'closed' AND VALUES(status) = 'open', dungeon_runs.close_reason, VALUES(close_reason)),
-                closed_at_ms = IF(dungeon_runs.status = 'closed' AND VALUES(status) = 'open', dungeon_runs.closed_at_ms, VALUES(closed_at_ms)),
+                status = IF(dungeon_runs.status <> 'open' AND VALUES(status) = 'open', dungeon_runs.status, VALUES(status)),
+                close_reason = IF(dungeon_runs.status <> 'open' AND VALUES(status) = 'open', dungeon_runs.close_reason, VALUES(close_reason)),
+                closed_at_ms = IF(dungeon_runs.status <> 'open' AND VALUES(status) = 'open', dungeon_runs.closed_at_ms, VALUES(closed_at_ms)),
                 created_at_ms = VALUES(created_at_ms),
                 reminder_counter = VALUES(reminder_counter),
                 reminders_enabled = VALUES(reminders_enabled),
@@ -733,10 +749,15 @@ class DungeonRecruitment {
     }
 
     saveRuns(extraRun = null) {
+        return this.queueStorageWrite(() => this.saveRunsNow(extraRun));
+    }
+
+    queueStorageWrite(work) {
         this.pendingStorageWrite = this.pendingStorageWrite
             .catch(() => { })
-            .then(() => this.saveRunsNow(extraRun))
-            .catch(err => console.error('[WW LOG] Failed to persist Dungeon recruitments:', err));
+            .then(work);
+        void this.pendingStorageWrite.catch(err => console.error('[WW LOG] Failed to persist Dungeon recruitments:', err));
+        return this.pendingStorageWrite;
     }
 
     async saveRunsNow(extraRun = null) {
@@ -745,23 +766,31 @@ class DungeonRecruitment {
             return;
         }
 
-        const storedRuns = this.getOpenStoredRuns();
-        if (extraRun) storedRuns.push(this.serializeRun(extraRun));
+        const storedRuns = this.mergeFallbackRuns(extraRun);
+        const currentRunIds = new Set(this.activeRuns.keys());
+        if (extraRun) currentRunIds.add(extraRun.id);
+
+        // Keep the snapshot recoverable before any database request can time out.
+        this.writeJsonStore(storedRuns, JSON_SOURCES.MYSQL_FALLBACK, true);
 
         if (!this.canUseMysql()) {
-            this.writeJsonStore(this.mergeFallbackRuns(extraRun), JSON_SOURCES.MYSQL_FALLBACK, true);
             return;
         }
 
         try {
-            await this.syncFallbackRuns();
             for (const storedRun of storedRuns) {
-                await this.upsertMysqlRun(storedRun, 'mysql');
+                await this.upsertMysqlRun(storedRun, currentRunIds.has(storedRun.id) ? 'mysql' : 'json_fallback');
             }
-            this.writeJsonStore([], JSON_SOURCES.MYSQL_FALLBACK, false);
         } catch (err) {
             this.noteMysqlFailure(err);
-            this.writeJsonStore(this.mergeFallbackRuns(extraRun), JSON_SOURCES.MYSQL_FALLBACK, true);
+            return;
+        }
+
+        try {
+            this.writeJsonStore([], JSON_SOURCES.MYSQL_FALLBACK, false);
+        } catch (err) {
+            // The change is already durable; leave the pending snapshot for a safe replay.
+            console.error('[WW LOG] Failed to clear synchronized Dungeon recovery data:', err);
         }
     }
 
@@ -781,30 +810,33 @@ class DungeonRecruitment {
     }
 
     startStorageSyncLoop() {
-        if (this.storageMode === 'json' || this.storageSyncInterval) return;
+        if (this.stopped || this.storageMode === 'json' || this.storageSyncInterval) return;
 
         this.storageSyncInterval = setInterval(() => {
-            this.syncFallbackRuns().catch(err => {
-                this.noteMysqlFailure(err);
-            });
+            // Use the write queue so an older sync cannot clear a newer fallback.
+            this.queueStorageWrite(() => this.syncFallbackRuns());
         }, STORAGE_SYNC_INTERVAL_MS);
 
         this.storageSyncInterval.unref?.();
     }
 
     async restorePersistedRuns() {
+        if (this.stopped) return;
         if (this.storageMode !== 'json') {
             await this.loadMysqlRuns();
+            if (this.stopped) return;
             this.loadPersistedRuns();
-            await this.syncFallbackRuns().catch(() => { });
+            await this.queueStorageWrite(() => this.syncFallbackRuns()).catch(() => { });
         }
 
+        if (this.stopped) return;
         this.startStorageSyncLoop();
         if (this.activeRuns.size === 0) return;
 
         let changed = false;
         for (const run of [...this.activeRuns.values()]) {
             const message = await this.fetchRunMessage(run, this.client);
+            if (this.stopped) return;
             if (!message) {
                 this.markRunClosed(run, 'missing_message');
                 this.activeRuns.delete(run.id);
@@ -824,7 +856,7 @@ class DungeonRecruitment {
             }
 
             if (run.registrationEndTime && run.registrationEndTime.getTime() <= Date.now()) {
-                await this.closeRun(run.id, 'deadline', this.client, message);
+                await this.closeRunAtDeadline(run, message);
                 continue;
             }
 
@@ -954,7 +986,7 @@ class DungeonRecruitment {
             run.messageId = message.id;
             run.messageUrl = message.url ?? `https://discord.com/channels/${run.guildId}/${run.channelId}/${run.messageId}`;
             this.scheduleDeadline(run);
-            this.saveRuns();
+            await this.saveRuns();
         } catch (err) {
             this.activeRuns.delete(runId);
             if (run.deadlineTimeout) clearTimeout(run.deadlineTimeout);
@@ -991,6 +1023,25 @@ class DungeonRecruitment {
         }
 
         return { updated: true, expired: false };
+    }
+
+    async saveReminderChanges(runs, enabled) {
+        return this.queueRunOperations(runs.map(run => run.id), async () => {
+            const openRuns = runs.filter(run => !run.closed && this.activeRuns.get(run.id) === run);
+            const previous = openRuns.map(run => ({
+                run, remindersEnabled: run.remindersEnabled, reminderCounter: run.reminderCounter
+            }));
+            const changes = openRuns.map(run => ({ run, result: this.setRunReminders(run, enabled) }));
+            try {
+                if (changes.length) await this.saveRuns();
+            } catch (error) {
+                for (const { run, remindersEnabled, reminderCounter } of previous) {
+                    Object.assign(run, { remindersEnabled, reminderCounter });
+                }
+                throw error;
+            }
+            return changes;
+        });
     }
 
     async executeReminderCommand(interaction) {
@@ -1033,13 +1084,10 @@ class DungeonRecruitment {
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             let updatedCount = 0;
             let expiredCount = 0;
-            // A run may close while Discord is accepting the command.
-            for (const run of this.getOpenRuns()) {
-                const result = this.setRunReminders(run, enableAll);
+            for (const { result } of await this.saveReminderChanges(this.getOpenRuns(), enableAll)) {
                 if (result.expired) expiredCount += 1;
                 if (result.updated) updatedCount += 1;
             }
-            this.saveRuns();
 
             const actionText = enableAll ? 'enabled' : 'disabled';
             const expiredText = expiredCount > 0
@@ -1064,15 +1112,17 @@ class DungeonRecruitment {
             return interaction.editReply({ content: '### ❌ That Dungeon recruitment is no longer open.' });
         }
         const enableReminder = postReminder !== 'no';
-        const result = this.setRunReminders(run, enableReminder);
+        const [change] = await this.saveReminderChanges([run], enableReminder);
+        if (!change) {
+            return interaction.editReply({ content: '### ❌ That Dungeon recruitment is no longer open.' });
+        }
+        const { result } = change;
         if (result.expired) {
-            this.saveRuns();
             return interaction.editReply({
                 content: `### ⏳ Reminders cannot be re-enabled for **${this.formatDungeonName(run)}** because it is older than 24 hours.`
             });
         }
 
-        this.saveRuns();
         return interaction.editReply({
             content:
                 `### ✅ Dungeon reminders updated\n` +
@@ -1113,7 +1163,6 @@ class DungeonRecruitment {
         descriptionLines.push(`- Dungeon Registration: **${run.closed ? 'Closed!\u2002:x:' : 'Open!\u2002:white_check_mark:'}**`);
 
         const embed = new EmbedBuilder()
-            // .setTitle(`${run.titleEmoji}  ${run.dungeonName} Dungeon`)
             .setColor(run.color)
             .setDescription(descriptionLines.join('\n'))
             .setFooter({
@@ -1361,23 +1410,38 @@ class DungeonRecruitment {
     }
 
     scheduleDeadline(run) {
-        if (!run.registrationEndTime || run.closed) return;
+        if (this.stopped || !run.registrationEndTime || run.closed) return;
 
         const delay = run.registrationEndTime.getTime() - Date.now();
         if (delay <= 0) {
-            this.closeRun(run.id, 'deadline', this.client).catch(err => console.error('[WW LOG] Dungeon deadline close failed:', err));
+            this.closeRunAtDeadline(run);
             return;
         }
 
         const timeoutDelay = Math.min(delay, MAX_TIMEOUT_MS);
         run.deadlineTimeout = setTimeout(() => {
             run.deadlineTimeout = null;
+            if (this.stopped) return;
             if (Date.now() >= run.registrationEndTime.getTime()) {
-                this.closeRun(run.id, 'deadline', this.client).catch(err => console.error('[WW LOG] Dungeon deadline close failed:', err));
+                this.closeRunAtDeadline(run);
             } else {
                 this.scheduleDeadline(run);
             }
         }, timeoutDelay);
+    }
+
+    closeRunAtDeadline(run, sourceMessage = null) {
+        return this.closeRun(run.id, 'deadline', this.client, sourceMessage).catch(err => {
+            console.error('[WW LOG] Dungeon deadline close failed:', err);
+            if (this.stopped || run.closed || this.activeRuns.get(run.id) !== run) return;
+
+            // A failed local save leaves the run open; retry without a tight timer loop.
+            run.deadlineTimeout = setTimeout(() => {
+                run.deadlineTimeout = null;
+                this.scheduleDeadline(run);
+            }, 60_000);
+            run.deadlineTimeout.unref?.();
+        });
     }
 
     async handleButton(interaction) {
@@ -1413,7 +1477,41 @@ class DungeonRecruitment {
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+        return this.queueRunOperation(runId, () => this.handleRunButton(interaction, run, role));
+    }
+
+    async queueRunOperation(runId, work) {
+        return this.queueRunOperations([runId], work);
+    }
+
+    async queueRunOperations(runIds, work) {
+        this.runButtonQueues ??= new Map();
+        const ids = [...new Set(runIds)];
+        const previous = ids.map(id => this.runButtonQueues.get(id) || Promise.resolve());
+        const pending = Promise.all(previous.map(operation => operation.catch(() => {}))).then(work);
+        for (const id of ids) this.runButtonQueues.set(id, pending);
+        try {
+            return await pending;
+        } finally {
+            for (const id of ids) {
+                if (this.runButtonQueues.get(id) === pending) this.runButtonQueues.delete(id);
+            }
+        }
+    }
+
+    async handleRunButton(interaction, run, role) {
+        // A deadline or another join can close the run while acknowledgement is pending.
+        if (this.stopped || run.closed || this.activeRuns.get(run.id) !== run) {
+            await interaction.editReply({ content: '### ⏳ This dungeon recruitment has already closed.' });
+            return true;
+        }
+
         const claimedBy = run.assignments[role.key];
+        const previousState = {
+            assignments: { ...run.assignments },
+            memberNames: { ...run.memberNames },
+            joinOrder: [...(run.joinOrder || [])]
+        };
         if (claimedBy === interaction.user.id) {
             run.memberNames ??= {};
             run.memberNames[interaction.user.id] ??= interaction.member?.displayName ?? interaction.user.globalName ?? interaction.user.username;
@@ -1422,13 +1520,15 @@ class DungeonRecruitment {
                 run.joinOrder = (run.joinOrder ?? []).filter(userId => userId !== interaction.user.id);
             }
 
+            try { await this.saveRuns(); }
+            catch (error) { Object.assign(run, previousState); throw error; }
+
             await this.sendJoinNotification(run, interaction, role, 'left');
 
             await interaction.message.edit({
                 embeds: [this.buildEmbed(run)],
                 components: this.buildComponents(run)
             });
-            this.saveRuns();
 
             await interaction.editReply({
                 content: `❌ You have been successfully removed from **${this.formatDungeonName(run)}** with the role: **${this.formatRoleLabel(role)}**.`
@@ -1459,17 +1559,19 @@ class DungeonRecruitment {
             run.joinOrder.push(interaction.user.id);
         }
 
+        try { await this.saveRuns(); }
+        catch (error) { Object.assign(run, previousState); throw error; }
+
         const isNowFull = this.isFull(run);
         await this.sendJoinNotification(run, interaction, role);
 
         if (isNowFull) {
-            await this.closeRun(run.id, 'full', interaction.client, interaction.message);
+            await this.closeRunNow(run.id, 'full', interaction.client, interaction.message);
         } else {
             await interaction.message.edit({
                 embeds: [this.buildEmbed(run)],
                 components: this.buildComponents(run)
             });
-            this.saveRuns();
         }
 
         await interaction.editReply({
@@ -1484,10 +1586,24 @@ class DungeonRecruitment {
     }
 
     async closeRun(runId, reason, client, sourceMessage = null) {
+        return this.queueRunOperation(runId, () => this.closeRunNow(runId, reason, client, sourceMessage));
+    }
+
+    async closeRunNow(runId, reason, client, sourceMessage = null) {
         const run = this.activeRuns.get(runId);
         if (!run || run.closed) return;
 
+        const previousState = {
+            closed: run.closed, remindersEnabled: run.remindersEnabled,
+            closeReason: run.closeReason, closedAt: run.closedAt, status: run.status
+        };
         this.markRunClosed(run, reason);
+        try {
+            await this.saveRuns(run);
+        } catch (error) {
+            Object.assign(run, previousState);
+            throw error;
+        }
         if (run.deadlineTimeout) {
             clearTimeout(run.deadlineTimeout);
             run.deadlineTimeout = null;

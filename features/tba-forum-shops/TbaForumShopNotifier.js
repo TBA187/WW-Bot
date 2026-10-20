@@ -1,7 +1,7 @@
 'use strict';
 
-// Builds the small owner DM used for new messages in either shop topic.
-const { EmbedBuilder } = require('discord.js');
+// Builds the small owner DM used for new messages in either forum shop topic.
+const { EmbedBuilder, embedLength } = require('discord.js');
 const {
     EMBED_COLOR,
     IGNORED_FORUM_USERNAME,
@@ -130,13 +130,12 @@ class TbaForumShopNotifier {
             });
         });
 
-        splitMessage(post.bodyText).slice(0, 5).forEach((value, index) => {
-            embed.addFields({
-                name: index === 0 ? 'Message Content:' : 'Message Content (continued):',
-                value,
-                inline: false
-            });
-        });
+        for (const [index, value] of splitMessage(post.bodyText).slice(0, 5).entries()) {
+            const name = index === 0 ? 'Message Content:' : 'Message Content (continued):';
+            // Quoted text shares Discord's 6,000-character budget with the customer's reply.
+            if (embedLength(embed.data) + name.length + value.length > 6000) break;
+            embed.addFields({ name, value, inline: false });
+        }
 
         const firstImage = downloadedImages[0];
         const files = [];
@@ -155,8 +154,8 @@ class TbaForumShopNotifier {
         };
     }
 
-    async sendRemainingMessageContent(owner, bodyText) {
-        const remaining = splitMessage(bodyText).slice(5);
+    async sendRemainingMessageContent(owner, bodyText, embeddedChunks = 5) {
+        const remaining = splitMessage(bodyText).slice(embeddedChunks);
         for (const value of remaining) {
             await owner.send({
                 content: `**Message Content (continued):**\n${value}`,
@@ -190,8 +189,11 @@ class TbaForumShopNotifier {
             console.log(`[WW LOG] Skipped duplicate ${shop.name} DM for forum post ${post.postId}.`);
             return existing;
         }
-        const message = await owner.send(this.buildPayload(shop, post, downloadedImages));
-        await this.sendRemainingMessageContent(owner, post.bodyText);
+        const payload = this.buildPayload(shop, post, downloadedImages);
+        const embeddedChunks = (payload.embeds[0].data.fields || [])
+            .filter(field => field.name.startsWith('Message Content')).length;
+        const message = await owner.send(payload);
+        await this.sendRemainingMessageContent(owner, post.bodyText, embeddedChunks);
         await this.sendAdditionalImages(owner, downloadedImages);
         return message;
     }

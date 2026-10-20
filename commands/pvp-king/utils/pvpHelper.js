@@ -1,3 +1,4 @@
+// Shares PvP permissions, channel checks and cached King-role validation.
 const { MessageFlags } = require('discord.js');
 const { fetchGuildMemberRoster } = require('../../../utils/guildMemberRoster.js');
 

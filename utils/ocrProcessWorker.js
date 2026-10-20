@@ -1,9 +1,10 @@
 'use strict';
 
+// Runs OCR in a child process and handles request deadlines, failures, and cleanup.
 const { fork } = require('node:child_process');
 const path = require('node:path');
 
-// Keep the unchanged Tesseract API behind IPC. Ending a worker thread can leave
+// Keep Tesseract behind IPC. Ending a worker thread can leave
 // native allocator arenas resident in the bot; ending this process releases them.
 async function createOcrProcessWorker({ cachePath, workerOptions = {}, forkProcess = fork,
     scriptPath = path.join(__dirname, 'ocrProcessEntry.js'), timeoutMs = 120_000 } = {}) {

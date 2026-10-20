@@ -22,6 +22,9 @@ function registryFixture() {
         async handleCreate(message) { calls.push(`create:${this.server}:${message.id}`); }
         async handleUpdate(message) { calls.push(`update:${this.server}:${message.id}`); }
         async handleDelete(message) { calls.push(`delete:${this.server}:${message.id}`); }
+        async handleDeleteBulk(messages) {
+            for (const message of messages) calls.push(`bulk:${this.server}:${message.id}`);
+        }
     }
     const registry = new ScoutServerRegistry({ Store, Ingestor, config: {
         guildId: 'guild', pvpScoutingGoldChannelID: 'gold-channel', pvpScoutingSilverChannelID: 'silver-channel'
@@ -78,6 +81,53 @@ test('events route create, edit, and delete only to the source server', async ()
     await handlers.get('messageCreate')({ ...gold, channelId: 'unrelated' });
     await handlers.get('messageCreate')({ ...silver, author: { id: 'bot', bot: true } });
     assert.deepEqual(calls, ['create:gold:one', 'update:silver:two', 'delete:silver:two']);
+});
+
+test('bulk-delete events reach the originating archive, including uncached messages', async () => {
+    const { registry, calls } = registryFixture();
+    const handlers = new Map();
+    events.register({ user: { id: 'bot' }, on: (type, handler) => handlers.set(type, handler) }, { scoutServers: registry });
+    for (const server of ['gold', 'silver']) {
+        const messages = new Map([['one', { id: 'one', channelId: `${server}-channel`, partial: true }],
+            ['two', { id: 'two', channelId: `${server}-channel`, author: { id: 'reporter' } }]]);
+        await handlers.get('messageDeleteBulk')(messages, { id: `${server}-channel` });
+    }
+    await handlers.get('messageDeleteBulk')(new Map(), { id: 'unrelated' });
+    assert.deepEqual(calls, ['bulk:gold:one', 'bulk:gold:two', 'bulk:silver:one', 'bulk:silver:two']);
+});
+
+test('bulk deletion regroups once and removes only eligible source feedback for each server', async t => {
+    for (const server of ['gold', 'silver']) {
+        const calls = [];
+        const ingestor = new PvpScoutIngestor({ server, channelId: `${server}-channel`,
+            client: { user: { id: 'bot' } }, ocr: {},
+            store: { markDeleted: async (id, channel) => calls.push(['deleted', id, channel]) },
+            feedback: { stop: async () => {}, remove: async id => calls.push(['feedback', id]) } });
+        ingestor.rebuildGroups = async () => calls.push(['regroup']);
+        t.after(() => ingestor.stop());
+        await ingestor.handleDeleteBulk([
+            { id: 'uncached', channelId: `${server}-channel`, partial: true },
+            { id: 'cached', channelId: `${server}-channel`, author: { id: 'reporter' } },
+            { id: 'other-server', channelId: `${server === 'gold' ? 'silver' : 'gold'}-channel` },
+            { id: 'bot-message', channelId: `${server}-channel`, author: { id: 'bot', bot: true } }
+        ]);
+        assert.deepEqual(calls, [['deleted', 'uncached', `${server}-channel`],
+            ['deleted', 'cached', `${server}-channel`], ['regroup'],
+            ['feedback', 'uncached'], ['feedback', 'cached']]);
+    }
+});
+
+test('one failed bulk-deletion write does not skip the remaining messages or successful feedback cleanup', async t => {
+    const calls = [];
+    const ingestor = new PvpScoutIngestor({ channelId: 'gold-channel', client: { user: { id: 'bot' } }, ocr: {},
+        store: { async markDeleted(id) { calls.push(['deleted', id]); if (id === 'failed') throw new Error('Write failed'); } },
+        feedback: { stop: async () => {}, remove: async id => calls.push(['feedback', id]) } });
+    ingestor.rebuildGroups = async () => calls.push(['regroup']);
+    t.after(() => ingestor.stop());
+    await assert.rejects(ingestor.handleDeleteBulk(['first', 'failed', 'last'].map(id => ({ id, channelId: 'gold-channel' }))),
+        error => error instanceof AggregateError && error.errors.length === 1);
+    assert.deepEqual(calls, [['deleted', 'first'], ['deleted', 'failed'], ['deleted', 'last'], ['regroup'],
+        ['feedback', 'first'], ['feedback', 'last']]);
 });
 
 test('one server cannot retrieve or save a source from the other channel', async () => {

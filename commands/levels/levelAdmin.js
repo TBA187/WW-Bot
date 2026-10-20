@@ -1,6 +1,4 @@
-// ===========================
-// Admin - Modify Levels & XP
-// ===========================
+// Manage XP and levels.
 
 const {
     SlashCommandBuilder,

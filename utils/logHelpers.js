@@ -1,10 +1,7 @@
-// =============================
-// UTILS: Shared Logging Logic
-// ============================
+// Share audit-log lookup and formatting for channel and member events.
 const { ChannelType, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 
 module.exports = {
-    // Helper to pause execution (replaces new Promise(res => setTimeout(res, 1500)))
     sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
 
     // Helper to check if a channel/thread should be ignored for logging
@@ -13,7 +10,6 @@ module.exports = {
     },
 
     // Helper to fetch and find the correct audit log entry
-    // Updated Helper to be more robust
     fetchTargetAuditLog: async (guild, actionType, targetId, maxAgeMs = 15000) => {
         if (!guild) return null;
         try {
@@ -25,16 +21,12 @@ module.exports = {
             });
 
             return fetchedLogs.entries.find(e => {
-                // 1. Match the action type (if provided)
-                // If actionType is null/undefined, we skip this check (useful for permission batches)
                 if (actionType && e.action !== actionType) return false;
 
-                // 2. Check the timing (did it happen recently?)
                 const isRecent = (Date.now() - e.createdTimestamp) < maxAgeMs;
                 if (!isRecent) return false;
 
-                // 3. THE CRITICAL FIX: Check targetId (raw string) OR extra data
-                // This covers standard Create/Delete AND the tricky Permission Overwrites
+                // Permission overwrites may identify the channel in extra rather than target.
                 return (
                     String(e.targetId || e.target?.id || '') === String(targetId) ||
                     String(e.extra?.channel?.id || '') === String(targetId) ||

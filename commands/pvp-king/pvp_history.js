@@ -1,9 +1,8 @@
+// Displays recent PvP reigns, combining consecutive defenses by the same King.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_history
-// ----------------------
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { stopIfOnCooldown } = require('./utils/pvpHelper.js');
+const { splitMessageParts } = require('./utils/pvpMessages.js');
 
 class PvpHistory {
 
@@ -67,7 +66,6 @@ class PvpHistory {
                 displayRows.push({
                     king_id: lastRow.king_id,
                     king_name: lastRow.king_name,
-                    // type: firstRow.type,
                     created_at: firstRow.created_at,
                     total_wins_after: lastRow.total_wins_after,
                     streak_after: lastRow.streak_after,
@@ -100,12 +98,16 @@ class PvpHistory {
                 `       **→ Total Wins:  ${currentKing.total_wins_after}  🏆**`
             );
 
-            await interaction.editReply(
+            const messages = splitMessageParts([
                 `# 👑  PvP King History in ${this.pvpServerName} (Last ${historyRows.length} entries)  👑\n` +
-                `**<:pepe_king:1455434151262949535>  ${totalKings} individual PvP Kings have ruled White Walkers so far! View all PvP Kings with the \`/pvp_leaderboard\` command.**\n\n` +
-                entries.join('\n') +
+                `**<:pepe_king:1455434151262949535>  ${totalKings} individual PvP Kings have ruled White Walkers so far! View all PvP Kings with the \`/pvp_leaderboard\` command.**\n\n`,
+                ...entries.map((entry, index) => (index ? '\n' : '') + entry),
                 `\n\n### View all \`${totalKingEntries}\` PvP King entries in <#${this.historyThreadID}>`
-            );
+            ], '');
+            await interaction.editReply({ content: messages[0], allowedMentions: { parse: [] } });
+            for (const content of messages.slice(1)) {
+                await interaction.followUp({ content, allowedMentions: { parse: [] } });
+            }
 
         } catch (err) {
             console.error(err);

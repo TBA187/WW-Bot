@@ -3,6 +3,9 @@
 // Checks the PRO forum for new posts, records how each one was classified, and sends the matching Discord alert.
 const crypto = require('crypto');
 const { runtimeActivity } = require('../../utils/runtimeActivity.js');
+const { shutdownError } = require('../../utils/abortable.js');
+const { uniqueForumPosts } = require('../../utils/forumPagination.js');
+const { forumRetryDelay } = require('../../utils/forumRetry.js');
 const {
     CLASSIFICATIONS,
     MAX_BACKOFF_MS,
@@ -107,6 +110,10 @@ class GuildApplicationMonitor {
         await this.ocr.close();
     }
 
+    checkRunning() {
+        if (this.stopped) throw shutdownError();
+    }
+
     forumRestored() {
         if (this.forumUnavailable) console.log('[WW LOG] PRO Forum application monitor connection restored.');
         this.forumUnavailable = false;
@@ -116,8 +123,7 @@ class GuildApplicationMonitor {
 
     forumFailed(error) {
         this.failureCount++;
-        const exponential = Math.min(MAX_BACKOFF_MS, this.intervalMs * (2 ** Math.min(this.failureCount - 1, 6)));
-        const delay = Math.min(MAX_BACKOFF_MS, Math.max(exponential, error.retryAfterMs || 0));
+        const delay = forumRetryDelay(this.intervalMs, this.failureCount, MAX_BACKOFF_MS, error.retryAfterMs);
         this.nextAttemptAt = Date.now() + delay;
         if (!this.forumUnavailable) {
             console.warn(`[WW LOG] PRO Forum application monitor is unavailable. Retrying in ${Math.ceil(delay / 60000)} minute(s):`, error.message);
@@ -132,14 +138,18 @@ class GuildApplicationMonitor {
         try {
             this.staffFilter?.beginScan();
             const initialized = await this.store.isInitialized();
+            this.checkRunning();
             if (!initialized) await this.buildSilentBaseline();
             else {
                 await this.retryPendingNotifications();
+                this.checkRunning();
                 await this.scanForNewPosts();
             }
+            this.checkRunning();
             this.forumRestored();
             return true;
         } catch (error) {
+            if (error.code === 'BOT_SHUTTING_DOWN') return false;
             if (error instanceof ForumRequestError) this.forumFailed(error);
             else if (error.guildApplicationStorage) this.store.noteLocalStorageFailure(error);
             else console.error('[WW LOG] Guild Application monitor cycle failed:', error);
@@ -151,7 +161,9 @@ class GuildApplicationMonitor {
     }
 
     async readablePage(pageNumber, firstPage = null) {
+        this.checkRunning();
         const page = pageNumber === 1 && firstPage ? firstPage : await this.forum.fetchPage(pageNumber);
+        this.checkRunning();
         if (!(page.posts || []).length) {
             throw new ForumRequestError(`PRO Forum page ${pageNumber} did not contain any readable posts.`);
         }
@@ -182,16 +194,19 @@ class GuildApplicationMonitor {
     }
 
     async buildSilentBaseline() {
+        this.checkRunning();
         const firstPage = await this.forum.fetchPage(1);
+        this.checkRunning();
         await this.removeStoredTemplateImages();
         const lastPage = Math.max(1, Number(firstPage.lastPage) || 1);
         const pages = await this.fetchPages(Array.from({ length: lastPage }, (_, index) => index + 1), firstPage);
-        const posts = pages.flatMap(page => page.posts).sort(comparePosts);
+        const posts = uniqueForumPosts(pages).sort(comparePosts);
         const latestApplications = {};
         const records = [];
 
         // A fresh install learns the whole topic first; historical posts must never ping officers.
         for (const post of posts) {
+            this.checkRunning();
             records.push(await this.createRecord(post, {
                 baseline: true,
                 latestApplications,
@@ -199,6 +214,7 @@ class GuildApplicationMonitor {
             }));
         }
 
+        this.checkRunning();
         if (records.length) await this.store.saveRecords(records);
         await this.store.markInitialized({
             lastPage,
@@ -223,8 +239,10 @@ class GuildApplicationMonitor {
     }
 
     async scanForNewPosts() {
+        this.checkRunning();
         const checkpoint = this.store.getCheckpoint();
         const firstPage = await this.forum.fetchPage(1);
+        this.checkRunning();
         await this.removeStoredTemplateImages();
         const lastPage = Math.max(1, Number(firstPage.lastPage) || 1);
         const pages = await this.fetchPages(
@@ -232,13 +250,15 @@ class GuildApplicationMonitor {
             firstPage,
             checkpoint.lastPostId
         );
-        const posts = pages.flatMap(page => page.posts).sort(comparePosts);
+        const posts = uniqueForumPosts(pages).sort(comparePosts);
         const knownIds = await this.store.knownPostIds(posts.map(post => post.postId));
         const unseen = posts.filter(post => !knownIds.has(String(post.postId)));
         const latestApplications = { ...(checkpoint.latestApplications || {}) };
 
         for (const post of unseen) {
+            this.checkRunning();
             const record = await this.createRecord(post, { baseline: false, latestApplications });
+            this.checkRunning();
             const saved = await this.store.saveRecord(record);
             if (saved.classification === CLASSIFICATIONS.APPLICATION) {
                 await this.notifyStoredApplication(saved, post);
@@ -247,6 +267,7 @@ class GuildApplicationMonitor {
             }
         }
 
+        this.checkRunning();
         await this.store.updateCheckpoint({
             lastPage,
             lastPostId: latestPostId(posts, checkpoint.lastPostId),
@@ -280,8 +301,10 @@ class GuildApplicationMonitor {
     }
 
     async createRecord(post, options) {
+        this.checkRunning();
         const parsed = this.parser.parse(post);
         const staff = await this.staffFilter?.matchAuthor(post.forumUsername);
+        this.checkRunning();
         if (staff) {
             parsed.classification = CLASSIFICATIONS.IGNORED_AUTHOR;
             parsed.confidence = 1;
@@ -291,8 +314,9 @@ class GuildApplicationMonitor {
         let ocrResult = { ign: parsed.fields.ign, source: parsed.ignSource, confidence: parsed.ignConfidence, output: null };
 
         if (parsed.classification === CLASSIFICATIONS.APPLICATION && !parsed.fields.ign && post.imageUrls.length) {
-            // OCR is deliberately last: most applications are resolved from cheap, reliable text labels.
+            // Read images only when the application text does not identify the player.
             downloadedForOcr = await this.forum.downloadPostImages(post, 2);
+            this.checkRunning();
             ocrResult = await this.ocr.resolveIgn(post, parsed, downloadedForOcr);
         }
 
@@ -408,9 +432,12 @@ class GuildApplicationMonitor {
     }
 
     async notifyStoredApplication(record, originalPost = null) {
+        this.checkRunning();
         if (await this.suppressStaffNotification(record)) return record;
+        this.checkRunning();
         const post = originalPost || this.postFromRecord(record);
         const downloadedImages = await this.forum.downloadPostImages(post);
+        this.checkRunning();
 
         try {
             const updated = await this.notifier.notify(record, {
@@ -435,7 +462,9 @@ class GuildApplicationMonitor {
     }
 
     async notifyStoredNonApplication(record) {
+        this.checkRunning();
         if (await this.suppressStaffNotification(record)) return record;
+        this.checkRunning();
         if (!this.nonApplicationNotifier) return record;
         try {
             const { record: updated } = await this.nonApplicationNotifier.notify(record);
@@ -450,8 +479,10 @@ class GuildApplicationMonitor {
     }
 
     async retryPendingNotifications() {
+        this.checkRunning();
         const pending = await this.store.pendingNotifications();
         for (const record of pending) await this.notifyStoredApplication(record);
+        this.checkRunning();
         const nonApplications = await this.store.pendingNonApplicationAlerts();
         for (const record of nonApplications) await this.notifyStoredNonApplication(record);
     }

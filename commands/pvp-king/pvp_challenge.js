@@ -1,7 +1,5 @@
+// Confirms a member's challenge and lets the current King accept or decline it.
 const { wrapPvpServerCommand } = require('./utils/pvpServers.js');
-// ----------------------
-// /pvp_challenge
-// ----------------------
 const { SlashCommandBuilder, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const { getServerLogo, getServerBanner, pvpThumnbnail, pvpBannerImage, createPvpFooter, createPvpLogFooter } = require('./utils/pvpAssets.js');
 const { formatNowMinute, requirePvpChannel, resolveSinglePvpKing, stopIfOnCooldown } = require('./utils/pvpHelper.js');
@@ -20,6 +18,7 @@ class PvpChallengeKing {
         //this.activeChallenge = null;
         this.challengeTimeouts = config.challengeTimeouts;
         this.onCooldown = config.onCooldown;
+        this.pendingResponses = new Set();
 
         this.data = new SlashCommandBuilder()
             .setName('pvp_challenge')
@@ -32,7 +31,7 @@ class PvpChallengeKing {
         if (await stopIfOnCooldown(interaction, this.onCooldown, 'currentking', 2)) return;
 
         if (!await requirePvpChannel(interaction, this.pvpKingChannelID, 'pvp_challenge')) return;
-
+        
         // Auto-clear stale lock (15 minutes - Discord Limitation)
         //if (activeChallenge && Date.now() - activeChallenge.startedAt > 900000) {
         //   activeChallenge = null;
@@ -59,7 +58,6 @@ class PvpChallengeKing {
             if (!kingCheck.ok) return;
 
             const currentKing = kingCheck.currentKing;
-            // currentKingId = currentKing.id; // re-sync automatically
 
             if (interaction.user.id === currentKing.id) {
                 return interaction.editReply({
@@ -162,8 +160,6 @@ class PvpChallengeKing {
 
             this.challengeTimeouts.set(interaction.user.id, timeout);
 
-            // Next code is executed from handleButton()
-
         } catch (err) {
             console.error(err);
             return interaction.editReply({ content: '### ⚠️ Error executing command.' });
@@ -176,6 +172,26 @@ class PvpChallengeKing {
     }
 
     async handleButton(interaction) {
+        const parts = String(interaction.customId || '').split('_');
+        const [, action, kingId, challengerId] = parts;
+        if (parts.length !== 4 || !['accept', 'decline'].includes(action)
+            || interaction.user.id !== kingId) return this.handleChallengeButton(interaction);
+
+        const key = `${kingId}:${challengerId}`;
+        if (this.pendingResponses.has(key)) {
+            await interaction.reply({ content: '### ⏳ This challenge response is already being processed.', flags: MessageFlags.Ephemeral });
+            return true;
+        }
+        // Disabling a button does not stop a second interaction already in flight.
+        this.pendingResponses.add(key);
+        try {
+            return await this.handleChallengeButton(interaction);
+        } finally {
+            this.pendingResponses.delete(key);
+        }
+    }
+
+    async handleChallengeButton(interaction) {
         if (!interaction.customId.startsWith("pvp_")) return false;
 
         const { guild } = interaction;
@@ -196,7 +212,7 @@ class PvpChallengeKing {
                 return interaction.reply({ content: "### ❌  This confirmation isn't for you!", flags: MessageFlags.Ephemeral });
             }
 
-            // Swap out the buttons for a disabled "Loading..." button before doing anything else (Prevents button spam)
+            // Acknowledge before fetching members or publishing the challenge.
             const challengerLoadingRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId('pvp_challenger_loading')
@@ -205,7 +221,7 @@ class PvpChallengeKing {
                     .setDisabled(true)
             );
 
-            await interaction.update({ components: [challengerLoadingRow] }); // deferReply
+            await interaction.update({ components: [challengerLoadingRow] });
 
             const timeout = this.challengeTimeouts.get(challengerId);
             if (timeout) {
@@ -250,7 +266,6 @@ class PvpChallengeKing {
                         `## <@&${this.pvpKingRoleID}> has been challenged in ${this.pvpServerName} ${this.pvpServerEmoji}\n\n` +
                         `**🏆 <@${kingId}>**, do you accept the challenge from <@${challengerId}>?\n` +
                         `-# When the PvP King accepts the challenge, a **48 hours cooldown** will be applied to the challenger.\n-# When a new King is Crowned, all active cooldowns will reset and the New King may be challenged immediately!`,
-                    //`-# The **Accept / Decline** buttons can become unresponsive (Discord limitation). If that's the case, the challenger **(${interaction.user.displayName})** must be pinged manually.`,
                     components: [row]
                 });
 
@@ -278,7 +293,7 @@ class PvpChallengeKing {
             });
         }
 
-        // Swap out the buttons for a disabled "Loading..." button before doing anything else (Prevents button spam)
+        // Acknowledge before fetching members or saving the response.
         const kingLoadingRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
                 .setCustomId('pvp_king_loading')
@@ -287,11 +302,10 @@ class PvpChallengeKing {
                 .setDisabled(true)
         );
 
-        await interaction.update({ components: [kingLoadingRow] }); // deferUpdate
+        await interaction.update({ components: [kingLoadingRow] });
 
         const currentKing = await interaction.guild.members.fetch(kingId).catch(() => null);
         const challenger = await interaction.guild.members.fetch(challengerId).catch(() => null);
-        const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
         const unixNow = Math.floor(Date.now() / 1000);
 
         if (!currentKing || !challenger) {
@@ -320,62 +334,83 @@ class PvpChallengeKing {
 
         if (actionType === 'pvp_accept') {
             //activeChallenge = null;
-            const acceptEmbed = new EmbedBuilder()
-                .setTitle('<:kyurem:1472065995089645609>\u2002White Walkers Awaken!\u2002<:kyurem:1472065995089645609>')
-                .setDescription(`Winter is coming… the Frozen Throne awaits no mortal. The White Walkers spare none; only the strongest shall endure the frost!\u2002🧊\n\u200B`)
-                .setColor(this.pvpServerColor)
-                .addFields(
-                    { name: '👑 The Night King', value: `<@${kingId}>`, inline: true },
-                    { name: '🗡️ Frostborn Challenger', value: `<@${challengerId}>`, inline: true }
-                    // { name: '📅 🌑 Time of Reckoning', value: `<t:${unixNow}:F>` }
-                )
-                .setThumbnail(currentKing.displayAvatarURL())
-                .setImage(pvpBannerImage)
-                .setFooter(createPvpFooter(this.pvpServerName))
-                .setTimestamp();
+            let cooldownSaved = false;
+            try {
+                const cooldown = await this.db.getCooldown(challengerId);
+                const lastChallenge = cooldown?.last_challenge
+                    ? new Date(`${cooldown.last_challenge}Z`).getTime() : NaN;
+                if (String(cooldown?.king_id) === kingId && Date.now() - lastChallenge < 48 * 60 * 60 * 1000) {
+                    await interaction.editReply({
+                        content: '### ⏳ This challenger already has an active cooldown against the current PvP King. This request cannot be accepted again.',
+                        components: []
+                    });
+                    return true;
+                }
+                await this.db.upsertChallengeCooldown(challengerId, challenger.displayName, kingId, currentKing.displayName);
+                cooldownSaved = true;
 
-            // Send the NEW message first and capture it in a variable
-            const newMessage = await interaction.channel.send({
-                content: `## ⚔️  The PvP King in ${this.pvpServerName} (${currentKing.displayName}) accepted a challenge from <@${challengerId}>  ${this.pvpServerEmoji}\n**❄️  Winter decides their fate… all who fall will freeze in its wake!  ❄️**\n\u200B`,
-                embeds: [acceptEmbed],
-                files: [getServerBanner(), getServerLogo()]
-            });
-
-            // Edit the OLD message and include the link to the NEW one
-            await interaction.editReply({
-                content: `~~${interaction.message.content}~~\n### ✅ Challenge Accepted: <t:${unixNow}:F>\n🔗 **[Jump to Challenge Message](${newMessage.url})**`,
-                components: []
-            });
-
-            // When King accepts challenge: Log timestamp for challenger cooldown in the DB
-            await this.db.upsertChallengeCooldown(challengerId, challenger.displayName, kingId, currentKing.displayName);
-
-            // Log to Discord Log Channel
-            if (logChannel) {
-                const logEmbed = new EmbedBuilder()
-                    // .setTitle('🏆\u2002PvP King Challenge Accepted!\u2002🏆')
-                    .setDescription(
-                        `### 🏆\u2002The PvP King in ${this.pvpServerName} accepted a challenge!\u2002🏆\n` +
-                        `**Post-Battle Instructions:**\n` +
-                        `-# Once the PvP King battle ends, make sure to check the posted screenshot, or ask the PvP King / Challenger to post a screenshot in <#${this.pvpKingChannelID}>\n` +
-                        `### ⚠️\u2002There can be 2 scenarios:\n` +
-                        `- **👑\u2002If the challenger wins:**\n   - Use \`/pvp_crown\` targeting <@${challengerId}>\n` +
-                        `- **🛡️\u2002If the King defends:**\n   - Use \`/pvp_crown\` targeting <@${kingId}> to log the winning streak 🔥\n` +
-                        `### 🔗\u2002Message Link:\u2002[Jump to Acceptance Message](${newMessage.url})\n`
-                    )
+                const acceptEmbed = new EmbedBuilder()
+                    .setTitle('<:kyurem:1472065995089645609>\u2002White Walkers Awaken!\u2002<:kyurem:1472065995089645609>')
+                    .setDescription(`Winter is coming… the Frozen Throne awaits no mortal. The White Walkers spare none; only the strongest shall endure the frost!\u2002🧊\n\u200B`)
                     .setColor(this.pvpServerColor)
                     .addFields(
-                        { name: '👑 PvP King', value: `<@${kingId}>`, inline: true },
-                        { name: '🗡️ Challenger', value: `<@${challengerId}>`, inline: true }
-                        // { name: '📅 Time of Acceptance', value: `<t:${unixNow}:F>`, inline: true },
+                        { name: '👑 The Night King', value: `<@${kingId}>`, inline: true },
+                        { name: '🗡️ Frostborn Challenger', value: `<@${challengerId}>`, inline: true }
+                        // { name: '📅 🌑 Time of Reckoning', value: `<t:${unixNow}:F>` }
                     )
-                    .setThumbnail(pvpThumnbnail)
+                    .setThumbnail(currentKing.displayAvatarURL())
+                    .setImage(pvpBannerImage)
                     .setFooter(createPvpFooter(this.pvpServerName))
                     .setTimestamp();
 
-                await logChannel.send({
-                    embeds: [logEmbed],
-                    files: [getServerLogo()]
+                // Send the NEW message first and capture it in a variable
+                const newMessage = await interaction.channel.send({
+                    content: `## ⚔️  The PvP King in ${this.pvpServerName} (${currentKing.displayName}) accepted a challenge from <@${challengerId}>  ${this.pvpServerEmoji}\n**❄️  Winter decides their fate… all who fall will freeze in its wake!  ❄️**\n\u200B`,
+                    embeds: [acceptEmbed],
+                    files: [getServerBanner(), getServerLogo()]
+                });
+
+                // Edit the OLD message and include the link to the NEW one
+                await interaction.editReply({
+                    content: `~~${interaction.message.content}~~\n### ✅ Challenge Accepted: <t:${unixNow}:F>\n🔗 **[Jump to Challenge Message](${newMessage.url})**`,
+                    components: []
+                });
+
+                // Log to Discord Log Channel
+                if (logChannel) {
+                    const logEmbed = new EmbedBuilder()
+                        // .setTitle('🏆\u2002PvP King Challenge Accepted!\u2002🏆')
+                        .setDescription(
+                            `### 🏆\u2002The PvP King in ${this.pvpServerName} accepted a challenge!\u2002🏆\n` +
+                            `**Post-Battle Instructions:**\n` +
+                            `-# Once the PvP King battle ends, make sure to check the posted screenshot, or ask the PvP King / Challenger to post a screenshot in <#${this.pvpKingChannelID}>\n` +
+                            `### ⚠️\u2002There can be 2 scenarios:\n` +
+                            `- **👑\u2002If the challenger wins:**\n   - Use \`/pvp_crown\` targeting <@${challengerId}>\n` +
+                            `- **🛡️\u2002If the King defends:**\n   - Use \`/pvp_crown\` targeting <@${kingId}> to log the winning streak 🔥\n` +
+                            `### 🔗\u2002Message Link:\u2002[Jump to Acceptance Message](${newMessage.url})\n`
+                        )
+                        .setColor(this.pvpServerColor)
+                        .addFields(
+                            { name: '👑 PvP King', value: `<@${kingId}>`, inline: true },
+                            { name: '🗡️ Challenger', value: `<@${challengerId}>`, inline: true }
+                            // { name: '📅 Time of Acceptance', value: `<t:${unixNow}:F>`, inline: true },
+                        )
+                        .setThumbnail(pvpThumnbnail)
+                        .setFooter(createPvpFooter(this.pvpServerName))
+                        .setTimestamp();
+
+                    await logChannel.send({
+                        embeds: [logEmbed],
+                        files: [getServerLogo()]
+                    });
+                }
+            } catch (error) {
+                console.warn('[WW LOG] PvP challenge acceptance failed:', error.code || error.name);
+                await interaction.editReply({
+                    content: cooldownSaved
+                        ? '### ⚠️ The challenge was accepted and its cooldown is saved, but some Discord updates failed. Officers should check the challenge messages; do not accept this request again.'
+                        : '### ⚠️ Could not confirm that the challenge cooldown was saved. Check `/pvp_cooldown` before trying again.',
+                    components: []
                 });
             }
         } else if (actionType === 'pvp_decline') {

@@ -1,3 +1,4 @@
+// Track outage alerts and recovery messages without repeating the same incident.
 'use strict';
 
 const { createHash } = require('node:crypto');

@@ -9,6 +9,89 @@ const {
 } = require('../events/channelLogs.js');
 const { findModerationAuditEntry } = require('../events/memberExit.js');
 const memberExit = require('../events/memberExit.js');
+const channelLogs = require('../events/channelLogs.js');
+
+function channelUpdateFixture(t, { sendError, fetchAuditLogs } = {}) {
+    const callbacks = [], sent = [], errors = [];
+    const controller = new AbortController();
+    t.mock.method(global, 'setTimeout', callback => {
+        callbacks.push(callback);
+        return { unref() {} };
+    });
+    t.mock.method(console, 'error', (...args) => errors.push(args));
+    const logChannel = { send: async payload => {
+        if (sendError) throw sendError;
+        sent.push(payload);
+    } };
+    const guild = {
+        id: 'guild-channel-update',
+        channels: { cache: new Collection([['log-channel', logChannel]]) },
+        fetchAuditLogs: fetchAuditLogs || (async () => ({ entries: new Collection([['entry', {
+            targetId: 'changed-channel', action: AuditLogEvent.ChannelUpdate,
+            createdTimestamp: Date.now(), executor: null
+        }]]) }))
+    };
+    const oldChannel = {
+        id: 'changed-channel', name: 'before', type: 0, guild,
+        permissionOverwrites: { cache: new Collection() }
+    };
+    const newChannel = { ...oldChannel, name: 'after' };
+    guild.channels.cache.set(newChannel.id, newChannel);
+    const config = { logChannelID: 'log-channel', shutdownSignal: controller.signal };
+    return { callbacks, sent, errors, controller, oldChannel, newChannel, config };
+}
+
+test('channel updates still log when the audit executor is unavailable', async t => {
+    const f = channelUpdateFixture(t);
+    await channelLogs.handleChannelUpdate(f.oldChannel, f.newChannel, f.config);
+    const batch = f.callbacks.shift()();
+    f.callbacks.shift()();
+    await batch;
+    assert.equal(f.errors.length, 0);
+    assert.equal(f.sent.length, 1);
+    const fields = f.sent[0].embeds[0].toJSON().fields;
+    assert.match(fields.find(field => field.name === 'Updated By').value, /Unknown User/);
+});
+
+test('delayed channel log delivery failures are handled by the timer callback', async t => {
+    const sendError = new Error('Missing channel permissions');
+    const f = channelUpdateFixture(t, { sendError });
+    await channelLogs.handleChannelUpdate(f.oldChannel, f.newChannel, f.config);
+    const batch = f.callbacks.shift()();
+    f.callbacks.shift()();
+    await batch;
+    assert.equal(f.errors.length, 1);
+    assert.equal(f.errors[0][1], sendError);
+});
+
+test('queued channel updates do not start audit lookups after shutdown', async t => {
+    let lookups = 0;
+    const f = channelUpdateFixture(t, { fetchAuditLogs: async () => {
+        lookups += 1;
+        return { entries: new Collection() };
+    } });
+    await channelLogs.handleChannelUpdate(f.oldChannel, f.newChannel, f.config);
+    f.controller.abort();
+    await f.callbacks.shift()();
+    assert.equal(lookups, 0);
+    assert.equal(f.callbacks.length, 0);
+    assert.equal(f.sent.length, 0);
+});
+
+test('a channel audit lookup finishing during shutdown does not send a log', async t => {
+    let resolveLookup;
+    const lookup = new Promise(resolve => { resolveLookup = resolve; });
+    const f = channelUpdateFixture(t, { fetchAuditLogs: () => lookup });
+    await channelLogs.handleChannelUpdate(f.oldChannel, f.newChannel, f.config);
+    const batch = f.callbacks.shift()();
+    f.callbacks.shift()();
+    await Promise.resolve();
+    f.controller.abort();
+    resolveLookup({ entries: new Collection() });
+    await batch;
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.errors.length, 0);
+});
 
 test('buildLogEmbed ignores malformed fields instead of passing strings to Discord', () => {
     const payload = buildLogEmbed('Thread Updated', null, 'thread-1', 0xFFA500, 'Thread', [

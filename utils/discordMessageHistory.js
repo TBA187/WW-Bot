@@ -1,5 +1,6 @@
 'use strict';
 
+// Finds recent bot messages so notification retries can recover prior deliveries.
 function messageSearchText(message) {
     const embeds = (message?.embeds || []).map(embed => {
         if (typeof embed?.toJSON === 'function') return embed.toJSON();

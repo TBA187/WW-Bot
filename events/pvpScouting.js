@@ -39,5 +39,15 @@ module.exports = {
                 console.error('[WW LOG] Failed to mark a deleted PvP scouting message:', error);
             }
         });
+
+        client.on('messageDeleteBulk', async (messages, channel) => {
+            const context = scoutingContext({ channelId: channel?.id || messages.first()?.channelId }, config);
+            if (!context) return;
+            try {
+                await context.ingestor?.handleDeleteBulk(messages.values());
+            } catch (error) {
+                console.error('[WW LOG] Failed to mark bulk-deleted PvP scouting messages:', error);
+            }
+        });
     }
 };

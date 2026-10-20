@@ -1,3 +1,4 @@
+// Shares the MySQL pool, tracks outages, and cancels retry delays during shutdown.
 require('dotenv').config({ quiet: true });
 const mysql = require('mysql2/promise');
 const { DatabaseHealthTracker } = require('./DatabaseHealthTracker.js');

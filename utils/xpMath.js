@@ -1,6 +1,4 @@
-// ==========================
-// Utility - XP Mathematics
-// ==========================
+// Calculate XP thresholds and levels using the configured progression curve.
 const xpSettings = require('../config/xpConfig');
 
 module.exports = {

@@ -16,6 +16,7 @@ pids
 *.pid.lock
 data/dungeon_runs.json
 data/dungeon_runs.json.tmp
+data/dungeon_runs.json.corrupt-*
 data/pvp_king_data.json
 data/pvp_king_data.json.tmp
 data/pvp_king_silver_data.json
@@ -25,6 +26,7 @@ data/giveaways.json.tmp
 data/giveaways.json.corrupt-*
 data/guild_settings.json
 data/guild_settings.json.tmp
+data/guild_settings.json.corrupt-*
 data/xp_pending.json
 data/xp_pending.json.tmp
 data/scout-autocomplete-cache.json
@@ -33,6 +35,7 @@ data/scout-autocomplete-silver-cache.json
 data/scout-autocomplete-silver-cache.json.tmp
 data/notifications.json
 data/notifications.json.tmp
+data/notifications.json.corrupt-*
 data/guild_applications.json
 data/guild_applications.json.tmp
 data/tba_forum_shops.json

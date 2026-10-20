@@ -1,9 +1,6 @@
-/**
- * @fileoverview Expose /edit_bot_msg and Edit Bot Message (Officer) for Leaders, Admins and Officers.
- * Edit text by message ID or through a private confirmation, with optional embed replacement.
- */
+// Let staff edit bot messages by ID or private confirmation while enforcing blocked destinations.
 
-// - TO-DO: Show ALSO CONTENT of Embeds when Created/Updated, and when Deleted
+// TODO: Include embed content in message creation, update and deletion logs.
 
 'use strict';
 
