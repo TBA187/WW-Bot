@@ -138,6 +138,8 @@ Console and monthly logs record failures immediately; Discord waits for persiste
 | Discord Gateway disconnection | After 1 minute |
 | Memory pressure | Immediately |
 
+Memory alerts and OCR pressure checks use container usage minus inactive file cache, matching Docker's working-set calculation. Raw container totals remain in console/file diagnostics. If inactive-cache accounting is unavailable, checks use the raw container total; without container metrics, runtime alerts use the bot process's RSS.
+
 Alerts contain fixed summaries rather than raw exceptions, credentials, SQL or payment details. Alert delivery is separate from commands and uses bounded in-memory incident tracking with retry delays. Incident tracking resets when the process restarts; a stopped process cannot send an alert.
 Routine reconnects, successful operations and normal cleanup remain in console/file logs.
 

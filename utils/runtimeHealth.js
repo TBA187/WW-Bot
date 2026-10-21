@@ -55,6 +55,20 @@ function effectiveMemoryLimit(container) {
     return Math.min(MEMORY_BUDGET_BYTES, positiveBytes(container?.limit) ?? MEMORY_BUDGET_BYTES);
 }
 
+function memoryPressureSample(container, rss = 0) {
+    // Docker subtracts inactive file cache for its displayed usage. Keep the raw
+    // total for diagnostics, but do not treat reclaimable cache as active pressure.
+    const hasWorkingSet = Number.isFinite(container?.workingSet)
+        && container.workingSet >= 0 && container.workingSet <= container.used;
+    return {
+        used: container ? hasWorkingSet ? container.workingSet : container.used : rss,
+        limit: effectiveMemoryLimit(container),
+        source: container ? hasWorkingSet ? 'container working set; inactive file cache excluded'
+            : 'container total; inactive file cache unavailable'
+            : 'bot RSS only; isolated OCR excluded'
+    };
+}
+
 function discordCacheCounts(client) {
     let messages = 0, members = 0;
     for (const channel of client?.channels?.cache?.values?.() || []) messages += channel.messages?.cache?.size || 0;
@@ -87,7 +101,7 @@ function formatMemorySample({ memory, heapLimit, container, caches, peakRss, ocr
         `main heap ${mib(memory.heapUsed)}/${mib(memory.heapTotal)} MiB (limit ${mib(heapLimit)} MiB)`,
         `external ${mib(memory.external)} MiB`, `buffers ${mib(memory.arrayBuffers || 0)} MiB`,
         ...(osPeakRss ? [`bot process OS lifetime peak ${mib(osPeakRss)} MiB`] : []),
-        ...(container ? [`container ${mib(container.used)}/${mib(effectiveMemoryLimit(container))} MiB (${(100 * container.used / effectiveMemoryLimit(container)).toFixed(1)}%)`,
+        ...(container ? [`container total including cache ${mib(container.used)}/${mib(effectiveMemoryLimit(container))} MiB (${(100 * container.used / effectiveMemoryLimit(container)).toFixed(1)}%)`,
             ...containerDetails(container)] : []),
         ...(!container ? [`container accounting unavailable; bot process RSS excludes isolated OCR; budget ${mib(MEMORY_BUDGET_BYTES)} MiB`] : []),
         ...(containerPeak ? [`container OS lifetime peak ${mib(containerPeak)} MiB (may include earlier bot runs)`] : []),
@@ -147,24 +161,23 @@ class RuntimeHealth {
     }
 
     pressureEvent(memory, container, now) {
-        const used = container?.used ?? memory.rss;
-        const limit = effectiveMemoryLimit(container);
+        const { used, limit, source } = memoryPressureSample(container, memory.rss);
         const ratio = used / limit;
         const level = ratio >= CRITICAL_RATIO ? 2 : ratio >= WARNING_RATIO ? 1 : 0;
         if (level && (!this.alertLevel || level > this.alertLevel || now - this.lastAlertAt >= ALERT_COOLDOWN_MS)) {
-            return { level, used, limit, ratio };
+            return { level, used, limit, ratio, source };
         } else if (this.alertLevel && ratio < RECOVERY_RATIO) {
-            return { level: 0, used, limit, ratio };
+            return { level: 0, used, limit, ratio, source };
         }
         return null;
     }
 
     reportPressure(event, memory, container, ocr, activity, now) {
         if (!event) return;
-        const { level, used, limit, ratio } = event;
-        const source = container ? 'container total including cache' : 'bot RSS only; isolated OCR excluded';
+        const { level, used, limit, ratio, source } = event;
         const label = level ? level === 2 ? 'CRITICAL' : 'WARNING' : 'Recovered below 75%';
-        const details = [...containerDetails(container), `bot RSS ${(memory.rss / MIB).toFixed(1)} MiB`,
+        const details = [...(container ? [`container total including cache ${(container.used / MIB).toFixed(1)} MiB`] : []),
+            ...containerDetails(container), `bot RSS ${(memory.rss / MIB).toFixed(1)} MiB`,
             `main heap ${(memory.heapUsed / MIB).toFixed(1)}/${(memory.heapTotal / MIB).toFixed(1)} MiB`,
             `OCR ${ocr?.pending || 0} queued/active task(s)${ocr?.creating ? ', initializing' : ''}`,
             ...jobDetails(activity)];
@@ -227,4 +240,4 @@ class RuntimeHealth {
     }
 }
 
-module.exports = { RuntimeHealth, readContainerMemory, discordCacheCounts, formatMemorySample, MEMORY_BUDGET_BYTES };
+module.exports = { RuntimeHealth, readContainerMemory, memoryPressureSample, discordCacheCounts, formatMemorySample, MEMORY_BUDGET_BYTES };

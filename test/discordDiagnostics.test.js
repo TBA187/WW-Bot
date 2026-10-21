@@ -433,6 +433,59 @@ test('local JSON write retries and memory pressure alert immediately but do not 
     assert.equal(f.sent.length, 4);
 });
 
+for (const label of ['WARNING', 'CRITICAL']) test(`startup ${label.toLowerCase()} memory pressure alerts immediately and recovers normally`, async t => {
+    const f = fixture();
+    t.after(() => f.logger.stop()); f.logger.start();
+    f.consoleObject.warn(`[RUNTIME MEMORY] ${label}: 470.0/512.0 MiB (91.8%; container).`);
+    await settle();
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].timestamp, new Date(1000).toISOString());
+    assert.equal(f.sent[0].statusKey, 'runtime:memory-pressure');
+    assert.ok(f.sent[0].message.includes(label));
+    assert.equal(f.clock.timers.size, 0);
+    f.logger.start();
+    f.consoleObject.warn(`[RUNTIME MEMORY] ${label}: 470.0/512.0 MiB (91.8%; container).`);
+    await settle();
+    assert.equal(f.sent.length, 1);
+    await f.clock.advance(80_000);
+    f.consoleObject.log('[RUNTIME MEMORY] Recovered below 75%: 370.0/512.0 MiB (container).');
+    await settle();
+    assert.equal(f.sent.length, 2);
+    assert.equal(f.sent[1].status, 'recovered');
+    assert.equal(f.sent[1].replyTo, 'message-1');
+    assert.equal(f.sent[1].durationMs, 80_000);
+});
+
+test('pre-login memory warnings deliver as soon as Discord is ready', async t => {
+    const f = fixture();
+    t.after(() => f.logger.stop());
+    f.consoleObject.warn('[RUNTIME MEMORY] WARNING: 420.0/512.0 MiB (82.0%; container).');
+    await settle();
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.clock.timers.size, 0);
+    f.logger.start(); f.logger.start(); await settle();
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].statusKey, 'runtime:memory-pressure');
+    assert.equal(f.sent[0].timestamp, new Date(1000).toISOString());
+    assert.equal(f.clock.timers.size, 0);
+});
+
+test('OCR pressure warnings deliver immediately after login, including buffered startup warnings', async t => {
+    const notice = '[WW LOG] OCR memory pressure: briefly delaying the next image (up to 5 seconds).';
+    for (const beforeLogin of [true, false]) {
+        const f = fixture(); t.after(() => f.logger.stop());
+        if (!beforeLogin) f.logger.start();
+        f.consoleObject.warn(notice);
+        assert.equal(f.sent.length, beforeLogin ? 0 : 1);
+        f.logger.start(); await settle();
+        assert.equal(f.sent.length, 1);
+        assert.match(f.sent[0].message, /OCR memory pressure/);
+        assert.equal(f.sent[0].timestamp, new Date(1000).toISOString());
+        f.consoleObject.warn(notice);
+        assert.equal(f.sent.length, 1);
+    }
+});
+
 test('gateway interruptions wait one minute and require every disconnected shard to recover', async t => {
     const f = fixture(), client = new EventEmitter(); t.after(() => f.logger.stop());
     f.logger.watchGateway(client); f.logger.watchGateway(client); f.logger.start();

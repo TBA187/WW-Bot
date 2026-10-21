@@ -282,6 +282,38 @@ test('memory pressure releases the old helper before checking whether a short pa
     await pool.close();
 });
 
+test('inactive file cache does not pause OCR or recycle its helper', async () => {
+    let created = 0, terminated = 0;
+    const pool = new OcrWorkerPool({ idleTimeoutMs: 0,
+        containerMemory: async () => ({ used: 490 * 1048576, limit: 512 * 1048576,
+            fileCache: 290 * 1048576, inactiveFile: 270 * 1048576, workingSet: 220 * 1048576 }),
+        pause: async () => assert.fail('Reclaimable cache must not delay OCR'),
+        workerFactory: async () => { created++; return {
+            async analyzeScout(id) { return id; }, async terminate() { terminated++; }
+        }; } });
+    try {
+        assert.equal(await pool.run(() => pool.processImage('analyzeScout', 1)), 1);
+        assert.equal(await pool.run(() => pool.processImage('analyzeScout', 2)), 2);
+        assert.equal(created, 1);
+        assert.equal(terminated, 0);
+    } finally { await pool.close(); }
+});
+
+test('genuine working-set pressure still recycles OCR and preserves the bounded delay', async () => {
+    const delays = [], logs = [];
+    const pool = new OcrWorkerPool({ idleTimeoutMs: 0,
+        containerMemory: async () => ({ used: 490 * 1048576, limit: 512 * 1048576,
+            inactiveFile: 40 * 1048576, workingSet: 450 * 1048576 }),
+        pause: async ms => delays.push(ms), log: text => logs.push(text),
+        workerFactory: async () => ({ async analyzeScout() { return 'done'; }, async terminate() {} }) });
+    try {
+        assert.equal(await pool.run(() => pool.processImage('analyzeScout')), 'done');
+        assert.deepEqual(delays, [1000, 1000, 1000, 1000, 1000]);
+        assert.equal(logs.length, 1);
+        assert.equal(pool.snapshot().workers, 0);
+    } finally { await pool.close(); }
+});
+
 test('sustained pressure adds at most five seconds and still processes the report', async () => {
     const delays = [], logs = [];
     const pool = new OcrWorkerPool({ idleTimeoutMs: 0,

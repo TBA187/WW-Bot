@@ -3,7 +3,7 @@
 // Shares one OCR queue and recycles workers after idle periods, failures, or memory pressure.
 const { createOcrProcessWorker } = require('./ocrProcessWorker.js');
 const path = require('node:path');
-const { readContainerMemory, MEMORY_BUDGET_BYTES } = require('./runtimeHealth.js');
+const { readContainerMemory, memoryPressureSample } = require('./runtimeHealth.js');
 
 const OCR_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const configuredSharp = new WeakSet();
@@ -138,9 +138,9 @@ class OcrWorkerPool {
     async memoryPressure() {
         try {
             const memory = await this.containerMemory();
-            // Respect a smaller host limit; keep the 512 MiB process budget even
-            // if the hosting panel/cgroup exposes a slightly larger allowance.
-            return Boolean(memory && memory.used >= Math.min(memory.limit, MEMORY_BUDGET_BYTES) * 0.85);
+            // Use the same cache-adjusted usage and capped budget as runtime alerts.
+            const { used, limit } = memoryPressureSample(memory);
+            return Boolean(memory && used >= limit * 0.85);
         } catch { return false; }
     }
 

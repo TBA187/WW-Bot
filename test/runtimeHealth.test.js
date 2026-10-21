@@ -57,23 +57,24 @@ test('warnings and recoveries include panel estimates, heap and jobs without ful
         consoleObject: { warn: line => warnings.push(line), log: line => reports.push(line) },
         memoryUsage: () => { fullReads++; return { rss: 180 * MIB, heapUsed: 60 * MIB, heapTotal: 90 * MIB, external: 0 }; },
         rssUsage: () => 180 * MIB, heapLimit: () => 340 * MIB, containerPeak: async () => null, processPeak: () => 0,
-        containerMemory: async () => ({ used, limit: 512 * MIB, fileCache: 200 * MIB, inactiveFile: 193 * MIB, workingSet: used - 193 * MIB }),
+        containerMemory: async () => ({ used, limit: 512 * MIB, fileCache: 83 * MIB, inactiveFile: 76 * MIB, workingSet: used - 76 * MIB }),
         activitySnapshot: () => activity.snapshot() });
     await health.sample();
     const finish = activity.begin('WW server-tag verification');
-    now = 5000; used = 414 * MIB; await health.sample({ report: false });
+    now = 5000; used = 490 * MIB; await health.sample({ report: false });
     assert.equal(fullReads, 2);
-    assert.match(warnings[0], /container total including cache/);
-    assert.match(warnings[0], /inactive file cache 193.0 MiB; panel-equivalent estimate 221.0 MiB/);
+    assert.match(warnings[0], /WARNING: 414.0\/512.0 MiB .*container working set; inactive file cache excluded/);
+    assert.match(warnings[0], /container total including cache 490.0 MiB/);
+    assert.match(warnings[0], /inactive file cache 76.0 MiB; panel-equivalent estimate 414.0 MiB/);
     assert.match(warnings[0], /bot RSS 180.0 MiB; main heap 60.0\/90.0 MiB/);
     assert.match(warnings[0], /active jobs: WW server-tag verification \(5.0s\)/);
     now = 6000; await health.sample({ report: false });
     assert.equal(fullReads, 2);
     finish();
-    now = 7000; used = 367.9 * MIB; await health.sample({ report: false });
+    now = 7000; used = 443.9 * MIB; await health.sample({ report: false });
     assert.equal(fullReads, 3);
     assert.match(reports.at(-1), /Recovered below 75%: 367.9\/512.0/);
-    assert.match(reports.at(-1), /panel-equivalent estimate 174.9 MiB/);
+    assert.match(reports.at(-1), /panel-equivalent estimate 367.9 MiB/);
     assert.match(reports.at(-1), /active jobs: none; recent jobs: WW server-tag verification \(6.0s, ended 1.0s ago\)/);
     now = 30000; await health.sample({ report: false });
     assert.match(reports.at(-1), /jobs at sampled peak: WW server-tag verification/);
@@ -105,7 +106,7 @@ test('runtime samples count caches without fetching Discord or treating buffers 
     rss = 90 * MIB; await health.sample();
     assert.match(lines[0], /RSS 100.0 MiB/);
     assert.match(lines[0], /main heap 20.0\/40.0 MiB/);
-    assert.match(lines[0], /container 400.0\/512.0 MiB \(78.1%\)/);
+    assert.match(lines[0], /container total including cache 400.0\/512.0 MiB \(78.1%\)/);
     assert.match(lines[0], /container file cache 80.0 MiB/);
     assert.match(lines[0], /2 messages, 1 members, 2 users/);
     assert.match(lines[0], /OCR: 1 worker\(s\), 2 queued\/active task\(s\)/);
@@ -144,6 +145,58 @@ test('memory pressure uses the 512 MiB budget, suppresses repeat warnings, and r
     assert.ok(reports.some(line => /Recovered below 75%/.test(line)));
     used = 410 * MIB; await health.sample(); assert.equal(warnings.length, 4);
     health.stop();
+});
+
+test('the reported cache-heavy startup sequence produces neither warnings nor false recoveries', async () => {
+    let sample;
+    const warnings = [], reports = [];
+    const health = new RuntimeHealth({ consoleObject: { warn: line => warnings.push(line), log: line => reports.push(line) },
+        containerMemory: async () => sample, containerPeak: async () => null, processPeak: () => 0 });
+    for (const [used, inactive, cache] of [[411.9, 197.6, 207.0], [370.2, 197.3, 206.9], [412.0, 197.3, 206.8]]) {
+        sample = await readContainerMemory(readFixture({
+            '/sys/fs/cgroup/memory.current': String(Math.round(used * MIB)),
+            '/sys/fs/cgroup/memory.max': String(512 * MIB),
+            '/sys/fs/cgroup/memory.stat': `file ${Math.round(cache * MIB)}\ninactive_file ${Math.round(inactive * MIB)}\n`
+        }));
+        await health.sample();
+    }
+    assert.deepEqual(warnings, []);
+    assert.equal(health.alertLevel, 0);
+    assert.ok(reports.every(line => !line.includes('Recovered below')));
+    assert.match(reports.at(-1), /panel-equivalent estimate 214.7 MiB/);
+    assert.match(reports.at(-1), /container total including cache 412.0\/512.0 MiB/);
+});
+
+test('working-set warnings, critical pressure and recovery respect a smaller container limit', async () => {
+    let used = 240 * MIB, inactiveFile = 16 * MIB;
+    const warnings = [], reports = [];
+    const health = new RuntimeHealth({ consoleObject: { warn: line => warnings.push(line), log: line => reports.push(line) },
+        containerMemory: async () => ({ used, limit: 256 * MIB, inactiveFile, workingSet: used - inactiveFile }),
+        containerPeak: async () => null, processPeak: () => 0 });
+    await health.sample();
+    assert.match(warnings[0], /WARNING: 224.0\/256.0 MiB \(87.5%/);
+    used = 250 * MIB; await health.sample();
+    assert.match(warnings[1], /CRITICAL: 234.0\/256.0 MiB \(91.4%/);
+    used = 210 * MIB; inactiveFile = 30 * MIB; await health.sample();
+    assert.match(reports.find(line => line.includes('Recovered below')), /180.0\/256.0 MiB/);
+});
+
+test('unavailable or invalid working sets retain raw-total protection and zero remains valid', async () => {
+    for (const workingSet of [undefined, null, NaN, -1, 421 * MIB, 0]) {
+        const warnings = [];
+        const health = new RuntimeHealth({ consoleObject: { warn: line => warnings.push(line), log() {} },
+            containerMemory: async () => ({ used: 420 * MIB, limit: 512 * MIB, fileCache: 300 * MIB, workingSet }),
+            containerPeak: async () => null, processPeak: () => 0 });
+        await health.sample();
+        assert.equal(warnings.length, workingSet === 0 ? 0 : 1);
+        if (warnings.length) assert.match(warnings[0], /420.0\/512.0 MiB .*inactive file cache unavailable/);
+    }
+    const warnings = [];
+    const health = new RuntimeHealth({ consoleObject: { warn: line => warnings.push(line), log() {} },
+        containerMemory: async () => null, containerPeak: async () => null, processPeak: () => 0,
+        memoryUsage: () => ({ rss: 420 * MIB, heapUsed: MIB, heapTotal: MIB, external: 0 }) });
+    await health.sample();
+    assert.match(warnings[0], /420.0\/512.0 MiB .*bot RSS only; isolated OCR excluded/);
 });
 
 test('idle sampling is cheap, active OCR samples each second, and short OCR jobs appear in the next report', async () => {
