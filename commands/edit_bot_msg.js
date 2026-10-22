@@ -11,16 +11,10 @@ const {
 } = require('discord.js');
 const { randomBytes } = require('node:crypto');
 const { brandedEditAttachments, visibleEmbedEditOptions, logoFile, LOGO_ATTACHMENT_URL } = require('../features/message-builder/draft.js');
+const { hasAllowedRole, currentMember } = require('../features/message-builder/permissions.js');
 
 const ZERO_WIDTH_SPACE = '\u200B';
 const CONFIRM_TIMEOUT = 300_000;
-
-function hasAllowedRole(member, allowedRoles) {
-    const roles = member?.roles;
-    if (roles?.cache?.some) return roles.cache.some(role => allowedRoles.includes(role.id));
-    if (Array.isArray(roles)) return roles.some(role => allowedRoles.includes(typeof role === 'string' ? role : role.id));
-    return false;
-}
 
 // Match Python's SequenceMatcher line grouping to preserve the source edit-log text.
 function matchingBlocks(oldLines, newLines) {
@@ -140,9 +134,28 @@ class EditBotMsg {
     }
 
     async denyIfUnauthorized(interaction) {
-        if (hasAllowedRole(interaction.member, this.allowedRoles)) return false;
-        await interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
+        if (hasAllowedRole(currentMember(interaction), this.allowedRoles)) return false;
+        await this.privateError(interaction, '### ❌  No permission!');
         return true;
+    }
+
+    privateError(interaction, content) {
+        const payload = { content, flags: MessageFlags.Ephemeral };
+        return interaction.deferred || interaction.replied ? interaction.followUp(payload) : interaction.reply(payload);
+    }
+
+    editPermissionError(interaction, channelId, channel, message, ownerId = interaction.user.id) {
+        if (!hasAllowedRole(currentMember(interaction), this.allowedRoles) || ownerId !== interaction.user.id) {
+            return '### ❌  No permission!';
+        }
+        if ([channelId, channel?.id, message?.channelId, message?.channel?.id]
+            .some(id => id && this.blockedEditBotMsgChannels.includes(id))) {
+            return '### ❌  Editing bot messages is not allowed in this channel!';
+        }
+        if (message && (!interaction.client.user?.id || message.author?.id !== interaction.client.user.id)) {
+            return '### ❌  Only bot messages can be edited!';
+        }
+        return null;
     }
 
     async fetchMessage(interaction, channelId, messageId) {
@@ -162,28 +175,29 @@ class EditBotMsg {
             return interaction.reply({ content: '### ❌  Editing bot messages is not allowed in this channel!', flags: MessageFlags.Ephemeral });
         }
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        let channel, message, oldContent;
         try {
-            const { channel, message } = await this.fetchMessage(interaction, channelId, messageId);
+            ({ channel, message } = await this.fetchMessage(interaction, channelId, messageId));
             if (!message) return interaction.editReply('### ❌  Failed to edit message.');
-            if (message.author.id !== interaction.client.user.id) return interaction.editReply('### ❌  Only bot messages can be edited!');
-            const oldContent = message.content || '';
+            oldContent = message.content || '';
+            const permissionError = this.editPermissionError(interaction, channelId, channel, message);
+            if (permissionError) return interaction.editReply(permissionError);
             await message.edit({ content: newContent });
-            await this.logMessageEdit(interaction, channel, message, oldContent, newContent, 'no changes');
-            return interaction.editReply('### ✅  Message edited!');
         } catch {
             return interaction.editReply('### ❌  Failed to edit message.');
         }
+        // Publication has succeeded; audit or feedback failures must not change that outcome.
+        try { await this.logMessageEdit(interaction, channel, message, oldContent, newContent, 'no changes'); }
+        catch { }
+        try { await interaction.editReply('### ✅  Message edited!'); }
+        catch { }
     }
 
     async handleContext(interaction) {
         if (await this.denyIfUnauthorized(interaction)) return;
         const message = interaction.targetMessage;
-        if (message.author.id !== interaction.client.user.id) {
-            return interaction.reply({ content: '### ❌  Only bot messages can be edited!', flags: MessageFlags.Ephemeral });
-        }
-        if (this.blockedEditBotMsgChannels.includes(message.channelId)) {
-            return interaction.reply({ content: '### ❌  Editing bot messages is not allowed in this channel!', flags: MessageFlags.Ephemeral });
-        }
+        const permissionError = this.editPermissionError(interaction, message.channelId, message.channel, message);
+        if (permissionError) return this.privateError(interaction, permissionError);
         const modal = new ModalBuilder().setCustomId('editMsg_' + message.id + '_' + message.channelId)
             .setTitle('Edit Bot Message (Officer)');
         const contentInput = new TextInputBuilder().setCustomId('content').setLabel('Message content')
@@ -204,6 +218,11 @@ class EditBotMsg {
         if (!interaction.customId.startsWith('editMsg_')) return false;
         if (await this.denyIfUnauthorized(interaction)) return true;
         const [, messageId, channelId] = interaction.customId.split('_');
+        const permissionError = this.editPermissionError(interaction, channelId);
+        if (permissionError) {
+            await this.privateError(interaction, permissionError);
+            return true;
+        }
         const appendRaw = (interaction.fields.getTextInputValue('append') || 'n').toLowerCase().trim() || 'n';
         if (appendRaw !== 'y' && appendRaw !== 'n') {
             await interaction.reply({
@@ -215,89 +234,121 @@ class EditBotMsg {
         const content = interaction.fields.getTextInputValue('content') || ZERO_WIDTH_SPACE;
         const embedRaw = interaction.fields.getTextInputValue('embed');
         const confirmId = 'confirmEdit_' + messageId + '_' + channelId + '_' + isAppend + '_' + randomBytes(8).toString('hex');
-        this.editCache(interaction.client).set(confirmId, {
-            content, embedRaw, ownerId: interaction.user.id, expiresAt: Date.now() + CONFIRM_TIMEOUT
-        });
         const buttons = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(confirmId).setLabel('✅ Confirm Edit').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId('cancelEdit_' + confirmId).setLabel('❌ Cancel').setStyle(ButtonStyle.Danger)
         );
         const previewLabel = isAppend ? 'APPEND to existing message:' : 'your edit below!\n## 👁️‍🗨️ New Message:\n';
-        await interaction.reply({
+        const preview = {
             content: '### ⚠️  <@' + interaction.user.id + '>, please confirm ' + previewLabel + '\n\n' +
                 content + '\n\n' + (embedRaw ? '- 📦 *Contains Embed JSON*' : ''),
-            components: [buttons], flags: MessageFlags.Ephemeral
+            components: [buttons]
+        };
+        const cacheMap = this.editCache(interaction.client);
+        cacheMap.set(confirmId, {
+            content, embedRaw, ownerId: interaction.user.id, expiresAt: Date.now() + CONFIRM_TIMEOUT,
+            preview, processing: false
         });
+        try { await interaction.reply({ ...preview, flags: MessageFlags.Ephemeral }); }
+        catch (error) { cacheMap.delete(confirmId); throw error; }
         return true;
     }
 
     editCache(client) {
         client.editCache ??= new Map();
-        for (const [key, value] of client.editCache) if (value.expiresAt <= Date.now()) client.editCache.delete(key);
+        for (const [key, value] of client.editCache) {
+            if (!value.processing && value.expiresAt <= Date.now()) client.editCache.delete(key);
+        }
         return client.editCache;
     }
 
     async handleButton(interaction) {
         const isCancel = interaction.customId === 'cancelEdit' || interaction.customId.startsWith('cancelEdit_');
         if (!isCancel && !interaction.customId.startsWith('confirmEdit_')) return false;
-        if (await this.denyIfUnauthorized(interaction)) return true;
+        if (!hasAllowedRole(currentMember(interaction), this.allowedRoles)) {
+            await this.privateError(interaction, '### ❌  No permission!');
+            return true;
+        }
         const cacheMap = this.editCache(interaction.client);
         const confirmId = isCancel ? interaction.customId.slice('cancelEdit_'.length) : interaction.customId;
         const cache = cacheMap.get(confirmId);
-        if (cache?.ownerId && cache.ownerId !== interaction.user.id) {
-            await interaction.reply({ content: '### ❌  No permission!', flags: MessageFlags.Ephemeral });
+        const staleNotice = '### ❌  This edit preview has expired or was already processed. Open Edit Bot Message (Officer) again.';
+        if (!cache) {
+            await this.privateError(interaction, staleNotice);
             return true;
         }
-        cacheMap.delete(confirmId);
-        if (isCancel) {
-            await interaction.update({ content: '### ❌  Edit cancelled.', components: [] });
+        if (cache.ownerId !== interaction.user.id) {
+            await this.privateError(interaction, '### ❌  No permission!');
             return true;
         }
-        await interaction.deferUpdate();
-        if (!cache) return true;
-        const [, messageId, channelId, appendValue] = confirmId.split('_');
-        if (this.blockedEditBotMsgChannels.includes(channelId)) {
-            await interaction.editReply({ content: '### ❌  Editing bot messages is not allowed in this channel!', components: [] });
+        if (cache.processing) {
+            await this.privateError(interaction, 'This edit preview is already being processed. Please wait, then try again.');
             return true;
         }
+        // Reserve both controls before acknowledgement and retain the reservation through recovery rendering.
+        cache.processing = true;
         try {
-            const { channel, message } = await this.fetchMessage(interaction, channelId, messageId);
-            if (!message) {
-                await interaction.editReply({ content: '### ❌  Failed to edit bot message!', components: [] });
+            if (isCancel) {
+                await interaction.update({ content: '### ❌  Edit cancelled.', components: [] });
+                cacheMap.delete(confirmId);
                 return true;
             }
-            if (message.author.id !== interaction.client.user.id) {
-                await interaction.editReply({ content: '### ❌  Only bot messages can be edited!', components: [] });
+            await interaction.deferUpdate();
+            const [, messageId, channelId, appendValue] = confirmId.split('_');
+            const permissionError = this.editPermissionError(interaction, channelId, null, null, cache.ownerId);
+            if (permissionError) {
+                await this.privateError(interaction, permissionError).catch(() => { });
                 return true;
             }
-            const oldContent = message.content || '';
-            let finalContent = cache.content;
-            if (appendValue === 'true') {
-                const addition = finalContent === ZERO_WIDTH_SPACE ? '' : finalContent;
-                finalContent = oldContent.trimEnd() + '\n' + addition;
-            } else if (!finalContent || finalContent === ZERO_WIDTH_SPACE) finalContent = oldContent;
-            const editPayload = { content: finalContent || message.content };
+            let channel, message, oldContent, finalContent;
             let embedStatus = 'no changes';
-            const trimmedEmbed = cache.embedRaw?.trim() || '';
-            if (trimmedEmbed) {
-                let replacementEmbed;
-                try {
-                    const parsed = JSON.parse(trimmedEmbed);
-                    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('Expected embed object');
-                    replacementEmbed = new EmbedBuilder(parsed);
-                } catch {
-                    await interaction.editReply({ content: '❌ Invalid embed JSON.', components: [] });
+            try {
+                ({ channel, message } = await this.fetchMessage(interaction, channelId, messageId));
+                if (!message) throw new Error('Target message unavailable');
+                const accessError = cacheMap.get(confirmId) !== cache ? staleNotice :
+                    this.editPermissionError(interaction, channelId, channel, message, cache.ownerId);
+                if (accessError) {
+                    await this.privateError(interaction, accessError).catch(() => { });
                     return true;
                 }
-                editPayload.embeds = [replacementEmbed];
-                Object.assign(editPayload, brandedEditAttachments(message, replacementEmbed), visibleEmbedEditOptions(message));
-                embedStatus = message.embeds.length ? '✏️ **Modified**' : '✅ **Added**';
+                oldContent = message.content || '';
+                finalContent = cache.content;
+                if (appendValue === 'true') {
+                    const addition = finalContent === ZERO_WIDTH_SPACE ? '' : finalContent;
+                    finalContent = oldContent.trimEnd() + '\n' + addition;
+                } else if (!finalContent || finalContent === ZERO_WIDTH_SPACE) finalContent = oldContent;
+                const editPayload = { content: finalContent || message.content };
+                const trimmedEmbed = cache.embedRaw?.trim() || '';
+                if (trimmedEmbed) {
+                    let replacementEmbed;
+                    try {
+                        const parsed = JSON.parse(trimmedEmbed);
+                        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('Expected embed object');
+                        replacementEmbed = new EmbedBuilder(parsed);
+                    } catch {
+                        cacheMap.delete(confirmId);
+                        await interaction.editReply({ content: '❌ Invalid embed JSON.', components: [] }).catch(() => { });
+                        return true;
+                    }
+                    editPayload.embeds = [replacementEmbed];
+                    Object.assign(editPayload, brandedEditAttachments(message, replacementEmbed), visibleEmbedEditOptions(message));
+                    embedStatus = message.embeds?.length ? '✏️ **Modified**' : '✅ **Added**';
+                }
+                await message.edit(editPayload);
+            } catch {
+                try { await interaction.editReply(cache.preview); }
+                catch { }
+                await this.privateError(interaction, '### ❌  Failed to edit bot message! Please try Confirm Edit again or Cancel.').catch(() => { });
+                return true;
             }
-            await message.edit(editPayload);
-            await this.logMessageEdit(interaction, channel, message, oldContent, finalContent, embedStatus);
-            await interaction.editReply({ content: '### ✅  Bot message successfully updated!', components: [] });
-        } catch {
-            await interaction.editReply({ content: '### ❌  Failed to edit bot message!', components: [] });
+            // Consume the preview before any audit or feedback can fail or yield to another callback.
+            cacheMap.delete(confirmId);
+            try { await this.logMessageEdit(interaction, channel, message, oldContent, finalContent, embedStatus); }
+            catch { }
+            try { await interaction.editReply({ content: '### ✅  Bot message successfully updated!', components: [] }); }
+            catch { }
+        } finally {
+            cache.processing = false;
         }
         return true;
     }

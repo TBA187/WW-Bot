@@ -1,6 +1,7 @@
 // Manage private message previews, owner-bound editing sessions, and confirmed publication.
 'use strict';
 const { randomBytes } = require('node:crypto');
+const { hasAllowedRole, currentMember } = require('./permissions.js');
 const { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelSelectMenuBuilder, ChannelType, CheckboxBuilder, EmbedBuilder, FileUploadBuilder, LabelBuilder, MessageFlags, ModalBuilder, RadioGroupBuilder, StringSelectMenuBuilder, TextDisplayBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { DraftValidationError, EmbedDraft, EmbedFieldDraft, EmbedMediaDraft, MessageAttachmentDraft, MAX_MESSAGE_CONTENT, MAX_TITLE, MAX_AUTHOR_NAME, MAX_FOOTER_TEXT, MAX_FIELD_NAME, MAX_FIELD_VALUE, MAX_FIELDS, MAX_MESSAGE_ATTACHMENTS, MAX_MESSAGE_JSON_BYTES, LOGO_PATH, LOGO_FILENAME, LOGO_ATTACHMENT_URL, draftFromMessage, validateEmbedDraft, buildMediaFiles, buildMessageAttachmentFiles, relatedAttachmentIdsFromMessage, reconcileEditAttachments, visibleEmbedEditOptions, readAttachmentBytes, exportMessageJson, importMessageJson, formatEmbedChanges, populatedEmbedProperties, parseEmbedTimestamp, formatEmbedTimestamp, normalizeEmbedColor, expandLiteralLineBreaks, expandFieldSpacingEscapes, isHttpsUrl, isImageAttachment } = require('./draft.js');
 const PREFIX = 'send_message:';
@@ -202,12 +203,42 @@ class EmbedBuilderSession {
         await interaction.editReply({ content, embeds: this.previewEmbeds(), components });
         this.confirmView();
     }
+    accessError(interaction) {
+        if (this.controller.sessions.get(this.sessionId) !== this || this.committed)
+            return 'This message has already been processed.';
+        if (interaction.user.id !== this.ownerId)
+            return 'This embed builder belongs to another user.';
+        if (!hasAllowedRole(currentMember(interaction), this.controller.allowedRoles))
+            return '### No permission!';
+        return null;
+    }
+    publicationError(interaction, message = this.target.message) {
+        const error = this.accessError(interaction);
+        if (error) return error;
+        if (this.editing) {
+            if (!interaction.client.user?.id || message?.author?.id !== interaction.client.user.id)
+                return 'Only White Walker bot messages can be edited.';
+            const blocked = this.config.blockedEditBotMsgChannels || [];
+            if ([this.target.channel?.id, this.target.message?.channelId, this.target.message?.channel?.id,
+                message.channelId, message.channel?.id].some(id => id && blocked.includes(id)))
+                return 'Editing bot messages is not allowed in this channel.';
+        }
+        return null;
+    }
+    async rejectReservedAction(interaction, error) {
+        try { await privateError(interaction, error); }
+        finally { this.processing = false; }
+    }
     async cancel(interaction) {
         if (this.updating) return privateError(interaction, PREVIEW_BUSY);
         if (this.processing || this.committed) return privateError(interaction, 'This message has already been processed.');
+        const error = this.accessError(interaction);
+        if (error) return privateError(interaction, error);
         this.processing = true;
         try { await interaction.deferUpdate(); }
         catch (error) { this.processing = false; throw error; }
+        const denied = this.accessError(interaction);
+        if (denied) return this.rejectReservedAction(interaction, denied);
         this.finish();
         await interaction.editReply({ content: 'Embed builder canceled.', embeds: [], attachments: [], components: [] });
     }
@@ -220,6 +251,8 @@ class EmbedBuilderSession {
         }
         if (this.processing || this.committed)
             return privateError(interaction, 'This message has already been processed.');
+        const error = this.publicationError(interaction);
+        if (error) return privateError(interaction, error);
         this.processing = true;
         try {
             await interaction.deferUpdate();
@@ -236,13 +269,18 @@ class EmbedBuilderSession {
                 let message = this.target.message;
                 if (message.channel?.messages?.fetch)
                     message = await message.channel.messages.fetch(message.id);
-                this.target.message = message;
                 const attachments = reconcileEditAttachments(message, { originalMediaAttachmentIds: this.originalMediaAttachmentIds, draft: this.draft, newFiles: files });
+                const denied = this.publicationError(interaction, message);
+                if (denied) return this.rejectReservedAction(interaction, denied);
+                this.target.message = message;
                 result = await message.edit({ content: this.draft.messageContent || null, embeds, ...attachments,
                     ...(embeds.length ? visibleEmbedEditOptions(message) : {}), allowedMentions: MENTIONS });
             }
-            else
+            else {
+                const denied = this.publicationError(interaction);
+                if (denied) return this.rejectReservedAction(interaction, denied);
                 result = await this.target.channel.send({ content: this.draft.messageContent || null, embeds, files, allowedMentions: MENTIONS });
+            }
         }
         catch (error) {
             this.controller.logError('Custom embed operation failed', error);
@@ -449,7 +487,12 @@ catch {
     return false;
 } }
 class BuilderController {
-    constructor(config = {}) { this.config = config; this.sessions = new Map(); this.closed = new Map(); }
+    constructor(config = {}) {
+        this.config = config;
+        this.allowedRoles = [config.leaderRoleID, config.adminRoleID, config.officerRoleID].filter(Boolean);
+        this.sessions = new Map();
+        this.closed = new Map();
+    }
     createSession(props) { return new EmbedBuilderSession(this, props); }
     logError(message, error) { console.error(`[WW LOG] ${message}:`, { name: error?.name, code: error?.code, message: error?.message }); }
     async resolve(interaction, { modal = false } = {}) {

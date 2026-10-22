@@ -3,6 +3,7 @@
 const { SlashCommandBuilder, ContextMenuCommandBuilder, ApplicationCommandType, ChannelType, MessageFlags } = require('discord.js');
 const { EmbedDraft, draftFromMessage, expandLiteralLineBreaks, applyWhiteWalkerBrandingDefaults } = require('../features/message-builder/draft.js');
 const { BuilderController } = require('../features/message-builder/editor.js');
+const { hasAllowedRole, currentMember } = require('../features/message-builder/permissions.js');
 class SendMessage {
     constructor(config = {}) {
         this.name = 'send_message';
@@ -30,11 +31,7 @@ class SendMessage {
         ];
     }
     canBuild(member) {
-        if (!member)
-            return false;
-        if (member.roles?.cache?.some)
-            return member.roles.cache.some(role => this.allowedRoles.has(role.id));
-        return Array.isArray(member.roles) && member.roles.some(id => this.allowedRoles.has(id));
+        return hasAllowedRole(member, this.allowedRoles);
     }
     async execute(interaction) {
         if (interaction.isMessageContextMenuCommand())
@@ -42,7 +39,7 @@ class SendMessage {
         return this.handleSlash(interaction);
     }
     async handleSlash(interaction) {
-        if (!this.canBuild(interaction.member))
+        if (!this.canBuild(currentMember(interaction)))
             return interaction.reply({ content: '### No permission!', flags: MessageFlags.Ephemeral });
         const channel = interaction.options.getChannel('channel') || interaction.channel;
         if (!channel || typeof channel.send !== 'function')
@@ -56,7 +53,7 @@ class SendMessage {
         await session.open(interaction);
     }
     async handleContext(interaction) {
-        if (!this.canBuild(interaction.member))
+        if (!this.canBuild(currentMember(interaction)))
             return interaction.reply({ content: '### No permission!', flags: MessageFlags.Ephemeral });
         const message = interaction.targetMessage;
         if (!interaction.client.user || message.author.id !== interaction.client.user.id)
@@ -71,7 +68,7 @@ class SendMessage {
     }
     async handleComponent(interaction, method) {
         if (!interaction.customId?.startsWith('send_message:')) return false;
-        if (!this.canBuild(interaction.member)) {
+        if (!this.canBuild(currentMember(interaction))) {
             await interaction.reply({ content: '### No permission!', flags: MessageFlags.Ephemeral });
             return true;
         }

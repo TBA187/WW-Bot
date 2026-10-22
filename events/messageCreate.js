@@ -46,8 +46,8 @@ module.exports = {
         // ---------------------------------------------------------
         // COMMAND 1: !write / ?write command
         // ---------------------------------------------------------
-        if (message.content.startsWith('!write') || message.content.startsWith('?write')) {
-            let newMessage = message.content.slice(7).trim();
+        if (/^[!?]write(?=\s|$)/.test(message.content)) {
+            let newMessage = message.content.slice(6).trim();
             let hidden = false;
 
             // Check for hidden flag (-h)

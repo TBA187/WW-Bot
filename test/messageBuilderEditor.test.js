@@ -23,6 +23,7 @@ function fakeInteraction(overrides = {}) {
     const interaction = {
         calls,
         user: { id: 'owner', username: 'officer', tag: 'officer' },
+        member: { roles: ['officer-role'] },
         guild: { maximumUploadLimit: 10 * 1024 * 1024 },
         channel: { id: 'origin', send: async () => ({ id: 'sent' }) },
         client: {
@@ -615,7 +616,7 @@ test('saving the first embed keeps additional embeds and unrelated attachments',
     const document = new ImportedAttachment({ id: 'document', filename: 'guide.txt', data: Buffer.from('guide') });
     const edits = [];
     const channel = { id: '123', send: async () => ({}), messages: { fetch: async () => message } };
-    const message = { id: 'original', content: 'Old content', embeds: [{ title: 'Old' }, { title: 'Keep' }], attachments: new Collection([['document', document]]), channel,
+    const message = { id: 'original', author: { id: 'bot' }, content: 'Old content', embeds: [{ title: 'Old' }, { title: 'Keep' }], attachments: new Collection([['document', document]]), channel,
         async edit(payload) { edits.push(payload); return { ...message, url: 'https://discord.test/original' }; } };
     const { session } = fixture({}, { target: { message, channel } });
     session.draft = draftFromMessage(message);
@@ -777,7 +778,7 @@ test('saving an embed restores visibility after manual suppression and preserves
     const edits = [];
     const channel = { id: '123', send: async () => ({}), messages: { fetch: async () => message } };
     const message = {
-        id: 'original', content: 'Old content', embeds: [], attachments: new Collection(), channel,
+        id: 'original', author: { id: 'bot' }, content: 'Old content', embeds: [], attachments: new Collection(), channel,
         flags: new MessageFlagsBitField([MessageFlags.SuppressEmbeds, MessageFlags.SuppressNotifications]),
         async edit(payload) { edits.push(payload); return { ...message, url: 'https://discord.test/original' }; }
     };
@@ -796,7 +797,7 @@ test('saving a text-only draft leaves the original suppression flag unchanged', 
     const edits = [];
     const channel = { id: '123', send: async () => ({}), messages: { fetch: async () => message } };
     const message = {
-        id: 'original', content: 'Old content', embeds: [], attachments: new Collection(), channel,
+        id: 'original', author: { id: 'bot' }, content: 'Old content', embeds: [], attachments: new Collection(), channel,
         flags: new MessageFlagsBitField(MessageFlags.SuppressEmbeds),
         async edit(payload) { edits.push(payload); return { ...message, url: 'https://discord.test/original' }; }
     };
@@ -808,4 +809,142 @@ test('saving a text-only draft leaves the original suppression flag unchanged', 
     assert.equal(edits[0].content, 'Updated text');
     assert.equal(Object.hasOwn(edits[0], 'flags'), false);
     assert.equal(message.flags.has(MessageFlags.SuppressEmbeds), true);
+});
+
+function controlledPromise() {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+}
+
+function editAuthorizationFixture() {
+    const edits = [];
+    const channel = { id: '123', messages: { fetch: async () => message } };
+    const message = { id: 'original', channelId: '123', channel, author: { id: 'bot' }, content: 'Original',
+        embeds: [], attachments: new Collection(), async edit(payload) { edits.push(payload); return message; } };
+    return { ...fixture({ messageContent: 'Replacement' }, { target: { message, channel } }), channel, message, edits };
+}
+
+test('builder publication rejects revoked roles, wrong owners and inactive sessions before lookup', async () => {
+    for (const reason of ['role', 'owner', 'session']) {
+        const state = editAuthorizationFixture();
+        state.channel.messages.fetch = () => assert.fail('Unauthorized publication must not fetch');
+        const interaction = fakeInteraction();
+        if (reason === 'role') interaction.member.roles = [];
+        if (reason === 'owner') interaction.user.id = 'someone-else';
+        if (reason === 'session') state.controller.sessions.delete(state.session.sessionId);
+        await state.session.commit(interaction);
+        assertPrivate(privateResponse(interaction));
+        assert.equal(state.edits.length, 0);
+        assert.equal(state.session.processing, false);
+        assert.equal(interaction.calls.some(([type]) => type === 'deferUpdate'), false);
+    }
+});
+
+test('builder edits recheck live authorization and resolved targets after lookup', async () => {
+    for (const reason of ['role', 'owner', 'session', 'author', 'configured-destination', 'resolved-destination']) {
+        const state = editAuthorizationFixture();
+        const started = controlledPromise(), lookup = controlledPromise();
+        state.channel.messages.fetch = async () => { started.resolve(); return lookup.promise; };
+        const interaction = fakeInteraction();
+        interaction.guild.members = { cache: new Collection([['owner', interaction.member]]) };
+        const pending = state.session.commit(interaction);
+        await started.promise;
+        let fetched = state.message;
+        if (reason === 'role') interaction.guild.members.cache.set('owner', { roles: [] });
+        if (reason === 'owner') state.session.ownerId = 'someone-else';
+        if (reason === 'session') state.controller.sessions.delete(state.session.sessionId);
+        if (reason === 'author') fetched = { ...state.message, author: { id: 'another-bot' } };
+        if (reason === 'configured-destination') state.controller.config.blockedEditBotMsgChannels.push('123');
+        if (reason === 'resolved-destination') {
+            state.controller.config.blockedEditBotMsgChannels.push('blocked');
+            fetched = { ...state.message, channelId: 'blocked', channel: { id: 'blocked' } };
+        }
+        lookup.resolve(fetched);
+        await pending;
+        assert.equal(state.edits.length, 0, reason);
+        assert.equal(state.session.committed, false, reason);
+        assert.equal(state.session.processing, false, reason);
+        assertPrivate(privateResponse(interaction));
+        assert.equal(interaction.calls.some(([type]) => type === 'editReply'), false, reason);
+    }
+});
+
+test('builder send rechecks cached membership after attachment loading and remains retryable', async () => {
+    const { MessageAttachmentDraft } = require('../features/message-builder/draft.js');
+    const started = controlledPromise(), read = controlledPromise();
+    const state = fixture({ messageContent: 'With attachment' });
+    state.session.draft.messageAttachments.push(new MessageAttachmentDraft({
+        id: 'upload', name: 'guide.txt', async read() { started.resolve(); await read.promise; return Buffer.from('guide'); },
+    }));
+    const interaction = fakeInteraction();
+    interaction.guild.members = { cache: new Collection([['owner', interaction.member]]) };
+    const pending = state.session.commit(interaction);
+    await started.promise;
+    interaction.guild.members.cache.set('owner', { roles: [] });
+    read.resolve();
+    await pending;
+    assert.equal(state.sent.length, 0);
+    assertPrivate(privateResponse(interaction));
+    assert.equal(state.session.processing, false);
+    assert.equal(state.controller.sessions.get(state.session.sessionId), state.session);
+    await state.session.commit(fakeInteraction());
+    assert.equal(state.sent.length, 1);
+});
+
+test('failed authorization feedback leaves an unpublished builder edit retryable', async () => {
+    const state = editAuthorizationFixture();
+    const interaction = fakeInteraction({ async followUp() { throw new Error('feedback unavailable'); } });
+    state.channel.messages.fetch = async () => {
+        interaction.member.roles = [];
+        return state.message;
+    };
+    await assert.rejects(state.session.commit(interaction), /feedback unavailable/);
+    assert.equal(state.edits.length, 0);
+    assert.equal(state.session.processing, false);
+    assert.equal(state.controller.sessions.get(state.session.sessionId), state.session);
+    assert.equal(interaction.calls.some(([type]) => type === 'editReply'), false);
+    state.channel.messages.fetch = async () => state.message;
+    await state.session.commit(fakeInteraction());
+    assert.equal(state.edits.length, 1);
+});
+
+test('blocked edit channels still allow new builder messages', async () => {
+    const { session, sent } = fixture({ messageContent: 'New message' }, { config: { blockedEditBotMsgChannels: ['123'] } });
+    await session.commit(fakeInteraction());
+    assert.equal(sent.length, 1);
+});
+
+test('builder cancellation rechecks membership, ownership and session identity after acknowledgement', async () => {
+    for (const reason of ['role', 'owner', 'session']) {
+        const { controller, session } = fixture({ messageContent: 'Keep the draft' });
+        const acknowledged = controlledPromise();
+        const interaction = fakeInteraction({ async deferUpdate() { this.deferred = true; await acknowledged.promise; } });
+        const pending = session.cancel(interaction);
+        if (reason === 'role') interaction.member.roles = [];
+        if (reason === 'owner') session.ownerId = 'someone-else';
+        if (reason === 'session') controller.sessions.delete(session.sessionId);
+        acknowledged.resolve();
+        await pending;
+        assert.equal(session.processing, false);
+        assert.equal(interaction.calls.some(([type]) => type === 'editReply'), false);
+        assertPrivate(privateResponse(interaction));
+        assert.equal(controller.closed.has(session.sessionId), false);
+        if (reason !== 'session') assert.equal(controller.sessions.get(session.sessionId), session);
+    }
+});
+
+test('successful builder edits remain committed when final feedback and audit fail', async () => {
+    const state = editAuthorizationFixture();
+    state.controller.logError = () => {};
+    state.session.audit = async () => { throw new Error('audit unavailable'); };
+    const feedback = [];
+    await state.session.commit(fakeInteraction({ async editReply(payload) { feedback.push(payload); throw new Error('feedback unavailable'); } }));
+    const duplicate = fakeInteraction();
+    await state.session.commit(duplicate);
+    assert.equal(state.edits.length, 1);
+    assert.equal(state.session.committed, true);
+    assert.equal(state.controller.sessions.has(state.session.sessionId), false);
+    assert.deepEqual(feedback.map(payload => payload.content), ['Embed updated in <#123>.']);
+    assert.match(privateResponse(duplicate).content, /already been processed/);
 });
